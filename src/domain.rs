@@ -1,37 +1,32 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkspaceSummary {
-    name: String,
-    agent_count: usize,
-}
+//! Dependency-free durable domain types and transition rules.
+//!
+//! Entity identifiers are deliberately incompatible:
+//!
+//! ```compile_fail
+//! use openpodium::domain::{AgentId, TaskId};
+//!
+//! fn find_agent(_id: AgentId) {}
+//!
+//! find_agent(TaskId::new(1));
+//! ```
 
-impl WorkspaceSummary {
-    pub(crate) fn name(&self) -> &str {
-        &self.name
-    }
+mod ids;
+pub use ids::*;
 
-    pub(crate) fn agent_count(&self) -> usize {
-        self.agent_count
-    }
-}
+mod value_objects;
+pub use value_objects::*;
 
-impl Default for WorkspaceSummary {
-    fn default() -> Self {
-        Self {
-            name: "Welcome".to_owned(),
-            agent_count: 0,
-        }
-    }
-}
+mod lifecycle;
+pub use lifecycle::*;
+
+mod entities;
+pub use entities::*;
+
+mod events;
+pub use events::*;
+
+mod workspace;
+pub use workspace::*;
 
 #[cfg(test)]
-mod tests {
-    use super::WorkspaceSummary;
-
-    #[test]
-    fn default_workspace_is_empty() {
-        let workspace = WorkspaceSummary::default();
-
-        assert_eq!(workspace.name(), "Welcome");
-        assert_eq!(workspace.agent_count(), 0);
-    }
-}
+mod tests;

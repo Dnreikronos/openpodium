@@ -85,7 +85,15 @@ src/
   main.rs       application entry point
   app.rs        application shell and messages
   canvas.rs     camera, nodes, and interaction
-  domain.rs     dependency-free domain types and transitions
+  domain.rs     public facade for dependency-free domain types
+  domain/
+    ids.rs            typed entity identifiers
+    value_objects.rs  validated names, content, geometry, and timestamps
+    lifecycle.rs      agent and task transition rules
+    entities.rs       workspace-owned domain entities
+    events.rs         commands, events, timeline records, and errors
+    workspace.rs      aggregate validation and event application
+    tests.rs          exhaustive domain behavior tests
 ```
 
 Runtime, persistence, orchestration, and Git modules will be added as their vertical slices begin. A module becomes a workspace crate when it needs an independently testable dependency boundary or separate platform implementation; the project will not start with empty architectural crates.
@@ -106,4 +114,3 @@ Runtime, persistence, orchestration, and Git modules will be added as their vert
 - Never interpolate user text into a shell command; use argument arrays.
 - Redact likely secrets from diagnostic logs.
 - Disable telemetry by design rather than by a preference toggle.
-
