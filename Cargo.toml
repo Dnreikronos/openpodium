@@ -1,0 +1,11 @@
+[package]
+name = "openpodium"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A free, open-source canvas for orchestrating coding agents"
+license = "Apache-2.0"
+repository = "https://github.com/Dnreikronos/openpodium"
+
+[dependencies]
+iced = "0.14.0"
