@@ -38,6 +38,71 @@ impl Display for Name {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceIcon(String);
+
+impl WorkspaceIcon {
+    pub const MAX_CHARS: usize = 32;
+
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        let value = value.trim();
+
+        if value.is_empty() {
+            return Err(ValidationError::new(
+                "workspace icon",
+                ValidationProblem::Empty,
+            ));
+        }
+        if value.chars().count() > Self::MAX_CHARS {
+            return Err(ValidationError::new(
+                "workspace icon",
+                ValidationProblem::TooLong {
+                    max_chars: Self::MAX_CHARS,
+                },
+            ));
+        }
+
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDirectory(String);
+
+impl WorkspaceDirectory {
+    pub const MAX_CHARS: usize = 32_768;
+
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+
+        if value.is_empty() {
+            return Err(ValidationError::new(
+                "working directory",
+                ValidationProblem::Empty,
+            ));
+        }
+        if value.chars().count() > Self::MAX_CHARS {
+            return Err(ValidationError::new(
+                "working directory",
+                ValidationProblem::TooLong {
+                    max_chars: Self::MAX_CHARS,
+                },
+            ));
+        }
+
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Content(String);
 
 impl Content {

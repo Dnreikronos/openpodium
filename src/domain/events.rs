@@ -3,11 +3,12 @@ use std::fmt::{self, Display, Formatter};
 
 use super::{
     Agent, AgentId, AgentState, Handoff, HandoffId, Node, NodeId, NodeTarget, Role, RoleId, Task,
-    TaskId, TaskState, TimelineEventId, Timestamp, WorkspaceId,
+    TaskId, TaskState, TimelineEventId, Timestamp, WorkspaceId, WorkspaceSettings,
 };
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainCommand {
+    UpdateWorkspaceSettings(WorkspaceSettings),
     AddRole(Role),
     AddAgent(Agent),
     AddTask(Task),
@@ -19,6 +20,10 @@ pub enum DomainCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainEvent {
+    WorkspaceSettingsChanged {
+        from: WorkspaceSettings,
+        to: WorkspaceSettings,
+    },
     RoleAdded(Role),
     AgentAdded(Agent),
     TaskAdded(Task),
@@ -113,6 +118,8 @@ impl From<NodeTarget> for EntityRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
+    UnchangedWorkspaceSettings,
+    WorkspaceSettingsConflict,
     DuplicateEntity(EntityRef),
     EntityNotFound(EntityRef),
     InvalidReference {
@@ -159,6 +166,12 @@ pub enum DomainError {
 impl Display for DomainError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnchangedWorkspaceSettings => {
+                formatter.write_str("workspace settings are unchanged")
+            }
+            Self::WorkspaceSettingsConflict => formatter.write_str(
+                "workspace settings event does not match the current workspace settings",
+            ),
             Self::DuplicateEntity(entity) => write!(formatter, "{entity} already exists"),
             Self::EntityNotFound(entity) => write!(formatter, "{entity} does not exist"),
             Self::InvalidReference {

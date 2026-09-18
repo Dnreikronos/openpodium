@@ -1,15 +1,55 @@
 use std::collections::BTreeMap;
 
 use super::{
-    Agent, AgentId, DomainCommand, DomainError, DomainEvent, EntityRef, Handoff, HandoffId,
-    HandoffPayload, Name, Node, NodeId, Role, RoleId, Task, TaskId, TaskState, TimelineEvent,
-    WorkspaceId,
+    Agent, AgentId, Content, DomainCommand, DomainError, DomainEvent, EntityRef, Handoff,
+    HandoffId, HandoffPayload, Name, Node, NodeId, Role, RoleId, Task, TaskId, TaskState,
+    TimelineEvent, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSettings {
+    name: Name,
+    icon: Option<WorkspaceIcon>,
+    working_directory: Option<WorkspaceDirectory>,
+    instructions: Option<Content>,
+}
+
+impl WorkspaceSettings {
+    pub const fn new(
+        name: Name,
+        icon: Option<WorkspaceIcon>,
+        working_directory: Option<WorkspaceDirectory>,
+        instructions: Option<Content>,
+    ) -> Self {
+        Self {
+            name,
+            icon,
+            working_directory,
+            instructions,
+        }
+    }
+
+    pub const fn name(&self) -> &Name {
+        &self.name
+    }
+
+    pub const fn icon(&self) -> Option<&WorkspaceIcon> {
+        self.icon.as_ref()
+    }
+
+    pub const fn working_directory(&self) -> Option<&WorkspaceDirectory> {
+        self.working_directory.as_ref()
+    }
+
+    pub const fn instructions(&self) -> Option<&Content> {
+        self.instructions.as_ref()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workspace {
     id: WorkspaceId,
-    name: Name,
+    settings: WorkspaceSettings,
     roles: BTreeMap<RoleId, Role>,
     agents: BTreeMap<AgentId, Agent>,
     tasks: BTreeMap<TaskId, Task>,
@@ -21,7 +61,7 @@ impl Workspace {
     pub fn new(id: WorkspaceId, name: Name) -> Self {
         Self {
             id,
-            name,
+            settings: WorkspaceSettings::new(name, None, None, None),
             roles: BTreeMap::new(),
             agents: BTreeMap::new(),
             tasks: BTreeMap::new(),
@@ -35,7 +75,11 @@ impl Workspace {
     }
 
     pub fn name(&self) -> &str {
-        self.name.as_str()
+        self.settings.name().as_str()
+    }
+
+    pub const fn settings(&self) -> &WorkspaceSettings {
+        &self.settings
     }
 
     pub fn agent_count(&self) -> usize {
@@ -84,6 +128,15 @@ impl Workspace {
 
     pub fn execute(&mut self, command: DomainCommand) -> Result<DomainEvent, DomainError> {
         let event = match command {
+            DomainCommand::UpdateWorkspaceSettings(settings) => {
+                if settings == self.settings {
+                    return Err(DomainError::UnchangedWorkspaceSettings);
+                }
+                DomainEvent::WorkspaceSettingsChanged {
+                    from: self.settings.clone(),
+                    to: settings,
+                }
+            }
             DomainCommand::AddRole(role) => DomainEvent::RoleAdded(role),
             DomainCommand::AddAgent(agent) => DomainEvent::AgentAdded(agent),
             DomainCommand::AddTask(task) => DomainEvent::TaskAdded(task),
@@ -131,6 +184,12 @@ impl Workspace {
 
     pub fn apply(&mut self, event: &DomainEvent) -> Result<(), DomainError> {
         match event {
+            DomainEvent::WorkspaceSettingsChanged { from, to } => {
+                if &self.settings != from {
+                    return Err(DomainError::WorkspaceSettingsConflict);
+                }
+                self.settings = to.clone();
+            }
             DomainEvent::RoleAdded(role) => {
                 self.ensure_absent(EntityRef::Role(role.id()))?;
                 self.roles.insert(role.id(), role.clone());

@@ -5,11 +5,12 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use crate::domain::{
-    Agent, AgentId, AgentState, CanvasPoint, CanvasSize, Content, DomainCommand, Handoff,
-    HandoffId, HandoffPayload, Name, Node, NodeId, NodeTarget, Role, RoleId, Task, TaskId,
+    Agent, AgentId, AgentState, CanvasPoint, CanvasSize, Content, DomainCommand, DomainEvent,
+    Handoff, HandoffId, HandoffPayload, Name, Node, NodeId, NodeTarget, Role, RoleId, Task, TaskId,
     TaskState, Timestamp, Workspace, WorkspaceId,
 };
 
+use super::codec::{decode_event, decode_workspace};
 use super::{Journal, PersistenceError};
 
 #[test]
@@ -30,7 +31,7 @@ fn new_database_enables_wal_foreign_keys_and_schema_version() {
         .pragma_query_value(None, "foreign_keys", |row| row.get(0))
         .unwrap();
 
-    assert_eq!(schema_version, 1);
+    assert_eq!(schema_version, 2);
     assert_eq!(journal_mode, "wal");
     assert_eq!(foreign_keys, 1);
 }
@@ -299,7 +300,7 @@ fn unknown_event_format_fails_recovery_without_partial_state() {
             record_type: "domain event",
             sequence: 2,
             found: 99,
-            supported: 1,
+            supported: 2,
         }
     ));
 }
@@ -310,6 +311,41 @@ fn empty_journal_has_no_workspace_to_recover() {
     let journal = Journal::open(database_path(&temp)).unwrap();
 
     assert_eq!(journal.recover(WorkspaceId::new(7)).unwrap(), None);
+}
+
+#[test]
+fn version_one_event_and_snapshot_formats_remain_decodable() {
+    let event = decode_event(
+        br#"{
+            "type":"role_added",
+            "role":{
+                "id":1,
+                "name":"Builder",
+                "instructions":"Implement the requested change"
+            }
+        }"#,
+        1,
+        1,
+    )
+    .unwrap();
+    let workspace = decode_workspace(
+        br#"{
+            "id":7,
+            "name":"Legacy workspace",
+            "roles":[],
+            "agents":[],
+            "tasks":[],
+            "handoffs":[],
+            "nodes":[]
+        }"#,
+        1,
+        1,
+    )
+    .unwrap();
+
+    assert_eq!(event, DomainEvent::RoleAdded(test_role()));
+    assert_eq!(workspace.name(), "Legacy workspace");
+    assert!(workspace.settings().working_directory().is_none());
 }
 
 #[test]
@@ -361,7 +397,7 @@ fn unknown_schema_version_does_not_modify_the_database() {
         error,
         PersistenceError::UnsupportedSchemaVersion {
             found: 99,
-            supported: 1,
+            supported: 2,
         }
     ));
     assert_eq!(fs::read(&path).unwrap(), before);
@@ -401,6 +437,41 @@ fn migrating_non_empty_database_creates_a_consistent_backup() {
 }
 
 #[test]
+fn version_one_migration_backfills_workspace_registry_and_active_selection() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    let workspace_id = WorkspaceId::new(7);
+    {
+        let mut journal = Journal::open(&path).unwrap();
+        let mut workspace = test_workspace();
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddRole(test_role()),
+            42,
+        );
+        journal
+            .connection()
+            .execute_batch(
+                "DROP TABLE application_state;
+                 DROP TABLE workspace_registry;
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+    }
+
+    let journal = Journal::open(&path).unwrap();
+
+    assert_eq!(journal.recent_workspace_ids().unwrap(), vec![workspace_id]);
+    assert_eq!(journal.active_workspace_id().unwrap(), Some(workspace_id));
+    assert!(journal.recover(workspace_id).unwrap().is_some());
+    assert!(
+        path.with_file_name("journal.sqlite.backup-v1-before-v2")
+            .exists()
+    );
+}
+
+#[test]
 fn migration_failure_reports_versions_and_preserves_a_backup() {
     let temp = TempDir::new().unwrap();
     let path = database_path(&temp);
@@ -418,7 +489,7 @@ fn migration_failure_reports_versions_and_preserves_a_backup() {
     let backup_path = match error {
         PersistenceError::Migration {
             from: 0,
-            to: 1,
+            to: 2,
             backup_path: Some(path),
             ..
         } => path,
@@ -488,5 +559,5 @@ fn database_path(temp: &TempDir) -> PathBuf {
 }
 
 fn migration_backup_path(database: &Path) -> PathBuf {
-    database.with_file_name("journal.sqlite.backup-v0-before-v1")
+    database.with_file_name("journal.sqlite.backup-v0-before-v2")
 }

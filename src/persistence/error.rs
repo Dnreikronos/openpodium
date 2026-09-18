@@ -58,6 +58,9 @@ pub enum PersistenceError {
         detail: String,
     },
     Domain(DomainError),
+    UnknownWorkspace {
+        workspace_id: WorkspaceId,
+    },
     NoValidSnapshot {
         workspace_id: WorkspaceId,
         snapshots_checked: usize,
@@ -170,6 +173,9 @@ impl Display for PersistenceError {
                 detail,
             } => write!(formatter, "invalid {record_type} {sequence}: {detail}"),
             Self::Domain(source) => write!(formatter, "domain command failed: {source}"),
+            Self::UnknownWorkspace { workspace_id } => {
+                write!(formatter, "workspace {workspace_id} is not registered")
+            }
             Self::NoValidSnapshot {
                 workspace_id,
                 snapshots_checked,
@@ -196,6 +202,7 @@ impl Error for PersistenceError {
             | Self::UnsupportedRecordVersion { .. }
             | Self::ChecksumMismatch { .. }
             | Self::InvalidRecord { .. }
+            | Self::UnknownWorkspace { .. }
             | Self::NoValidSnapshot { .. } => None,
         }
     }
