@@ -1,0 +1,591 @@
+use serde::{Deserialize, Serialize};
+
+use crate::domain::{
+    Agent, AgentId, AgentState, CanvasPoint, CanvasSize, Content, DomainCommand, DomainEvent,
+    Handoff, HandoffId, HandoffPayload, Name, Node, NodeId, NodeTarget, Role, RoleId, Task, TaskId,
+    TaskState, Workspace, WorkspaceId,
+};
+
+use super::PersistenceError;
+
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 1;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
+    serde_json::to_vec(&EventV1::from(event)).map_err(|source| PersistenceError::Serialization {
+        record_type: "domain event",
+        source,
+    })
+}
+
+pub(crate) fn decode_event(payload: &[u8], sequence: u64) -> Result<DomainEvent, PersistenceError> {
+    let stored: EventV1 =
+        serde_json::from_slice(payload).map_err(|source| PersistenceError::Deserialization {
+            record_type: "domain event",
+            sequence,
+            source,
+        })?;
+
+    stored
+        .into_domain()
+        .map_err(|detail| PersistenceError::invalid_record("domain event", sequence, detail))
+}
+
+pub(crate) fn encode_workspace(workspace: &Workspace) -> Result<Vec<u8>, PersistenceError> {
+    serde_json::to_vec(&WorkspaceV1::from(workspace)).map_err(|source| {
+        PersistenceError::Serialization {
+            record_type: "workspace snapshot",
+            source,
+        }
+    })
+}
+
+pub(crate) fn decode_workspace(
+    payload: &[u8],
+    sequence: u64,
+) -> Result<Workspace, PersistenceError> {
+    let stored: WorkspaceV1 =
+        serde_json::from_slice(payload).map_err(|source| PersistenceError::Deserialization {
+            record_type: "workspace snapshot",
+            sequence,
+            source,
+        })?;
+
+    stored
+        .into_domain()
+        .map_err(|detail| PersistenceError::invalid_record("workspace snapshot", sequence, detail))
+}
+
+pub(crate) fn checksum(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum EventV1 {
+    RoleAdded {
+        role: RoleV1,
+    },
+    AgentAdded {
+        agent: AgentV1,
+    },
+    TaskAdded {
+        task: TaskV1,
+    },
+    HandoffAdded {
+        handoff: HandoffV1,
+    },
+    NodeAdded {
+        node: NodeV1,
+    },
+    AgentStateChanged {
+        agent_id: u64,
+        from: AgentStateV1,
+        to: AgentStateV1,
+    },
+    TaskStateChanged {
+        task_id: u64,
+        from: TaskStateV1,
+        to: TaskStateV1,
+    },
+}
+
+impl From<&DomainEvent> for EventV1 {
+    fn from(event: &DomainEvent) -> Self {
+        match event {
+            DomainEvent::RoleAdded(role) => Self::RoleAdded {
+                role: RoleV1::from(role),
+            },
+            DomainEvent::AgentAdded(agent) => Self::AgentAdded {
+                agent: AgentV1::from(agent),
+            },
+            DomainEvent::TaskAdded(task) => Self::TaskAdded {
+                task: TaskV1::from(task),
+            },
+            DomainEvent::HandoffAdded(handoff) => Self::HandoffAdded {
+                handoff: HandoffV1::from(handoff),
+            },
+            DomainEvent::NodeAdded(node) => Self::NodeAdded {
+                node: NodeV1::from(node),
+            },
+            DomainEvent::AgentStateChanged { agent_id, from, to } => Self::AgentStateChanged {
+                agent_id: agent_id.get(),
+                from: (*from).into(),
+                to: (*to).into(),
+            },
+            DomainEvent::TaskStateChanged { task_id, from, to } => Self::TaskStateChanged {
+                task_id: task_id.get(),
+                from: (*from).into(),
+                to: (*to).into(),
+            },
+        }
+    }
+}
+
+impl EventV1 {
+    fn into_domain(self) -> Result<DomainEvent, String> {
+        match self {
+            Self::RoleAdded { role } => Ok(DomainEvent::RoleAdded(role.into_domain()?)),
+            Self::AgentAdded { agent } => {
+                let (agent, state) = agent.into_domain()?;
+                if state != AgentState::Starting {
+                    return Err("an agent_added event must contain a starting agent".to_owned());
+                }
+                Ok(DomainEvent::AgentAdded(agent))
+            }
+            Self::TaskAdded { task } => {
+                let (task, state) = task.into_domain()?;
+                if state != TaskState::Queued {
+                    return Err("a task_added event must contain a queued task".to_owned());
+                }
+                Ok(DomainEvent::TaskAdded(task))
+            }
+            Self::HandoffAdded { handoff } => Ok(DomainEvent::HandoffAdded(handoff.into_domain()?)),
+            Self::NodeAdded { node } => Ok(DomainEvent::NodeAdded(node.into_domain()?)),
+            Self::AgentStateChanged { agent_id, from, to } => Ok(DomainEvent::AgentStateChanged {
+                agent_id: AgentId::new(agent_id),
+                from: from.into(),
+                to: to.into(),
+            }),
+            Self::TaskStateChanged { task_id, from, to } => Ok(DomainEvent::TaskStateChanged {
+                task_id: TaskId::new(task_id),
+                from: from.into(),
+                to: to.into(),
+            }),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceV1 {
+    id: u64,
+    name: String,
+    roles: Vec<RoleV1>,
+    agents: Vec<AgentV1>,
+    tasks: Vec<TaskV1>,
+    handoffs: Vec<HandoffV1>,
+    nodes: Vec<NodeV1>,
+}
+
+impl From<&Workspace> for WorkspaceV1 {
+    fn from(workspace: &Workspace) -> Self {
+        Self {
+            id: workspace.id().get(),
+            name: workspace.name().to_owned(),
+            roles: workspace.roles().map(RoleV1::from).collect(),
+            agents: workspace.agents().map(AgentV1::from).collect(),
+            tasks: workspace.tasks().map(TaskV1::from).collect(),
+            handoffs: workspace.handoffs().map(HandoffV1::from).collect(),
+            nodes: workspace.nodes().map(NodeV1::from).collect(),
+        }
+    }
+}
+
+impl WorkspaceV1 {
+    fn into_domain(self) -> Result<Workspace, String> {
+        let mut workspace = Workspace::new(
+            WorkspaceId::new(self.id),
+            Name::new(self.name).map_err(|error| error.to_string())?,
+        );
+
+        for role in self.roles {
+            apply_snapshot_command(&mut workspace, DomainCommand::AddRole(role.into_domain()?))?;
+        }
+        for agent in self.agents {
+            let (agent, state) = agent.into_domain()?;
+            let agent_id = agent.id();
+            apply_snapshot_command(&mut workspace, DomainCommand::AddAgent(agent))?;
+            restore_agent_state(&mut workspace, agent_id, state)?;
+        }
+
+        let mut pending_tasks = self.tasks;
+        while !pending_tasks.is_empty() {
+            let Some(index) = pending_tasks.iter().position(|task| {
+                task.retry_of
+                    .is_none_or(|retry_of| workspace.task(TaskId::new(retry_of)).is_some())
+            }) else {
+                return Err("task retry references contain a cycle or missing task".to_owned());
+            };
+            let (task, state) = pending_tasks.remove(index).into_domain()?;
+            let task_id = task.id();
+            apply_snapshot_command(&mut workspace, DomainCommand::AddTask(task))?;
+            restore_task_state(&mut workspace, task_id, state)?;
+        }
+
+        for handoff in self.handoffs {
+            apply_snapshot_command(
+                &mut workspace,
+                DomainCommand::AddHandoff(handoff.into_domain()?),
+            )?;
+        }
+        for node in self.nodes {
+            apply_snapshot_command(&mut workspace, DomainCommand::AddNode(node.into_domain()?))?;
+        }
+
+        Ok(workspace)
+    }
+}
+
+fn restore_agent_state(
+    workspace: &mut Workspace,
+    agent_id: AgentId,
+    state: AgentState,
+) -> Result<(), String> {
+    let transitions: &[AgentState] = match state {
+        AgentState::Starting => &[],
+        AgentState::Running => &[AgentState::Running],
+        AgentState::Waiting => &[AgentState::Running, AgentState::Waiting],
+        AgentState::Completed => &[AgentState::Running, AgentState::Completed],
+        AgentState::Failed => &[AgentState::Failed],
+        AgentState::Stopped => &[AgentState::Stopped],
+    };
+    for to in transitions {
+        apply_snapshot_command(
+            workspace,
+            DomainCommand::TransitionAgent { agent_id, to: *to },
+        )?;
+    }
+    Ok(())
+}
+
+fn restore_task_state(
+    workspace: &mut Workspace,
+    task_id: TaskId,
+    state: TaskState,
+) -> Result<(), String> {
+    let transitions: &[TaskState] = match state {
+        TaskState::Queued => &[],
+        TaskState::Delivered => &[TaskState::Delivered],
+        TaskState::Running => &[TaskState::Delivered, TaskState::Running],
+        TaskState::Blocked => &[TaskState::Delivered, TaskState::Running, TaskState::Blocked],
+        TaskState::Completed => &[
+            TaskState::Delivered,
+            TaskState::Running,
+            TaskState::Completed,
+        ],
+        TaskState::Failed => &[TaskState::Delivered, TaskState::Failed],
+        TaskState::Cancelled => &[TaskState::Cancelled],
+    };
+    for to in transitions {
+        apply_snapshot_command(
+            workspace,
+            DomainCommand::TransitionTask { task_id, to: *to },
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_snapshot_command(workspace: &mut Workspace, command: DomainCommand) -> Result<(), String> {
+    workspace
+        .execute(command)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleV1 {
+    id: u64,
+    name: String,
+    instructions: String,
+}
+
+impl From<&Role> for RoleV1 {
+    fn from(role: &Role) -> Self {
+        Self {
+            id: role.id().get(),
+            name: role.name().as_str().to_owned(),
+            instructions: role.instructions().as_str().to_owned(),
+        }
+    }
+}
+
+impl RoleV1 {
+    fn into_domain(self) -> Result<Role, String> {
+        Ok(Role::new(
+            RoleId::new(self.id),
+            Name::new(self.name).map_err(|error| error.to_string())?,
+            Content::new(self.instructions).map_err(|error| error.to_string())?,
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentV1 {
+    id: u64,
+    name: String,
+    role_id: Option<u64>,
+    state: AgentStateV1,
+}
+
+impl From<&Agent> for AgentV1 {
+    fn from(agent: &Agent) -> Self {
+        Self {
+            id: agent.id().get(),
+            name: agent.name().as_str().to_owned(),
+            role_id: agent.role_id().map(RoleId::get),
+            state: agent.state().into(),
+        }
+    }
+}
+
+impl AgentV1 {
+    fn into_domain(self) -> Result<(Agent, AgentState), String> {
+        Ok((
+            Agent::new(
+                AgentId::new(self.id),
+                Name::new(self.name).map_err(|error| error.to_string())?,
+                self.role_id.map(RoleId::new),
+            ),
+            self.state.into(),
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskV1 {
+    id: u64,
+    title: String,
+    prompt: String,
+    assignee: Option<u64>,
+    retry_of: Option<u64>,
+    state: TaskStateV1,
+}
+
+impl From<&Task> for TaskV1 {
+    fn from(task: &Task) -> Self {
+        Self {
+            id: task.id().get(),
+            title: task.title().as_str().to_owned(),
+            prompt: task.prompt().as_str().to_owned(),
+            assignee: task.assignee().map(AgentId::get),
+            retry_of: task.retry_of().map(TaskId::get),
+            state: task.state().into(),
+        }
+    }
+}
+
+impl TaskV1 {
+    fn into_domain(self) -> Result<(Task, TaskState), String> {
+        Ok((
+            Task::new(
+                TaskId::new(self.id),
+                Name::new(self.title).map_err(|error| error.to_string())?,
+                Content::new(self.prompt).map_err(|error| error.to_string())?,
+                self.assignee.map(AgentId::new),
+                self.retry_of.map(TaskId::new),
+            ),
+            self.state.into(),
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffV1 {
+    id: u64,
+    source: u64,
+    recipient: u64,
+    payload: HandoffPayloadV1,
+}
+
+impl From<&Handoff> for HandoffV1 {
+    fn from(handoff: &Handoff) -> Self {
+        Self {
+            id: handoff.id().get(),
+            source: handoff.source().get(),
+            recipient: handoff.recipient().get(),
+            payload: HandoffPayloadV1::from(handoff.payload()),
+        }
+    }
+}
+
+impl HandoffV1 {
+    fn into_domain(self) -> Result<Handoff, String> {
+        Ok(Handoff::new(
+            HandoffId::new(self.id),
+            AgentId::new(self.source),
+            AgentId::new(self.recipient),
+            self.payload.into_domain()?,
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum HandoffPayloadV1 {
+    Task { task_id: u64 },
+    Question { content: String },
+}
+
+impl From<&HandoffPayload> for HandoffPayloadV1 {
+    fn from(payload: &HandoffPayload) -> Self {
+        match payload {
+            HandoffPayload::Task(task_id) => Self::Task {
+                task_id: task_id.get(),
+            },
+            HandoffPayload::Question(content) => Self::Question {
+                content: content.as_str().to_owned(),
+            },
+        }
+    }
+}
+
+impl HandoffPayloadV1 {
+    fn into_domain(self) -> Result<HandoffPayload, String> {
+        match self {
+            Self::Task { task_id } => Ok(HandoffPayload::Task(TaskId::new(task_id))),
+            Self::Question { content } => Ok(HandoffPayload::Question(
+                Content::new(content).map_err(|error| error.to_string())?,
+            )),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeV1 {
+    id: u64,
+    target: NodeTargetV1,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl From<&Node> for NodeV1 {
+    fn from(node: &Node) -> Self {
+        Self {
+            id: node.id().get(),
+            target: node.target().into(),
+            x: node.position().x(),
+            y: node.position().y(),
+            width: node.size().width(),
+            height: node.size().height(),
+        }
+    }
+}
+
+impl NodeV1 {
+    fn into_domain(self) -> Result<Node, String> {
+        Ok(Node::new(
+            NodeId::new(self.id),
+            self.target.into(),
+            CanvasPoint::new(self.x, self.y).map_err(|error| error.to_string())?,
+            CanvasSize::new(self.width, self.height).map_err(|error| error.to_string())?,
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum NodeTargetV1 {
+    Agent { id: u64 },
+    Task { id: u64 },
+    Handoff { id: u64 },
+}
+
+impl From<NodeTarget> for NodeTargetV1 {
+    fn from(target: NodeTarget) -> Self {
+        match target {
+            NodeTarget::Agent(id) => Self::Agent { id: id.get() },
+            NodeTarget::Task(id) => Self::Task { id: id.get() },
+            NodeTarget::Handoff(id) => Self::Handoff { id: id.get() },
+        }
+    }
+}
+
+impl From<NodeTargetV1> for NodeTarget {
+    fn from(target: NodeTargetV1) -> Self {
+        match target {
+            NodeTargetV1::Agent { id } => Self::Agent(AgentId::new(id)),
+            NodeTargetV1::Task { id } => Self::Task(TaskId::new(id)),
+            NodeTargetV1::Handoff { id } => Self::Handoff(HandoffId::new(id)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentStateV1 {
+    Starting,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl From<AgentState> for AgentStateV1 {
+    fn from(state: AgentState) -> Self {
+        match state {
+            AgentState::Starting => Self::Starting,
+            AgentState::Running => Self::Running,
+            AgentState::Waiting => Self::Waiting,
+            AgentState::Completed => Self::Completed,
+            AgentState::Failed => Self::Failed,
+            AgentState::Stopped => Self::Stopped,
+        }
+    }
+}
+
+impl From<AgentStateV1> for AgentState {
+    fn from(state: AgentStateV1) -> Self {
+        match state {
+            AgentStateV1::Starting => Self::Starting,
+            AgentStateV1::Running => Self::Running,
+            AgentStateV1::Waiting => Self::Waiting,
+            AgentStateV1::Completed => Self::Completed,
+            AgentStateV1::Failed => Self::Failed,
+            AgentStateV1::Stopped => Self::Stopped,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskStateV1 {
+    Queued,
+    Delivered,
+    Running,
+    Blocked,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl From<TaskState> for TaskStateV1 {
+    fn from(state: TaskState) -> Self {
+        match state {
+            TaskState::Queued => Self::Queued,
+            TaskState::Delivered => Self::Delivered,
+            TaskState::Running => Self::Running,
+            TaskState::Blocked => Self::Blocked,
+            TaskState::Completed => Self::Completed,
+            TaskState::Failed => Self::Failed,
+            TaskState::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+impl From<TaskStateV1> for TaskState {
+    fn from(state: TaskStateV1) -> Self {
+        match state {
+            TaskStateV1::Queued => Self::Queued,
+            TaskStateV1::Delivered => Self::Delivered,
+            TaskStateV1::Running => Self::Running,
+            TaskStateV1::Blocked => Self::Blocked,
+            TaskStateV1::Completed => Self::Completed,
+            TaskStateV1::Failed => Self::Failed,
+            TaskStateV1::Cancelled => Self::Cancelled,
+        }
+    }
+}
