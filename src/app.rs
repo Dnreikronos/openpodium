@@ -1,8 +1,8 @@
 use iced::widget::{column, container, row, text};
 use iced::{Element, Fill, Theme};
+use openpodium::domain::Workspace;
 
 use crate::canvas::Camera;
-use crate::domain::WorkspaceSummary;
 
 const APP_NAME: &str = "OpenPodium";
 
@@ -11,7 +11,7 @@ type Message = ();
 #[derive(Debug, Default)]
 struct OpenPodium {
     camera: Camera,
-    workspace: WorkspaceSummary,
+    workspace: Workspace,
 }
 
 pub(crate) fn run() -> iced::Result {
