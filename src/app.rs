@@ -9,7 +9,7 @@ use iced::{Element, Fill, Theme};
 use openpodium::domain::{Timestamp, WorkspaceId};
 use openpodium::workspaces::{WorkspaceManager, WorkspaceSettingsInput};
 
-use crate::canvas::Camera;
+use crate::canvas::{self, Camera};
 
 const APP_NAME: &str = "OpenPodium";
 const DATABASE_FILE: &str = "openpodium.sqlite";
@@ -51,6 +51,7 @@ impl Default for OpenPodium {
 
 #[derive(Debug, Clone)]
 enum Message {
+    Canvas(canvas::Message),
     CreateDirectoryChanged(String),
     CreateWorkspace,
     SwitchWorkspace(WorkspaceId),
@@ -71,6 +72,7 @@ pub(crate) fn run() -> iced::Result {
 
 fn update(state: &mut OpenPodium, message: Message) {
     match message {
+        Message::Canvas(canvas::Message::CameraChanged(camera)) => state.camera = camera,
         Message::CreateDirectoryChanged(value) => state.create_directory = value,
         Message::NameChanged(value) => state.name = value,
         Message::IconChanged(value) => state.icon = value,
@@ -142,6 +144,11 @@ fn update(state: &mut OpenPodium, message: Message) {
 }
 
 fn view(state: &OpenPodium) -> Element<'_, Message> {
+    let has_active_workspace = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .is_some();
     let mut workspace_list =
         column![text(APP_NAME).size(24), text("Workspaces").size(14)].spacing(12);
     if let Some(workspaces) = &state.workspaces {
@@ -185,16 +192,17 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         text_input("Workspace instructions", &state.instructions)
             .on_input(Message::InstructionsChanged),
         button("Save settings").on_press(Message::SaveSettings),
-        text(format!("Zoom: {}%", state.camera.zoom_percent())).size(12),
+        text(format!(
+            "Canvas: {}% · x {:.0} · y {:.0}",
+            state.camera.zoom_percent(),
+            state.camera.position().x,
+            state.camera.position().y,
+        ))
+        .size(12),
     ]
     .spacing(12)
     .max_width(720);
-    if state
-        .workspaces
-        .as_ref()
-        .and_then(WorkspaceManager::active_workspace)
-        .is_none()
-    {
+    if !has_active_workspace {
         settings = column![
             text("Create your first workspace").size(28),
             text("Enter a local project directory in the sidebar to get started."),
@@ -206,11 +214,20 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         settings = settings.push(text(notice));
     }
 
-    let stage = container(settings)
-        .width(Fill)
-        .height(Fill)
-        .center(Fill)
-        .padding(32);
+    let stage: Element<'_, Message> = if has_active_workspace {
+        row![
+            canvas::view(state.camera).map(Message::Canvas),
+            container(settings).width(360).height(Fill).padding(24),
+        ]
+        .into()
+    } else {
+        container(settings)
+            .width(Fill)
+            .height(Fill)
+            .center(Fill)
+            .padding(32)
+            .into()
+    };
 
     row![sidebar, stage].into()
 }
