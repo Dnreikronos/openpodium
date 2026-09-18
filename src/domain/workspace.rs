@@ -42,6 +42,26 @@ impl Workspace {
         self.agents.len()
     }
 
+    pub(crate) fn roles(&self) -> impl Iterator<Item = &Role> {
+        self.roles.values()
+    }
+
+    pub(crate) fn agents(&self) -> impl Iterator<Item = &Agent> {
+        self.agents.values()
+    }
+
+    pub(crate) fn tasks(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.values()
+    }
+
+    pub(crate) fn handoffs(&self) -> impl Iterator<Item = &Handoff> {
+        self.handoffs.values()
+    }
+
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = &Node> {
+        self.nodes.values()
+    }
+
     pub fn role(&self, id: RoleId) -> Option<&Role> {
         self.roles.get(&id)
     }
