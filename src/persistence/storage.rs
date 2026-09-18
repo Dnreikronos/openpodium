@@ -14,7 +14,7 @@ use super::codec::{
     encode_event, encode_workspace,
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MIGRATION_0_TO_1: &str = "
@@ -41,6 +41,38 @@ CREATE TABLE workspace_snapshots (
 
 CREATE INDEX workspace_snapshots_workspace_sequence
     ON workspace_snapshots (workspace_id, event_sequence DESC);
+";
+
+const MIGRATION_1_TO_2: &str = "
+CREATE TABLE workspace_registry (
+    workspace_id   TEXT PRIMARY KEY,
+    last_opened_at TEXT NOT NULL
+) STRICT;
+
+INSERT INTO workspace_registry (workspace_id, last_opened_at)
+SELECT event.workspace_id, event.occurred_at
+FROM journal_events AS event
+JOIN (
+    SELECT workspace_id, MAX(sequence) AS sequence
+    FROM journal_events
+    GROUP BY workspace_id
+) AS latest
+ON latest.sequence = event.sequence;
+
+CREATE TABLE application_state (
+    singleton           INTEGER PRIMARY KEY CHECK (singleton = 1),
+    active_workspace_id TEXT REFERENCES workspace_registry(workspace_id)
+) STRICT;
+
+INSERT INTO application_state (singleton, active_workspace_id)
+SELECT 1, workspace_id
+FROM workspace_registry
+ORDER BY length(last_opened_at) DESC, last_opened_at DESC
+LIMIT 1;
+
+INSERT INTO application_state (singleton, active_workspace_id)
+SELECT 1, NULL
+WHERE NOT EXISTS (SELECT 1 FROM application_state);
 ";
 
 pub struct Journal {
@@ -120,6 +152,27 @@ impl Journal {
             )
             .map_err(|source| PersistenceError::database("insert domain event", source))?;
 
+        let registered = transaction
+            .execute(
+                "INSERT INTO workspace_registry (workspace_id, last_opened_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT (workspace_id) DO NOTHING",
+                params![workspace_key, occurred_at_key],
+            )
+            .map_err(|source| PersistenceError::database("register workspace", source))?;
+        if registered == 1 {
+            transaction
+                .execute(
+                    "UPDATE application_state
+                     SET active_workspace_id = ?1
+                     WHERE singleton = 1",
+                    [&workspace_key],
+                )
+                .map_err(|source| {
+                    PersistenceError::database("store initial active workspace", source)
+                })?;
+        }
+
         let sequence = positive_sequence(transaction.last_insert_rowid(), "domain event")?;
         let snapshot_version = SNAPSHOT_FORMAT_VERSION.to_le_bytes();
         let sequence_bytes = sequence.to_le_bytes();
@@ -156,6 +209,82 @@ impl Journal {
             occurred_at,
             event,
         ))
+    }
+
+    pub fn recent_workspace_ids(&self) -> Result<Vec<WorkspaceId>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT registry.workspace_id
+                 FROM workspace_registry AS registry
+                 CROSS JOIN application_state AS state
+                 ORDER BY (registry.workspace_id = state.active_workspace_id) DESC,
+                          length(registry.last_opened_at) DESC,
+                          registry.last_opened_at DESC,
+                          registry.workspace_id",
+            )
+            .map_err(|source| PersistenceError::database("prepare recent workspaces", source))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|source| PersistenceError::database("query recent workspaces", source))?;
+
+        let mut workspace_ids = Vec::new();
+        for row in rows {
+            let value =
+                row.map_err(|source| PersistenceError::database("read recent workspace", source))?;
+            workspace_ids.push(parse_workspace_id(&value, "workspace registry")?);
+        }
+        Ok(workspace_ids)
+    }
+
+    pub fn active_workspace_id(&self) -> Result<Option<WorkspaceId>, PersistenceError> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT active_workspace_id FROM application_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|source| PersistenceError::database("read active workspace", source))?;
+
+        value
+            .map(|value| parse_workspace_id(&value, "active workspace"))
+            .transpose()
+    }
+
+    pub fn activate_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        opened_at: Timestamp,
+    ) -> Result<(), PersistenceError> {
+        let workspace_key = workspace_id.get().to_string();
+        let opened_at_key = opened_at.as_unix_millis().to_string();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| PersistenceError::database("begin workspace activation", source))?;
+        let updated = transaction
+            .execute(
+                "UPDATE workspace_registry
+                 SET last_opened_at = ?2
+                 WHERE workspace_id = ?1",
+                params![workspace_key, opened_at_key],
+            )
+            .map_err(|source| PersistenceError::database("update workspace recency", source))?;
+        if updated == 0 {
+            return Err(PersistenceError::UnknownWorkspace { workspace_id });
+        }
+        transaction
+            .execute(
+                "UPDATE application_state
+                 SET active_workspace_id = ?1
+                 WHERE singleton = 1",
+                [workspace_key],
+            )
+            .map_err(|source| PersistenceError::database("store active workspace", source))?;
+        transaction
+            .commit()
+            .map_err(|source| PersistenceError::database("commit workspace activation", source))
     }
 
     pub fn recover(
@@ -229,7 +358,7 @@ impl SnapshotRecord {
         workspace_key: &str,
         workspace_id: WorkspaceId,
     ) -> Result<Workspace, PersistenceError> {
-        if self.format_version != SNAPSHOT_FORMAT_VERSION {
+        if self.format_version == 0 || self.format_version > SNAPSHOT_FORMAT_VERSION {
             return Err(PersistenceError::UnsupportedRecordVersion {
                 record_type: "workspace snapshot",
                 sequence: self.sequence,
@@ -248,7 +377,7 @@ impl SnapshotRecord {
             });
         }
 
-        let workspace = decode_workspace(&self.payload, self.sequence)?;
+        let workspace = decode_workspace(&self.payload, self.sequence, self.format_version)?;
         if workspace.id() != workspace_id {
             return Err(PersistenceError::invalid_record(
                 "workspace snapshot",
@@ -278,7 +407,7 @@ impl EventRecord {
         workspace_key: &str,
         workspace_id: WorkspaceId,
     ) -> Result<TimelineEvent, PersistenceError> {
-        if self.format_version != EVENT_FORMAT_VERSION {
+        if self.format_version == 0 || self.format_version > EVENT_FORMAT_VERSION {
             return Err(PersistenceError::UnsupportedRecordVersion {
                 record_type: "domain event",
                 sequence: self.sequence,
@@ -313,7 +442,7 @@ impl EventRecord {
             TimelineEventId::new(self.sequence),
             workspace_id,
             Timestamp::from_unix_millis(timestamp),
-            decode_event(&self.payload, self.sequence)?,
+            decode_event(&self.payload, self.sequence, self.format_version)?,
         ))
     }
 }
@@ -424,7 +553,7 @@ fn has_user_schema(connection: &Connection) -> Result<bool, PersistenceError> {
 }
 
 fn migrate(connection: &mut Connection, path: &Path, from: u32) -> Result<(), PersistenceError> {
-    let to = from + 1;
+    let to = SCHEMA_VERSION;
     let backup_path = if has_user_schema(connection)? {
         let backup_path = next_backup_path(path, from, to)?;
         connection
@@ -443,30 +572,53 @@ fn migrate(connection: &mut Connection, path: &Path, from: u32) -> Result<(), Pe
     };
 
     let result = (|| {
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| PersistenceError::database("begin migration", source))?;
+        for current in from..to {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|source| PersistenceError::database("begin migration", source))?;
 
-        match from {
-            0 => transaction
-                .execute_batch(MIGRATION_0_TO_1)
-                .map_err(|source| PersistenceError::database("apply schema version 1", source))?,
-            _ => {
-                return Err(PersistenceError::Configuration {
-                    detail: format!("no migration exists from schema version {from}"),
-                });
+            match current {
+                0 => transaction
+                    .execute_batch(MIGRATION_0_TO_1)
+                    .map_err(|source| {
+                        PersistenceError::database("apply schema version 1", source)
+                    })?,
+                1 => transaction
+                    .execute_batch(MIGRATION_1_TO_2)
+                    .map_err(|source| {
+                        PersistenceError::database("apply schema version 2", source)
+                    })?,
+                _ => {
+                    return Err(PersistenceError::Configuration {
+                        detail: format!("no migration exists from schema version {current}"),
+                    });
+                }
             }
-        }
 
-        transaction
-            .pragma_update(None, "user_version", i64::from(to))
-            .map_err(|source| PersistenceError::database("update schema version", source))?;
-        transaction
-            .commit()
-            .map_err(|source| PersistenceError::database("commit migration", source))
+            transaction
+                .pragma_update(None, "user_version", i64::from(current + 1))
+                .map_err(|source| PersistenceError::database("update schema version", source))?;
+            transaction
+                .commit()
+                .map_err(|source| PersistenceError::database("commit migration", source))?;
+        }
+        Ok(())
     })();
 
     result.map_err(|source| PersistenceError::migration(from, to, backup_path, source))
+}
+
+fn parse_workspace_id(
+    value: &str,
+    record_type: &'static str,
+) -> Result<WorkspaceId, PersistenceError> {
+    value.parse::<u64>().map(WorkspaceId::new).map_err(|error| {
+        PersistenceError::invalid_record(
+            record_type,
+            0,
+            format!("invalid workspace identifier {value:?}: {error}"),
+        )
+    })
 }
 
 fn next_backup_path(path: &Path, from: u32, to: u32) -> Result<PathBuf, PersistenceError> {

@@ -3,28 +3,42 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{
     Agent, AgentId, AgentState, CanvasPoint, CanvasSize, Content, DomainCommand, DomainEvent,
     Handoff, HandoffId, HandoffPayload, Name, Node, NodeId, NodeTarget, Role, RoleId, Task, TaskId,
-    TaskState, Workspace, WorkspaceId,
+    TaskState, Workspace, WorkspaceDirectory, WorkspaceIcon, WorkspaceId, WorkspaceSettings,
 };
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 1;
-pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 2;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
-    serde_json::to_vec(&EventV1::from(event)).map_err(|source| PersistenceError::Serialization {
-        record_type: "domain event",
-        source,
+    serde_json::to_vec(&StoredEvent::from(event)).map_err(|source| {
+        PersistenceError::Serialization {
+            record_type: "domain event",
+            source,
+        }
     })
 }
 
-pub(crate) fn decode_event(payload: &[u8], sequence: u64) -> Result<DomainEvent, PersistenceError> {
-    let stored: EventV1 =
+pub(crate) fn decode_event(
+    payload: &[u8],
+    sequence: u64,
+    format_version: u32,
+) -> Result<DomainEvent, PersistenceError> {
+    let stored: StoredEvent =
         serde_json::from_slice(payload).map_err(|source| PersistenceError::Deserialization {
             record_type: "domain event",
             sequence,
             source,
         })?;
+
+    if format_version == 1 && matches!(stored, StoredEvent::WorkspaceSettingsChanged { .. }) {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "workspace settings changes require event format version 2",
+        ));
+    }
 
     stored
         .into_domain()
@@ -32,7 +46,7 @@ pub(crate) fn decode_event(payload: &[u8], sequence: u64) -> Result<DomainEvent,
 }
 
 pub(crate) fn encode_workspace(workspace: &Workspace) -> Result<Vec<u8>, PersistenceError> {
-    serde_json::to_vec(&WorkspaceV1::from(workspace)).map_err(|source| {
+    serde_json::to_vec(&StoredWorkspace::from(workspace)).map_err(|source| {
         PersistenceError::Serialization {
             record_type: "workspace snapshot",
             source,
@@ -43,8 +57,9 @@ pub(crate) fn encode_workspace(workspace: &Workspace) -> Result<Vec<u8>, Persist
 pub(crate) fn decode_workspace(
     payload: &[u8],
     sequence: u64,
+    format_version: u32,
 ) -> Result<Workspace, PersistenceError> {
-    let stored: WorkspaceV1 =
+    let stored: StoredWorkspace =
         serde_json::from_slice(payload).map_err(|source| PersistenceError::Deserialization {
             record_type: "workspace snapshot",
             sequence,
@@ -52,7 +67,7 @@ pub(crate) fn decode_workspace(
         })?;
 
     stored
-        .into_domain()
+        .into_domain(format_version)
         .map_err(|detail| PersistenceError::invalid_record("workspace snapshot", sequence, detail))
 }
 
@@ -67,7 +82,11 @@ pub(crate) fn checksum(parts: &[&[u8]]) -> [u8; 32] {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum EventV1 {
+enum StoredEvent {
+    WorkspaceSettingsChanged {
+        from: StoredWorkspaceSettings,
+        to: StoredWorkspaceSettings,
+    },
     RoleAdded {
         role: RoleV1,
     },
@@ -95,9 +114,13 @@ enum EventV1 {
     },
 }
 
-impl From<&DomainEvent> for EventV1 {
+impl From<&DomainEvent> for StoredEvent {
     fn from(event: &DomainEvent) -> Self {
         match event {
+            DomainEvent::WorkspaceSettingsChanged { from, to } => Self::WorkspaceSettingsChanged {
+                from: StoredWorkspaceSettings::from(from),
+                to: StoredWorkspaceSettings::from(to),
+            },
             DomainEvent::RoleAdded(role) => Self::RoleAdded {
                 role: RoleV1::from(role),
             },
@@ -127,9 +150,15 @@ impl From<&DomainEvent> for EventV1 {
     }
 }
 
-impl EventV1 {
+impl StoredEvent {
     fn into_domain(self) -> Result<DomainEvent, String> {
         match self {
+            Self::WorkspaceSettingsChanged { from, to } => {
+                Ok(DomainEvent::WorkspaceSettingsChanged {
+                    from: from.into_domain()?,
+                    to: to.into_domain()?,
+                })
+            }
             Self::RoleAdded { role } => Ok(DomainEvent::RoleAdded(role.into_domain()?)),
             Self::AgentAdded { agent } => {
                 let (agent, state) = agent.into_domain()?;
@@ -163,9 +192,15 @@ impl EventV1 {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkspaceV1 {
+struct StoredWorkspace {
     id: u64,
     name: String,
+    #[serde(default)]
+    icon: Option<String>,
+    #[serde(default)]
+    working_directory: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
     roles: Vec<RoleV1>,
     agents: Vec<AgentV1>,
     tasks: Vec<TaskV1>,
@@ -173,11 +208,23 @@ struct WorkspaceV1 {
     nodes: Vec<NodeV1>,
 }
 
-impl From<&Workspace> for WorkspaceV1 {
+impl From<&Workspace> for StoredWorkspace {
     fn from(workspace: &Workspace) -> Self {
         Self {
             id: workspace.id().get(),
             name: workspace.name().to_owned(),
+            icon: workspace
+                .settings()
+                .icon()
+                .map(|icon| icon.as_str().to_owned()),
+            working_directory: workspace
+                .settings()
+                .working_directory()
+                .map(|directory| directory.as_str().to_owned()),
+            instructions: workspace
+                .settings()
+                .instructions()
+                .map(|instructions| instructions.as_str().to_owned()),
             roles: workspace.roles().map(RoleV1::from).collect(),
             agents: workspace.agents().map(AgentV1::from).collect(),
             tasks: workspace.tasks().map(TaskV1::from).collect(),
@@ -187,12 +234,30 @@ impl From<&Workspace> for WorkspaceV1 {
     }
 }
 
-impl WorkspaceV1 {
-    fn into_domain(self) -> Result<Workspace, String> {
-        let mut workspace = Workspace::new(
-            WorkspaceId::new(self.id),
-            Name::new(self.name).map_err(|error| error.to_string())?,
-        );
+impl StoredWorkspace {
+    fn into_domain(self, format_version: u32) -> Result<Workspace, String> {
+        if format_version == 1
+            && (self.icon.is_some()
+                || self.working_directory.is_some()
+                || self.instructions.is_some())
+        {
+            return Err("workspace settings require snapshot format version 2".to_owned());
+        }
+
+        let settings = StoredWorkspaceSettings {
+            name: self.name,
+            icon: self.icon,
+            working_directory: self.working_directory,
+            instructions: self.instructions,
+        }
+        .into_domain()?;
+        let mut workspace = Workspace::new(WorkspaceId::new(self.id), settings.name().clone());
+        if workspace.settings() != &settings {
+            apply_snapshot_command(
+                &mut workspace,
+                DomainCommand::UpdateWorkspaceSettings(settings),
+            )?;
+        }
 
         for role in self.roles {
             apply_snapshot_command(&mut workspace, DomainCommand::AddRole(role.into_domain()?))?;
@@ -229,6 +294,50 @@ impl WorkspaceV1 {
         }
 
         Ok(workspace)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredWorkspaceSettings {
+    name: String,
+    icon: Option<String>,
+    working_directory: Option<String>,
+    instructions: Option<String>,
+}
+
+impl From<&WorkspaceSettings> for StoredWorkspaceSettings {
+    fn from(settings: &WorkspaceSettings) -> Self {
+        Self {
+            name: settings.name().as_str().to_owned(),
+            icon: settings.icon().map(|icon| icon.as_str().to_owned()),
+            working_directory: settings
+                .working_directory()
+                .map(|directory| directory.as_str().to_owned()),
+            instructions: settings
+                .instructions()
+                .map(|instructions| instructions.as_str().to_owned()),
+        }
+    }
+}
+
+impl StoredWorkspaceSettings {
+    fn into_domain(self) -> Result<WorkspaceSettings, String> {
+        Ok(WorkspaceSettings::new(
+            Name::new(self.name).map_err(|error| error.to_string())?,
+            self.icon
+                .map(WorkspaceIcon::new)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+            self.working_directory
+                .map(WorkspaceDirectory::new)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+            self.instructions
+                .map(Content::new)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+        ))
     }
 }
 

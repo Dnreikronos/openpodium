@@ -72,6 +72,14 @@ fn value_objects_reject_invalid_values() {
         ValidationProblem::Empty
     );
     assert_eq!(
+        WorkspaceIcon::new("  ").unwrap_err().problem(),
+        ValidationProblem::Empty
+    );
+    assert_eq!(
+        WorkspaceDirectory::new("").unwrap_err().problem(),
+        ValidationProblem::Empty
+    );
+    assert_eq!(
         CanvasPoint::new(f32::NAN, 0.0).unwrap_err().problem(),
         ValidationProblem::NotFinite
     );
@@ -79,6 +87,58 @@ fn value_objects_reject_invalid_values() {
         CanvasSize::new(0.0, 100.0).unwrap_err().problem(),
         ValidationProblem::NotPositive
     );
+}
+
+#[test]
+fn workspace_settings_changes_are_explicit_and_atomic() {
+    let mut workspace = test_workspace();
+    let before = workspace.settings().clone();
+    let settings = WorkspaceSettings::new(
+        name("Renamed workspace"),
+        Some(WorkspaceIcon::new("🚀").unwrap()),
+        Some(WorkspaceDirectory::new("/projects/openpodium").unwrap()),
+        Some(content("Prefer targeted tests")),
+    );
+
+    let event = workspace
+        .execute(DomainCommand::UpdateWorkspaceSettings(settings.clone()))
+        .unwrap();
+
+    assert_eq!(
+        event,
+        DomainEvent::WorkspaceSettingsChanged {
+            from: before,
+            to: settings.clone(),
+        }
+    );
+    assert_eq!(workspace.settings(), &settings);
+    assert_eq!(workspace.name(), "Renamed workspace");
+    assert_eq!(
+        workspace.settings().working_directory().unwrap().as_str(),
+        "/projects/openpodium"
+    );
+}
+
+#[test]
+fn workspace_settings_reject_no_ops_and_stale_replay() {
+    let mut workspace = test_workspace();
+    let unchanged = workspace.settings().clone();
+
+    assert_eq!(
+        workspace.execute(DomainCommand::UpdateWorkspaceSettings(unchanged.clone())),
+        Err(DomainError::UnchangedWorkspaceSettings)
+    );
+
+    let before = workspace.clone();
+    let stale = DomainEvent::WorkspaceSettingsChanged {
+        from: WorkspaceSettings::new(name("Stale"), None, None, None),
+        to: unchanged,
+    };
+    assert_eq!(
+        workspace.apply(&stale),
+        Err(DomainError::WorkspaceSettingsConflict)
+    );
+    assert_eq!(workspace, before);
 }
 
 #[test]
