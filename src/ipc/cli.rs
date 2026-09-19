@@ -3,7 +3,7 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
 
 use super::{
-    ClientError, ConnectionConfig, ErrorCode, IpcClient, MessageId, ProtocolCommand,
+    ClientError, ConnectionConfig, ErrorCode, HandoffKind, IpcClient, MessageId, ProtocolCommand,
     ProtocolResponse, ResponseStatus,
 };
 
@@ -15,7 +15,7 @@ const EXIT_AUTHENTICATION: u8 = 5;
 const EXIT_COMPATIBILITY: u8 = 6;
 const EXIT_REJECTED: u8 = 7;
 
-const USAGE: &str = "Usage:\n  openpodium ipc agents list\n  openpodium ipc task send --to <agent-id> --title <title> --body <text> [--message-id <id>]\n  openpodium ipc progress report --task <message-id> --body <text> [--message-id <id>]\n  openpodium ipc respond --task <message-id> --status <completed|failed|blocked> --body <text> [--message-id <id>]";
+const USAGE: &str = "Usage:\n  openpodium ipc agents list\n  openpodium ipc task send --to <agent-id> --title <title> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]\n  openpodium ipc question send --to <agent-id> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]\n  openpodium ipc progress report --handoff <message-id> --body <text> [--message-id <id>]\n  openpodium ipc respond --handoff <message-id> --status <completed|failed|blocked> --body <text> [--message-id <id>]\n  openpodium ipc cancel --handoff <message-id> --reason <text> [--message-id <id>]";
 
 pub fn run_cli(arguments: impl IntoIterator<Item = String>) -> u8 {
     let mut stdout = io::stdout().lock();
@@ -98,30 +98,55 @@ fn parse_command(arguments: &[String]) -> Result<ProtocolCommand, CliUsageError>
     match words.as_slice() {
         ["ipc", "agents", "list"] => Ok(ProtocolCommand::ListAgents),
         ["ipc", "task", "send", options @ ..] => {
-            let options = parse_options(options, &["--to", "--title", "--body", "--message-id"])?;
-            Ok(ProtocolCommand::SendTask {
+            let options = parse_options(
+                options,
+                &[
+                    "--to",
+                    "--title",
+                    "--body",
+                    "--parent",
+                    "--timeout-ms",
+                    "--message-id",
+                ],
+            )?;
+            Ok(ProtocolCommand::SendHandoff {
                 message_id: message_id(&options, "task")?,
-                recipient_agent_id: required(&options, "--to")?
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|id| *id > 0)
-                    .ok_or_else(|| CliUsageError("--to must be a positive agent ID".to_owned()))?,
-                title: required(&options, "--title")?.to_owned(),
+                recipient_agent_id: recipient_id(&options)?,
+                kind: HandoffKind::Task,
+                title: Some(required(&options, "--title")?.to_owned()),
                 body: required(&options, "--body")?.to_owned(),
+                parent_message_id: optional_id(&options, "--parent")?,
+                response_timeout_ms: optional_timeout(&options)?,
+            })
+        }
+        ["ipc", "question", "send", options @ ..] => {
+            let options = parse_options(
+                options,
+                &["--to", "--body", "--parent", "--timeout-ms", "--message-id"],
+            )?;
+            Ok(ProtocolCommand::SendHandoff {
+                message_id: message_id(&options, "question")?,
+                recipient_agent_id: recipient_id(&options)?,
+                kind: HandoffKind::Question,
+                title: None,
+                body: required(&options, "--body")?.to_owned(),
+                parent_message_id: optional_id(&options, "--parent")?,
+                response_timeout_ms: optional_timeout(&options)?,
             })
         }
         ["ipc", "progress", "report", options @ ..] => {
-            let options = parse_options(options, &["--task", "--body", "--message-id"])?;
-            Ok(ProtocolCommand::ReportProgress {
+            let options = parse_options(options, &["--handoff", "--body", "--message-id"])?;
+            Ok(ProtocolCommand::ReportHandoffProgress {
                 message_id: message_id(&options, "progress")?,
-                task_message_id: MessageId::new(required(&options, "--task")?.to_owned())
-                    .map_err(|error| CliUsageError(format!("invalid --task: {error}")))?,
+                handoff_message_id: required_id(&options, "--handoff")?,
                 body: required(&options, "--body")?.to_owned(),
             })
         }
         ["ipc", "respond", options @ ..] => {
-            let options =
-                parse_options(options, &["--task", "--status", "--body", "--message-id"])?;
+            let options = parse_options(
+                options,
+                &["--handoff", "--status", "--body", "--message-id"],
+            )?;
             let status = match required(&options, "--status")? {
                 "completed" => ResponseStatus::Completed,
                 "failed" => ResponseStatus::Failed,
@@ -132,12 +157,19 @@ fn parse_command(arguments: &[String]) -> Result<ProtocolCommand, CliUsageError>
                     ));
                 }
             };
-            Ok(ProtocolCommand::Respond {
+            Ok(ProtocolCommand::RespondToHandoff {
                 message_id: message_id(&options, "response")?,
-                task_message_id: MessageId::new(required(&options, "--task")?.to_owned())
-                    .map_err(|error| CliUsageError(format!("invalid --task: {error}")))?,
+                handoff_message_id: required_id(&options, "--handoff")?,
                 status,
                 body: required(&options, "--body")?.to_owned(),
+            })
+        }
+        ["ipc", "cancel", options @ ..] => {
+            let options = parse_options(options, &["--handoff", "--reason", "--message-id"])?;
+            Ok(ProtocolCommand::CancelHandoff {
+                message_id: message_id(&options, "cancel")?,
+                handoff_message_id: required_id(&options, "--handoff")?,
+                reason: required(&options, "--reason")?.to_owned(),
             })
         }
         _ => Err(CliUsageError("unknown IPC command".to_owned())),
@@ -186,6 +218,45 @@ fn message_id(options: &BTreeMap<&str, &str>, prefix: &str) -> Result<MessageId,
                 .map_err(|error| CliUsageError(format!("invalid --message-id: {error}")))
         },
     )
+}
+
+fn recipient_id(options: &BTreeMap<&str, &str>) -> Result<u64, CliUsageError> {
+    required(options, "--to")?
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| CliUsageError("--to must be a positive agent ID".to_owned()))
+}
+
+fn required_id(options: &BTreeMap<&str, &str>, name: &str) -> Result<MessageId, CliUsageError> {
+    MessageId::new(required(options, name)?.to_owned())
+        .map_err(|error| CliUsageError(format!("invalid {name}: {error}")))
+}
+
+fn optional_id(
+    options: &BTreeMap<&str, &str>,
+    name: &str,
+) -> Result<Option<MessageId>, CliUsageError> {
+    options
+        .get(name)
+        .map(|value| {
+            MessageId::new((*value).to_owned())
+                .map_err(|error| CliUsageError(format!("invalid {name}: {error}")))
+        })
+        .transpose()
+}
+
+fn optional_timeout(options: &BTreeMap<&str, &str>) -> Result<Option<u64>, CliUsageError> {
+    options
+        .get("--timeout-ms")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|timeout| *timeout > 0)
+                .ok_or_else(|| CliUsageError("--timeout-ms must be a positive integer".to_owned()))
+        })
+        .transpose()
 }
 
 fn random_id(prefix: &str) -> Result<MessageId, ClientError> {
@@ -252,19 +323,44 @@ mod tests {
                 "task-1",
             ]))
             .unwrap(),
-            ProtocolCommand::SendTask {
+            ProtocolCommand::SendHandoff {
                 message_id: MessageId::new("task-1").unwrap(),
                 recipient_agent_id: 8,
-                title: "Review".to_owned(),
+                kind: HandoffKind::Task,
+                title: Some("Review".to_owned()),
                 body: "$(touch /tmp/unsafe)".to_owned(),
+                parent_message_id: None,
+                response_timeout_ms: None,
             }
         );
         assert!(matches!(
             parse_command(&arguments(&[
                 "ipc",
+                "question",
+                "send",
+                "--to",
+                "7",
+                "--body",
+                "Which API?",
+                "--parent",
+                "task-1",
+                "--timeout-ms",
+                "30000",
+            ]))
+            .unwrap(),
+            ProtocolCommand::SendHandoff {
+                kind: HandoffKind::Question,
+                parent_message_id: Some(_),
+                response_timeout_ms: Some(30_000),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_command(&arguments(&[
+                "ipc",
                 "progress",
                 "report",
-                "--task",
+                "--handoff",
                 "task-1",
                 "--body",
                 "Running tests",
@@ -272,13 +368,13 @@ mod tests {
                 "progress-1",
             ]))
             .unwrap(),
-            ProtocolCommand::ReportProgress { .. }
+            ProtocolCommand::ReportHandoffProgress { .. }
         ));
         assert!(matches!(
             parse_command(&arguments(&[
                 "ipc",
                 "respond",
-                "--task",
+                "--handoff",
                 "task-1",
                 "--status",
                 "completed",
@@ -288,10 +384,22 @@ mod tests {
                 "response-1",
             ]))
             .unwrap(),
-            ProtocolCommand::Respond {
+            ProtocolCommand::RespondToHandoff {
                 status: ResponseStatus::Completed,
                 ..
             }
+        ));
+        assert!(matches!(
+            parse_command(&arguments(&[
+                "ipc",
+                "cancel",
+                "--handoff",
+                "task-1",
+                "--reason",
+                "No longer needed",
+            ]))
+            .unwrap(),
+            ProtocolCommand::CancelHandoff { .. }
         ));
     }
 
@@ -306,7 +414,15 @@ mod tests {
         );
 
         let duplicate = parse_command(&arguments(&[
-            "ipc", "progress", "report", "--task", "task-1", "--body", "one", "--body", "two",
+            "ipc",
+            "progress",
+            "report",
+            "--handoff",
+            "task-1",
+            "--body",
+            "one",
+            "--body",
+            "two",
         ]));
         assert_eq!(
             duplicate.unwrap_err(),

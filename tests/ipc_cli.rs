@@ -81,3 +81,48 @@ fn binary_uses_distinct_exit_status_for_rejected_authentication() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("unauthorized"));
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn binary_sends_a_version_two_question() {
+    let (_temp, service) = service();
+    let connection = service.connection_info(4, 7).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openpodium"))
+        .args([
+            "ipc",
+            "question",
+            "send",
+            "--to",
+            "8",
+            "--body",
+            "Which module owns delivery?",
+            "--timeout-ms",
+            "30000",
+            "--message-id",
+            "question-1",
+        ])
+        .env(AVAILABLE_ENV, "1")
+        .env(ENDPOINT_ENV, connection.endpoint().to_string())
+        .env(TOKEN_ENV, connection.token())
+        .env(VERSIONS_ENV, "2,1")
+        .env(WORKSPACE_ID_ENV, "4")
+        .env(AGENT_ID_ENV, "7")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let accepted = service.try_recv().unwrap();
+    assert_eq!(accepted.recipient_agent_id, 8);
+    assert!(matches!(
+        accepted.command,
+        openpodium::ipc::ProtocolCommand::SendHandoff {
+            kind: openpodium::ipc::HandoffKind::Question,
+            response_timeout_ms: Some(30_000),
+            ..
+        }
+    ));
+}

@@ -3,6 +3,7 @@ use std::sync::Barrier;
 use tempfile::TempDir;
 
 use super::*;
+use crate::ipc::{HandoffKind, LEGACY_PROTOCOL_VERSION, ResponseStatus};
 
 fn registration(id: u64, name: &str) -> AgentRegistration {
     AgentRegistration {
@@ -87,7 +88,7 @@ fn incompatible_versions_return_supported_versions_and_upgrade_guidance() {
 
     let error = response.error.unwrap();
     assert_eq!(error.code, ErrorCode::IncompatibleProtocol);
-    assert_eq!(error.supported_versions, Some(vec![PROTOCOL_VERSION]));
+    assert_eq!(error.supported_versions, Some(SUPPORTED_VERSIONS.to_vec()));
     assert!(error.message.contains("upgrade"));
 }
 
@@ -153,6 +154,68 @@ fn identical_retries_publish_once_and_conflicting_reuse_is_rejected() {
 }
 
 #[test]
+fn accepted_messages_and_idempotency_survive_service_restart() {
+    let temp = TempDir::new().unwrap();
+    let command = ProtocolCommand::SendTask {
+        message_id: MessageId::new("task-durable").unwrap(),
+        recipient_agent_id: 2,
+        title: "Persist me".to_owned(),
+        body: "Remain pending across restart".to_owned(),
+    };
+
+    {
+        let service = IpcService::start(temp.path()).unwrap();
+        service.replace_workspace_agents(1, [registration(1, "Lead"), registration(2, "Builder")]);
+        let response = round_trip(
+            service.endpoint(),
+            &request(&service, 1, 1, "request-1", command.clone()),
+        );
+        assert!(matches!(
+            response.result,
+            Some(ProtocolResult::Accepted {
+                duplicate: false,
+                ..
+            })
+        ));
+    }
+
+    {
+        let service = IpcService::start(temp.path()).unwrap();
+        service.replace_workspace_agents(1, [registration(1, "Lead"), registration(2, "Builder")]);
+        let retry = round_trip(
+            service.endpoint(),
+            &request(&service, 1, 1, "request-2", command.clone()),
+        );
+        assert!(matches!(
+            retry.result,
+            Some(ProtocolResult::Accepted {
+                duplicate: true,
+                ..
+            })
+        ));
+
+        let recovered = service.next_message().unwrap().unwrap();
+        assert_eq!(recovered.command, command);
+        assert!(service.mark_processed(&recovered).unwrap());
+    }
+
+    let service = IpcService::start(temp.path()).unwrap();
+    service.replace_workspace_agents(1, [registration(1, "Lead"), registration(2, "Builder")]);
+    assert!(service.next_message().unwrap().is_none());
+    let retry = round_trip(
+        service.endpoint(),
+        &request(&service, 1, 1, "request-3", command),
+    );
+    assert!(matches!(
+        retry.result,
+        Some(ProtocolResult::Accepted {
+            duplicate: true,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn progress_and_response_route_back_to_the_task_sender() {
     let (_temp, service) = service();
     let task = ProtocolCommand::SendTask {
@@ -181,6 +244,145 @@ fn progress_and_response_route_back_to_the_task_sender() {
     assert_eq!(task.recipient_agent_id, 2);
     assert_eq!(progress.sender_agent_id, 2);
     assert_eq!(progress.recipient_agent_id, 1);
+}
+
+#[test]
+fn version_two_questions_progress_responses_and_cancellation_are_routed() {
+    let (_temp, service) = service();
+    let question = ProtocolCommand::SendHandoff {
+        message_id: MessageId::new("question-1").unwrap(),
+        recipient_agent_id: 2,
+        kind: HandoffKind::Question,
+        title: None,
+        body: "Which API should I use?".to_owned(),
+        parent_message_id: None,
+        response_timeout_ms: Some(30_000),
+    };
+    let sent = round_trip(
+        service.endpoint(),
+        &request(&service, 1, 1, "request-1", question),
+    );
+    assert_eq!(sent.version, Some(2));
+
+    for (request_id, command) in [
+        (
+            "request-2",
+            ProtocolCommand::ReportHandoffProgress {
+                message_id: MessageId::new("progress-1").unwrap(),
+                handoff_message_id: MessageId::new("question-1").unwrap(),
+                body: "Checking the domain model".to_owned(),
+            },
+        ),
+        (
+            "request-3",
+            ProtocolCommand::RespondToHandoff {
+                message_id: MessageId::new("response-1").unwrap(),
+                handoff_message_id: MessageId::new("question-1").unwrap(),
+                status: ResponseStatus::Completed,
+                body: "Use the workspace aggregate".to_owned(),
+            },
+        ),
+    ] {
+        let response = round_trip(
+            service.endpoint(),
+            &request(&service, 1, 2, request_id, command),
+        );
+        assert!(
+            response.error.is_none(),
+            "unexpected response: {response:?}"
+        );
+    }
+
+    let cancellation = round_trip(
+        service.endpoint(),
+        &request(
+            &service,
+            1,
+            1,
+            "request-4",
+            ProtocolCommand::CancelHandoff {
+                message_id: MessageId::new("cancel-1").unwrap(),
+                handoff_message_id: MessageId::new("question-1").unwrap(),
+                reason: "Answered out of band".to_owned(),
+            },
+        ),
+    );
+    assert!(cancellation.error.is_none());
+
+    let messages: Vec<_> = std::iter::from_fn(|| service.try_recv()).collect();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0].recipient_agent_id, 2);
+    assert_eq!(messages[1].recipient_agent_id, 1);
+    assert_eq!(messages[2].recipient_agent_id, 1);
+    assert_eq!(messages[3].recipient_agent_id, 2);
+}
+
+#[test]
+fn legacy_clients_negotiate_version_one_and_cannot_send_v2_commands() {
+    let (_temp, service) = service();
+    let mut list = request(&service, 1, 1, "request-1", ProtocolCommand::ListAgents);
+    list.supported_versions = vec![LEGACY_PROTOCOL_VERSION];
+    let response = round_trip(service.endpoint(), &list);
+    assert_eq!(response.version, Some(LEGACY_PROTOCOL_VERSION));
+
+    let mut question = request(
+        &service,
+        1,
+        1,
+        "request-2",
+        ProtocolCommand::SendHandoff {
+            message_id: MessageId::new("question-1").unwrap(),
+            recipient_agent_id: 2,
+            kind: HandoffKind::Question,
+            title: None,
+            body: "Question".to_owned(),
+            parent_message_id: None,
+            response_timeout_ms: None,
+        },
+    );
+    question.supported_versions = vec![LEGACY_PROTOCOL_VERSION];
+    let response = round_trip(service.endpoint(), &question);
+    assert_eq!(
+        response.error.unwrap().code,
+        ErrorCode::IncompatibleProtocol
+    );
+}
+
+#[test]
+fn unavailable_adapters_reject_handoffs_before_they_enter_the_queue() {
+    let (_temp, service) = service();
+    service.replace_workspace_agents(
+        1,
+        [
+            registration(1, "Lead"),
+            AgentRegistration {
+                capabilities: AgentCapabilities::UNAVAILABLE,
+                ..registration(2, "Shell")
+            },
+        ],
+    );
+
+    let response = round_trip(
+        service.endpoint(),
+        &request(
+            &service,
+            1,
+            1,
+            "request-1",
+            ProtocolCommand::SendHandoff {
+                message_id: MessageId::new("question-1").unwrap(),
+                recipient_agent_id: 2,
+                kind: HandoffKind::Question,
+                title: None,
+                body: "Can you receive this?".to_owned(),
+                parent_message_id: None,
+                response_timeout_ms: None,
+            },
+        ),
+    );
+
+    assert_eq!(response.error.unwrap().code, ErrorCode::InvalidRequest);
+    assert!(service.next_message().unwrap().is_none());
 }
 
 #[test]
