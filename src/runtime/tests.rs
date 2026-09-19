@@ -29,11 +29,12 @@ async fn interactive_shell_uses_working_directory_and_accepts_input() {
         .expect("interactive shell starts");
 
     let mut output = initialize_terminal_host(&mut process).await;
-    process
+    let controller = process.controller();
+    controller
         .write_input(shell_input_for_working_directory())
         .expect("input reaches shell");
     output.extend(collect_until_output(&mut process, b"__OPENPODIUM_READY__").await);
-    process
+    controller
         .write_input(shell_exit_input())
         .expect("exit reaches shell");
     let (remaining_output, termination) = collect_process(&mut process).await;
@@ -64,12 +65,13 @@ async fn resize_is_visible_inside_the_child_terminal() {
         .expect("interactive shell starts");
 
     let _ = initialize_terminal_host(&mut process).await;
-    process.resize(size).expect("PTY resizes");
-    process
+    let controller = process.controller();
+    controller.resize(size).expect("PTY resizes");
+    controller
         .write_input(shell_input_for_terminal_size())
         .expect("terminal query reaches shell");
     let mut output = collect_until_output(&mut process, b"41 111").await;
-    process
+    controller
         .write_input(shell_exit_input())
         .expect("exit reaches shell");
     let (remaining_output, termination) = collect_process(&mut process).await;

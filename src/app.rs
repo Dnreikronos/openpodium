@@ -1,18 +1,24 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
-use iced::{Element, Fill, Theme};
+use iced::{Element, Fill, Task, Theme, clipboard};
 use openpodium::domain::{
     Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, DomainCommand, Name, Node,
     NodeId, NodeTarget, Timestamp, Workspace, WorkspaceId,
 };
+use openpodium::runtime::{LocalProcessRuntime, ProcessEvent, ProcessRuntime, RuntimeError};
 use openpodium::workspaces::{WorkspaceManager, WorkspaceSettingsInput};
+use tokio::sync::Mutex;
 
 use crate::canvas::{self, Alignment, Camera, History, ZOrder};
+use crate::terminal;
+use crate::terminal::session::{self, Action as TerminalAction, ProcessStream, Session};
 
 const APP_NAME: &str = "OpenPodium";
 const DATABASE_FILE: &str = "openpodium.sqlite";
@@ -23,6 +29,9 @@ struct OpenPodium {
     canvas_preview: Option<CanvasLayout>,
     canvas_history: History,
     canvas_revision: u64,
+    terminals: BTreeMap<NodeId, Session>,
+    focused_terminal: Option<NodeId>,
+    terminal_generation: u64,
     workspaces: Option<WorkspaceManager>,
     create_directory: String,
     name: String,
@@ -47,6 +56,9 @@ impl Default for OpenPodium {
             canvas_preview: None,
             canvas_history: History::default(),
             canvas_revision: 1,
+            terminals: BTreeMap::new(),
+            focused_terminal: None,
+            terminal_generation: 0,
             workspaces,
             create_directory: String::new(),
             name: String::new(),
@@ -60,7 +72,7 @@ impl Default for OpenPodium {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Message {
     Canvas(canvas::Message),
     AddAgent(AgentProgram),
@@ -73,6 +85,22 @@ enum Message {
     WorkingDirectoryChanged(String),
     InstructionsChanged(String),
     SaveSettings,
+    StartTerminal(NodeId),
+    StopTerminal(NodeId),
+    TerminalStarted {
+        node_id: NodeId,
+        generation: u64,
+        result: Result<ProcessStream, RuntimeError>,
+    },
+    TerminalEvent {
+        node_id: NodeId,
+        generation: u64,
+        event: Option<ProcessEvent>,
+    },
+    ClipboardRead {
+        node_id: NodeId,
+        contents: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -96,10 +124,10 @@ pub(crate) fn run() -> iced::Result {
         .run()
 }
 
-fn update(state: &mut OpenPodium, message: Message) {
+fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
-        Message::Canvas(message) => handle_canvas_message(state, message),
-        Message::AddAgent(program) => add_agent(state, program),
+        Message::Canvas(message) => return handle_canvas_message(state, message),
+        Message::AddAgent(program) => return add_agent(state, program),
         Message::CanvasAction(action) => apply_canvas_action(state, action),
         Message::CreateDirectoryChanged(value) => state.create_directory = value,
         Message::NameChanged(value) => state.name = value,
@@ -152,7 +180,7 @@ fn update(state: &mut OpenPodium, message: Message) {
                 .and_then(WorkspaceManager::active_workspace_id)
             else {
                 state.notice = Some("Create or select a workspace first".to_owned());
-                return;
+                return Task::none();
             };
             let input = WorkspaceSettingsInput {
                 name: state.name.clone(),
@@ -170,7 +198,27 @@ fn update(state: &mut OpenPodium, message: Message) {
                 Err(error) => error.to_string(),
             });
         }
+        Message::StartTerminal(node_id) => return start_terminal(state, node_id),
+        Message::StopTerminal(node_id) => stop_terminal(state, node_id),
+        Message::TerminalStarted {
+            node_id,
+            generation,
+            result,
+        } => return handle_terminal_started(state, node_id, generation, result),
+        Message::TerminalEvent {
+            node_id,
+            generation,
+            event,
+        } => return handle_terminal_event(state, node_id, generation, event),
+        Message::ClipboardRead { node_id, contents } => {
+            if let (Some(session), Some(contents)) = (state.terminals.get(&node_id), contents) {
+                if let Err(error) = session.paste(&contents) {
+                    state.notice = Some(error);
+                }
+            }
+        }
     }
+    Task::none()
 }
 
 fn view(state: &OpenPodium) -> Element<'_, Message> {
@@ -296,6 +344,17 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     if let Some(notice) = &state.notice {
         settings = settings.push(text(notice));
     }
+    if let Some(node_id) = selected_terminal_node(state) {
+        let active = state
+            .terminals
+            .get(&node_id)
+            .is_some_and(Session::is_active);
+        settings = settings.push(text("Terminal").size(18)).push(if active {
+            button("Stop terminal").on_press(Message::StopTerminal(node_id))
+        } else {
+            button("Start terminal").on_press(Message::StartTerminal(node_id))
+        });
+    }
 
     let stage: Element<'_, Message> = if has_active_workspace {
         let workspace = state
@@ -307,12 +366,14 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .canvas_preview
             .clone()
             .unwrap_or_else(|| workspace.canvas_layout());
-        let document = canvas::CanvasDocument::new(workspace, layout);
+        let terminal_views = terminal_views(state, &layout);
+        let document = canvas::CanvasDocument::new(workspace, layout, terminal_views);
         row![
             canvas::view(
                 state.camera,
                 document,
                 state.canvas_selection.clone(),
+                state.focused_terminal,
                 state.canvas_revision,
             )
             .map(Message::Canvas),
@@ -336,11 +397,20 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
 
 impl OpenPodium {
     fn reset_canvas_session(&mut self) {
+        self.stop_all_terminals();
         self.camera = Camera::default();
         self.canvas_selection.clear();
         self.canvas_preview = None;
         self.canvas_history.clear();
         self.canvas_revision = self.canvas_revision.wrapping_add(1);
+    }
+
+    fn stop_all_terminals(&mut self) {
+        for session in self.terminals.values_mut() {
+            let _ = session.stop();
+        }
+        self.terminals.clear();
+        self.focused_terminal = None;
     }
 
     fn load_active_settings(&mut self) {
@@ -372,7 +442,13 @@ impl OpenPodium {
     }
 }
 
-fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) {
+impl Drop for OpenPodium {
+    fn drop(&mut self) {
+        self.stop_all_terminals();
+    }
+}
+
+fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Task<Message> {
     match message {
         canvas::Message::CameraChanged(camera) => {
             state.camera = camera;
@@ -380,6 +456,7 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) {
         }
         canvas::Message::SelectionChanged(selection) => {
             state.canvas_selection = selection;
+            state.focused_terminal = None;
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
         }
         canvas::Message::PreviewLayout(layout) => {
@@ -399,10 +476,66 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) {
         canvas::Message::DuplicateRequested => {
             apply_canvas_action(state, CanvasAction::Duplicate);
         }
+        canvas::Message::TerminalFocused(node_id) => {
+            state.focused_terminal = node_id;
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        }
+        canvas::Message::TerminalInput { node_id, bytes } => {
+            if let Some(session) = state.terminals.get(&node_id) {
+                if let Err(error) = session.write(&bytes) {
+                    state.notice = Some(error);
+                }
+            }
+        }
+        canvas::Message::TerminalPasteRequested(node_id) => {
+            return clipboard::read()
+                .map(move |contents| Message::ClipboardRead { node_id, contents });
+        }
+        canvas::Message::TerminalCopyRequested(node_id) => {
+            if let Some(text) = state
+                .terminals
+                .get(&node_id)
+                .and_then(Session::selected_text)
+            {
+                return clipboard::write(text);
+            }
+        }
+        canvas::Message::TerminalScrolled { node_id, lines } => {
+            if let Some(session) = state.terminals.get_mut(&node_id) {
+                session.scroll(lines);
+                state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            }
+        }
+        canvas::Message::TerminalSelectionStarted {
+            node_id,
+            row,
+            column,
+            right_side,
+        } => {
+            state.focused_terminal = Some(node_id);
+            state.canvas_selection = vec![node_id];
+            if let Some(session) = state.terminals.get_mut(&node_id) {
+                session.clear_selection();
+                session.begin_selection(row, column, right_side);
+            }
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        }
+        canvas::Message::TerminalSelectionUpdated {
+            node_id,
+            row,
+            column,
+            right_side,
+        } => {
+            if let Some(session) = state.terminals.get_mut(&node_id) {
+                session.update_selection(row, column, right_side);
+                state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            }
+        }
     }
+    Task::none()
 }
 
-fn add_agent(state: &mut OpenPodium, program: AgentProgram) {
+fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
     let Some((workspace_id, agent_id, node_id, before, node)) = state
         .workspaces
         .as_ref()
@@ -434,7 +567,7 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) {
         })
     else {
         state.notice = Some("Create or select a workspace first".to_owned());
-        return;
+        return Task::none();
     };
     let label = agent_program_name(program);
     let agent = Agent::with_program(
@@ -458,12 +591,160 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) {
             state.canvas_selection = vec![node_id];
             state.canvas_preview = None;
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
-            state.notice = Some(format!(
-                "{label} agent added; terminal runtime is not connected yet"
-            ));
+            state.notice = Some(format!("{label} agent added; terminal starting"));
+            return start_terminal(state, node_id);
         }
         Err(error) => state.notice = Some(error.to_string()),
     }
+    Task::none()
+}
+
+fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
+    let Some((program, working_directory, size)) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| {
+            let node = workspace.node(node_id)?;
+            let NodeTarget::Agent(agent_id) = node.target() else {
+                return None;
+            };
+            let agent = workspace.agent(agent_id)?;
+            let working_directory = workspace.settings().working_directory()?.as_str();
+            Some((
+                agent.program(),
+                PathBuf::from(working_directory),
+                terminal::GridSize::for_node(node.size().width(), node.size().height()),
+            ))
+        })
+    else {
+        state.notice = Some("The selected agent has no workspace working directory".to_owned());
+        return Task::none();
+    };
+
+    state.terminal_generation = state.terminal_generation.wrapping_add(1);
+    let generation = state.terminal_generation;
+    state
+        .terminals
+        .insert(node_id, Session::starting(size, generation));
+    state.focused_terminal = Some(node_id);
+    state.canvas_revision = state.canvas_revision.wrapping_add(1);
+    state.notice = Some("Terminal starting".to_owned());
+    let spec = session::process_spec(program, &working_directory, size);
+
+    Task::perform(
+        async move {
+            LocalProcessRuntime
+                .spawn(spec)
+                .map(|process| Arc::new(Mutex::new(process)))
+        },
+        move |result| Message::TerminalStarted {
+            node_id,
+            generation,
+            result,
+        },
+    )
+}
+
+fn handle_terminal_started(
+    state: &mut OpenPodium,
+    node_id: NodeId,
+    generation: u64,
+    result: Result<ProcessStream, RuntimeError>,
+) -> Task<Message> {
+    let Some(session) = state
+        .terminals
+        .get_mut(&node_id)
+        .filter(|session| session.generation() == generation)
+    else {
+        return Task::none();
+    };
+    match result {
+        Ok(stream) => {
+            if let Err(error) = session.attach(stream) {
+                session.fail(error);
+                state.notice = Some(error.to_owned());
+                return Task::none();
+            }
+            state.notice = None;
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            wait_for_terminal_event(
+                node_id,
+                generation,
+                session.stream().expect("just attached"),
+            )
+        }
+        Err(error) => {
+            session.fail(&error);
+            state.notice = Some(error.to_string());
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            Task::none()
+        }
+    }
+}
+
+fn wait_for_terminal_event(
+    node_id: NodeId,
+    generation: u64,
+    stream: ProcessStream,
+) -> Task<Message> {
+    Task::perform(
+        async move { stream.lock().await.next_event().await },
+        move |event| Message::TerminalEvent {
+            node_id,
+            generation,
+            event,
+        },
+    )
+}
+
+fn handle_terminal_event(
+    state: &mut OpenPodium,
+    node_id: NodeId,
+    generation: u64,
+    event: Option<ProcessEvent>,
+) -> Task<Message> {
+    let Some(session) = state
+        .terminals
+        .get_mut(&node_id)
+        .filter(|session| session.generation() == generation)
+    else {
+        return Task::none();
+    };
+    let continues = matches!(event, Some(ProcessEvent::Output(_)));
+    let actions = match event {
+        Some(event) => session.handle_event(event),
+        None => {
+            session.fail("the terminal event stream closed unexpectedly");
+            Vec::new()
+        }
+    };
+    let mut tasks = actions
+        .into_iter()
+        .filter_map(|action| match action {
+            TerminalAction::ClipboardStore(text) => Some(clipboard::write(text)),
+            TerminalAction::Bell => None,
+        })
+        .collect::<Vec<_>>();
+    if continues {
+        if let Some(stream) = session.stream() {
+            tasks.push(wait_for_terminal_event(node_id, generation, stream));
+        }
+    }
+    state.canvas_revision = state.canvas_revision.wrapping_add(1);
+    Task::batch(tasks)
+}
+
+fn stop_terminal(state: &mut OpenPodium, node_id: NodeId) {
+    if let Some(session) = state.terminals.get_mut(&node_id) {
+        if let Err(error) = session.stop() {
+            state.notice = Some(error);
+        }
+    }
+    if state.focused_terminal == Some(node_id) {
+        state.focused_terminal = None;
+    }
+    state.canvas_revision = state.canvas_revision.wrapping_add(1);
 }
 
 fn apply_canvas_action(state: &mut OpenPodium, action: CanvasAction) {
@@ -555,6 +836,7 @@ fn persist_canvas(
         return Err(());
     };
     state.canvas_preview = None;
+    let runtime_layout = after.clone();
     match state
         .workspaces
         .as_mut()
@@ -565,6 +847,7 @@ fn persist_canvas(
             now(),
         ) {
         Ok(_) => {
+            synchronize_terminals(state, &runtime_layout);
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
             Ok(())
         }
@@ -574,6 +857,53 @@ fn persist_canvas(
             Err(())
         }
     }
+}
+
+fn synchronize_terminals(state: &mut OpenPodium, layout: &CanvasLayout) {
+    state
+        .terminals
+        .retain(|node_id, _| layout.nodes().iter().any(|node| node.id() == *node_id));
+    if state
+        .focused_terminal
+        .is_some_and(|node_id| !state.terminals.contains_key(&node_id))
+    {
+        state.focused_terminal = None;
+    }
+    for node in layout.nodes() {
+        let Some(session) = state.terminals.get_mut(&node.id()) else {
+            continue;
+        };
+        let size = terminal::GridSize::for_node(node.size().width(), node.size().height());
+        if let Err(error) = session.resize(size) {
+            state.notice = Some(error);
+        }
+    }
+}
+
+fn terminal_views(state: &OpenPodium, layout: &CanvasLayout) -> BTreeMap<NodeId, terminal::View> {
+    layout
+        .nodes()
+        .iter()
+        .filter_map(|node| {
+            matches!(node.target(), NodeTarget::Agent(_)).then(|| {
+                let size = terminal::GridSize::for_node(node.size().width(), node.size().height());
+                let view = state
+                    .terminals
+                    .get(&node.id())
+                    .map_or_else(|| terminal::View::offline(size), Session::view);
+                (node.id(), view)
+            })
+        })
+        .collect()
+}
+
+fn selected_terminal_node(state: &OpenPodium) -> Option<NodeId> {
+    let workspace = state.workspaces.as_ref()?.active_workspace()?;
+    state.canvas_selection.iter().copied().find(|node_id| {
+        workspace
+            .node(*node_id)
+            .is_some_and(|node| matches!(node.target(), NodeTarget::Agent(_)))
+    })
 }
 
 fn current_canvas(state: &OpenPodium) -> Option<CanvasLayout> {
@@ -695,6 +1025,9 @@ mod tests {
             canvas_preview: None,
             canvas_history: History::default(),
             canvas_revision: 1,
+            terminals: BTreeMap::new(),
+            focused_terminal: None,
+            terminal_generation: 0,
             workspaces: Some(workspaces),
             create_directory: String::new(),
             name: String::new(),
@@ -704,7 +1037,7 @@ mod tests {
             notice: None,
         };
 
-        add_agent(&mut state, AgentProgram::Codex);
+        let _task = add_agent(&mut state, AgentProgram::Codex);
         let workspace = state
             .workspaces
             .as_ref()
