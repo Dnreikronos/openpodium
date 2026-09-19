@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use super::{
-    AgentId, AgentState, CanvasPoint, CanvasSize, ConnectionId, Content, HandoffId, Name,
-    NodeGroupId, NodeId, RoleId, TaskId, TaskState,
+    AgentId, AgentState, CanvasPoint, CanvasSize, ConnectionId, Content, EnvironmentProfileId,
+    HandoffId, Name, NodeGroupId, NodeId, RoleId, TaskId, TaskState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +40,7 @@ pub struct Agent {
     name: Name,
     role_id: Option<RoleId>,
     program: AgentProgram,
+    environment_id: Option<EnvironmentProfileId>,
     state: AgentState,
 }
 
@@ -67,8 +68,14 @@ impl Agent {
             name,
             role_id,
             program,
+            environment_id: None,
             state: AgentState::Starting,
         }
+    }
+
+    pub const fn in_environment(mut self, environment_id: EnvironmentProfileId) -> Self {
+        self.environment_id = Some(environment_id);
+        self
     }
 
     pub const fn id(&self) -> AgentId {
@@ -85,6 +92,10 @@ impl Agent {
 
     pub const fn program(&self) -> AgentProgram {
         self.program
+    }
+
+    pub const fn environment_id(&self) -> Option<EnvironmentProfileId> {
+        self.environment_id
     }
 
     pub const fn state(&self) -> AgentState {

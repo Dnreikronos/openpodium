@@ -7,8 +7,9 @@ use tempfile::TempDir;
 use crate::domain::{
     Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize,
     Connection as DomainConnection, ConnectionId, ConnectionKind, Content, DomainCommand,
-    DomainEvent, Handoff, HandoffId, HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId,
-    NodeTarget, Role, RoleId, Task, TaskId, TaskState, Timestamp, Workspace, WorkspaceId,
+    DomainEvent, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId,
+    HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId,
+    SshEnvironment, Task, TaskId, TaskState, Timestamp, Workspace, WorkspaceId,
 };
 
 use super::codec::{decode_event, decode_workspace};
@@ -258,6 +259,60 @@ fn canvas_graph_and_agent_program_survive_restart() {
 }
 
 #[test]
+fn environment_profiles_and_agent_references_survive_restart() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    let profile_id = EnvironmentProfileId::new(1);
+    let expected = {
+        let mut journal = Journal::open(&path).unwrap();
+        let mut workspace = test_workspace();
+        let profile = EnvironmentProfile::new(
+            profile_id,
+            name("Remote builder"),
+            EnvironmentKind::Ssh(
+                SshEnvironment::new(
+                    "builder.example.com",
+                    Some("codex".to_owned()),
+                    Some(2222),
+                    "/workspace",
+                )
+                .unwrap(),
+            ),
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddEnvironmentProfile(profile),
+            1,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddAgent(
+                Agent::with_program(
+                    AgentId::new(1),
+                    name("Remote Codex"),
+                    None,
+                    AgentProgram::Codex,
+                )
+                .in_environment(profile_id),
+            ),
+            2,
+        );
+        workspace
+    };
+
+    let journal = Journal::open(&path).unwrap();
+    let recovered = journal.recover(WorkspaceId::new(7)).unwrap().unwrap();
+
+    assert_eq!(recovered, expected);
+    assert_eq!(
+        recovered.agent(AgentId::new(1)).unwrap().environment_id(),
+        Some(profile_id)
+    );
+}
+
+#[test]
 fn corrupt_newest_snapshot_is_skipped_and_its_event_is_replayed() {
     let temp = TempDir::new().unwrap();
     let mut journal = Journal::open(database_path(&temp)).unwrap();
@@ -374,7 +429,7 @@ fn unknown_event_format_fails_recovery_without_partial_state() {
             record_type: "domain event",
             sequence: 2,
             found: 99,
-            supported: 3,
+            supported: 4,
         }
     ));
 }

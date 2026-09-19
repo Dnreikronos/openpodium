@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use super::{
     Agent, AgentId, CanvasLayout, Connection, ConnectionId, ConnectionKind, Content, DomainCommand,
-    DomainError, DomainEvent, EntityRef, Handoff, HandoffId, HandoffPayload, Name, Node, NodeGroup,
-    NodeGroupId, NodeId, Role, RoleId, Task, TaskId, TaskState, TimelineEvent, WorkspaceDirectory,
-    WorkspaceIcon, WorkspaceId,
+    DomainError, DomainEvent, EntityRef, EnvironmentProfile, EnvironmentProfileId, Handoff,
+    HandoffId, HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId, Role, RoleId, Task,
+    TaskId, TaskState, TimelineEvent, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +51,7 @@ impl WorkspaceSettings {
 pub struct Workspace {
     id: WorkspaceId,
     settings: WorkspaceSettings,
+    environment_profiles: BTreeMap<EnvironmentProfileId, EnvironmentProfile>,
     roles: BTreeMap<RoleId, Role>,
     agents: BTreeMap<AgentId, Agent>,
     tasks: BTreeMap<TaskId, Task>,
@@ -65,6 +66,7 @@ impl Workspace {
         Self {
             id,
             settings: WorkspaceSettings::new(name, None, None, None),
+            environment_profiles: BTreeMap::new(),
             roles: BTreeMap::new(),
             agents: BTreeMap::new(),
             tasks: BTreeMap::new(),
@@ -89,6 +91,14 @@ impl Workspace {
 
     pub fn agent_count(&self) -> usize {
         self.agents.len()
+    }
+
+    pub fn environment_profiles(&self) -> impl Iterator<Item = &EnvironmentProfile> {
+        self.environment_profiles.values()
+    }
+
+    pub fn environment_profile(&self, id: EnvironmentProfileId) -> Option<&EnvironmentProfile> {
+        self.environment_profiles.get(&id)
     }
 
     pub(crate) fn roles(&self) -> impl Iterator<Item = &Role> {
@@ -158,6 +168,27 @@ impl Workspace {
                     to: settings,
                 }
             }
+            DomainCommand::AddEnvironmentProfile(profile) => {
+                DomainEvent::EnvironmentProfileAdded(profile)
+            }
+            DomainCommand::UpdateEnvironmentProfile(profile) => {
+                let current = self.environment_profiles.get(&profile.id()).ok_or(
+                    DomainError::EntityNotFound(EntityRef::EnvironmentProfile(profile.id())),
+                )?;
+                if current == &profile {
+                    return Err(DomainError::UnchangedEnvironmentProfile);
+                }
+                DomainEvent::EnvironmentProfileChanged {
+                    from: current.clone(),
+                    to: profile,
+                }
+            }
+            DomainCommand::RemoveEnvironmentProfile(profile_id) => {
+                let profile = self.environment_profiles.get(&profile_id).ok_or(
+                    DomainError::EntityNotFound(EntityRef::EnvironmentProfile(profile_id)),
+                )?;
+                DomainEvent::EnvironmentProfileRemoved(profile.clone())
+            }
             DomainCommand::AddRole(role) => DomainEvent::RoleAdded(role),
             DomainCommand::AddAgent(agent) => DomainEvent::AgentAdded(agent),
             DomainCommand::AddTask(task) => DomainEvent::TaskAdded(task),
@@ -217,6 +248,39 @@ impl Workspace {
                 }
                 self.settings = to.clone();
             }
+            DomainEvent::EnvironmentProfileAdded(profile) => {
+                self.ensure_absent(EntityRef::EnvironmentProfile(profile.id()))?;
+                self.environment_profiles
+                    .insert(profile.id(), profile.clone());
+            }
+            DomainEvent::EnvironmentProfileChanged { from, to } => {
+                let current = self.environment_profiles.get(&from.id()).ok_or(
+                    DomainError::EntityNotFound(EntityRef::EnvironmentProfile(from.id())),
+                )?;
+                if current != from || to.id() != from.id() {
+                    return Err(DomainError::EnvironmentProfileConflict(from.id()));
+                }
+                self.environment_profiles.insert(to.id(), to.clone());
+            }
+            DomainEvent::EnvironmentProfileRemoved(profile) => {
+                let current = self.environment_profiles.get(&profile.id()).ok_or(
+                    DomainError::EntityNotFound(EntityRef::EnvironmentProfile(profile.id())),
+                )?;
+                if current != profile {
+                    return Err(DomainError::EnvironmentProfileConflict(profile.id()));
+                }
+                if let Some(agent) = self
+                    .agents
+                    .values()
+                    .find(|agent| agent.environment_id() == Some(profile.id()))
+                {
+                    return Err(DomainError::EnvironmentProfileInUse {
+                        profile_id: profile.id(),
+                        agent_id: agent.id(),
+                    });
+                }
+                self.environment_profiles.remove(&profile.id());
+            }
             DomainEvent::RoleAdded(role) => {
                 self.ensure_absent(EntityRef::Role(role.id()))?;
                 self.roles.insert(role.id(), role.clone());
@@ -228,6 +292,13 @@ impl Workspace {
                         EntityRef::Agent(agent.id()),
                         "role_id",
                         EntityRef::Role(role_id),
+                    )?;
+                }
+                if let Some(environment_id) = agent.environment_id() {
+                    self.ensure_reference(
+                        EntityRef::Agent(agent.id()),
+                        "environment_id",
+                        EntityRef::EnvironmentProfile(environment_id),
                     )?;
                 }
                 self.agents.insert(agent.id(), agent.clone());
@@ -300,6 +371,13 @@ impl Workspace {
                         EntityRef::Agent(agent.id()),
                         "role_id",
                         EntityRef::Role(role_id),
+                    )?;
+                }
+                if let Some(environment_id) = agent.environment_id() {
+                    self.ensure_reference(
+                        EntityRef::Agent(agent.id()),
+                        "environment_id",
+                        EntityRef::EnvironmentProfile(environment_id),
                     )?;
                 }
                 if node.target() != super::NodeTarget::Agent(agent.id()) {
@@ -427,6 +505,7 @@ impl Workspace {
     fn contains(&self, entity: EntityRef) -> bool {
         match entity {
             EntityRef::Workspace(id) => self.id == id,
+            EntityRef::EnvironmentProfile(id) => self.environment_profiles.contains_key(&id),
             EntityRef::Role(id) => self.roles.contains_key(&id),
             EntityRef::Agent(id) => self.agents.contains_key(&id),
             EntityRef::Task(id) => self.tasks.contains_key(&id),

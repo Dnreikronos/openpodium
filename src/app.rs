@@ -9,10 +9,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Task, Theme, clipboard};
 use openpodium::domain::{
-    Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, DomainCommand, Name, Node,
-    NodeId, NodeTarget, Timestamp, Workspace, WorkspaceId,
+    Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, ContainerEnvironment,
+    CustomEnvironment, DomainCommand, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId,
+    Name, Node, NodeId, NodeTarget, SshEnvironment, Timestamp, Workspace, WorkspaceDirectory,
+    WorkspaceId,
 };
-use openpodium::runtime::{LocalProcessRuntime, ProcessEvent, ProcessRuntime, RuntimeError};
+use openpodium::runtime::{
+    EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, RuntimeError,
+    check_environment, prepare_environment_process,
+};
 use openpodium::workspaces::{WorkspaceManager, WorkspaceSettingsInput};
 use tokio::sync::Mutex;
 
@@ -23,13 +28,27 @@ use crate::terminal::session::{self, Action as TerminalAction, ProcessStream, Se
 const APP_NAME: &str = "OpenPodium";
 const DATABASE_FILE: &str = "openpodium.sqlite";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TerminalKey {
+    workspace_id: WorkspaceId,
+    node_id: NodeId,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum EnvironmentDraftKind {
+    #[default]
+    Ssh,
+    Container,
+    Custom,
+}
+
 struct OpenPodium {
     camera: Camera,
     canvas_selection: Vec<NodeId>,
     canvas_preview: Option<CanvasLayout>,
     canvas_history: History,
     canvas_revision: u64,
-    terminals: BTreeMap<NodeId, Session>,
+    terminals: BTreeMap<TerminalKey, Session>,
     focused_terminal: Option<NodeId>,
     terminal_generation: u64,
     workspaces: Option<WorkspaceManager>,
@@ -38,6 +57,15 @@ struct OpenPodium {
     icon: String,
     working_directory: String,
     instructions: String,
+    selected_environment: Option<EnvironmentProfileId>,
+    environment_kind: EnvironmentDraftKind,
+    environment_name: String,
+    environment_primary: String,
+    environment_secondary: String,
+    environment_port: String,
+    environment_directory: String,
+    environment_arguments: String,
+    environment_health: BTreeMap<(WorkspaceId, EnvironmentProfileId), EnvironmentHealth>,
     notice: Option<String>,
 }
 
@@ -65,6 +93,15 @@ impl Default for OpenPodium {
             icon: String::new(),
             working_directory: String::new(),
             instructions: String::new(),
+            selected_environment: None,
+            environment_kind: EnvironmentDraftKind::default(),
+            environment_name: String::new(),
+            environment_primary: String::new(),
+            environment_secondary: String::new(),
+            environment_port: String::new(),
+            environment_directory: String::new(),
+            environment_arguments: String::new(),
+            environment_health: BTreeMap::new(),
             notice,
         };
         state.load_active_settings();
@@ -85,19 +122,38 @@ enum Message {
     WorkingDirectoryChanged(String),
     InstructionsChanged(String),
     SaveSettings,
+    SelectEnvironment(Option<EnvironmentProfileId>),
+    EnvironmentKindSelected(EnvironmentDraftKind),
+    EnvironmentNameChanged(String),
+    EnvironmentPrimaryChanged(String),
+    EnvironmentSecondaryChanged(String),
+    EnvironmentPortChanged(String),
+    EnvironmentDirectoryChanged(String),
+    EnvironmentArgumentsChanged(String),
+    CreateEnvironment,
+    RemoveEnvironment(EnvironmentProfileId),
+    CheckEnvironment(EnvironmentProfileId),
+    EnvironmentChecked {
+        workspace_id: WorkspaceId,
+        profile_id: EnvironmentProfileId,
+        health: EnvironmentHealth,
+    },
     StartTerminal(NodeId),
     StopTerminal(NodeId),
     TerminalStarted {
+        workspace_id: WorkspaceId,
         node_id: NodeId,
         generation: u64,
         result: Result<ProcessStream, RuntimeError>,
     },
     TerminalEvent {
+        workspace_id: WorkspaceId,
         node_id: NodeId,
         generation: u64,
         event: Option<ProcessEvent>,
     },
     ClipboardRead {
+        workspace_id: WorkspaceId,
         node_id: NodeId,
         contents: Option<String>,
     },
@@ -134,6 +190,16 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::IconChanged(value) => state.icon = value,
         Message::WorkingDirectoryChanged(value) => state.working_directory = value,
         Message::InstructionsChanged(value) => state.instructions = value,
+        Message::SelectEnvironment(environment_id) => {
+            state.selected_environment = environment_id;
+        }
+        Message::EnvironmentKindSelected(kind) => state.environment_kind = kind,
+        Message::EnvironmentNameChanged(value) => state.environment_name = value,
+        Message::EnvironmentPrimaryChanged(value) => state.environment_primary = value,
+        Message::EnvironmentSecondaryChanged(value) => state.environment_secondary = value,
+        Message::EnvironmentPortChanged(value) => state.environment_port = value,
+        Message::EnvironmentDirectoryChanged(value) => state.environment_directory = value,
+        Message::EnvironmentArgumentsChanged(value) => state.environment_arguments = value,
         Message::CreateWorkspace => {
             let result = state
                 .workspaces
@@ -198,20 +264,54 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
                 Err(error) => error.to_string(),
             });
         }
+        Message::CreateEnvironment => return create_environment(state),
+        Message::RemoveEnvironment(profile_id) => remove_environment(state, profile_id),
+        Message::CheckEnvironment(profile_id) => {
+            return check_environment_task(state, profile_id);
+        }
+        Message::EnvironmentChecked {
+            workspace_id,
+            profile_id,
+            health,
+        } => {
+            state
+                .environment_health
+                .insert((workspace_id, profile_id), health);
+            if state
+                .workspaces
+                .as_ref()
+                .and_then(WorkspaceManager::active_workspace_id)
+                == Some(workspace_id)
+            {
+                state.notice = Some(format!("Environment health: {}", health.label()));
+            }
+        }
         Message::StartTerminal(node_id) => return start_terminal(state, node_id),
         Message::StopTerminal(node_id) => stop_terminal(state, node_id),
         Message::TerminalStarted {
+            workspace_id,
             node_id,
             generation,
             result,
-        } => return handle_terminal_started(state, node_id, generation, result),
+        } => {
+            return handle_terminal_started(state, workspace_id, node_id, generation, result);
+        }
         Message::TerminalEvent {
+            workspace_id,
             node_id,
             generation,
             event,
-        } => return handle_terminal_event(state, node_id, generation, event),
-        Message::ClipboardRead { node_id, contents } => {
-            if let (Some(session), Some(contents)) = (state.terminals.get(&node_id), contents) {
+        } => return handle_terminal_event(state, workspace_id, node_id, generation, event),
+        Message::ClipboardRead {
+            workspace_id,
+            node_id,
+            contents,
+        } => {
+            let key = TerminalKey {
+                workspace_id,
+                node_id,
+            };
+            if let (Some(session), Some(contents)) = (state.terminals.get(&key), contents) {
                 if let Err(error) = session.paste(&contents) {
                     state.notice = Some(error);
                 }
@@ -277,6 +377,13 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             button("Shell").on_press(Message::AddAgent(AgentProgram::Shell)),
         ]
         .spacing(8),
+        text("Runtime environment for new agents").size(18),
+        button(if state.selected_environment.is_none() {
+            "✓ Local workspace"
+        } else {
+            "Local workspace"
+        })
+        .on_press(Message::SelectEnvironment(None)),
         text("Canvas tools").size(18),
         row![
             button("Undo").on_press(Message::CanvasAction(CanvasAction::Undo)),
@@ -333,6 +440,117 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     ]
     .spacing(12)
     .max_width(720);
+    if let Some(workspace) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+    {
+        for profile in workspace.environment_profiles() {
+            let selected = state.selected_environment == Some(profile.id());
+            let label = if selected {
+                format!("✓ {}", profile.name())
+            } else {
+                profile.name().to_string()
+            };
+            let health = state
+                .environment_health
+                .get(&(workspace.id(), profile.id()))
+                .copied()
+                .unwrap_or_default();
+            settings = settings.push(
+                row![
+                    button(text(label)).on_press(Message::SelectEnvironment(Some(profile.id()))),
+                    text(health.label()).size(12),
+                    button("Check").on_press(Message::CheckEnvironment(profile.id())),
+                    button("Delete").on_press(Message::RemoveEnvironment(profile.id())),
+                ]
+                .spacing(8),
+            );
+        }
+        let kind_buttons = row![
+            button(if state.environment_kind == EnvironmentDraftKind::Ssh {
+                "✓ SSH"
+            } else {
+                "SSH"
+            })
+            .on_press(Message::EnvironmentKindSelected(EnvironmentDraftKind::Ssh)),
+            button(
+                if state.environment_kind == EnvironmentDraftKind::Container {
+                    "✓ Container"
+                } else {
+                    "Container"
+                }
+            )
+            .on_press(Message::EnvironmentKindSelected(
+                EnvironmentDraftKind::Container,
+            )),
+            button(if state.environment_kind == EnvironmentDraftKind::Custom {
+                "✓ Custom"
+            } else {
+                "Custom"
+            })
+            .on_press(Message::EnvironmentKindSelected(
+                EnvironmentDraftKind::Custom,
+            )),
+        ]
+        .spacing(8);
+        settings = settings
+            .push(text("Add environment profile").size(18))
+            .push(kind_buttons)
+            .push(
+                text_input("Profile name", &state.environment_name)
+                    .on_input(Message::EnvironmentNameChanged),
+            );
+        settings = match state.environment_kind {
+            EnvironmentDraftKind::Ssh => settings
+                .push(
+                    text_input("SSH host", &state.environment_primary)
+                        .on_input(Message::EnvironmentPrimaryChanged),
+                )
+                .push(
+                    text_input("SSH user (optional)", &state.environment_secondary)
+                        .on_input(Message::EnvironmentSecondaryChanged),
+                )
+                .push(
+                    text_input("SSH port (optional)", &state.environment_port)
+                        .on_input(Message::EnvironmentPortChanged),
+                )
+                .push(
+                    text_input("Remote working directory", &state.environment_directory)
+                        .on_input(Message::EnvironmentDirectoryChanged),
+                ),
+            EnvironmentDraftKind::Container => settings
+                .push(
+                    text_input("Docker-compatible executable", &state.environment_primary)
+                        .on_input(Message::EnvironmentPrimaryChanged),
+                )
+                .push(
+                    text_input(
+                        "Existing container name or ID",
+                        &state.environment_secondary,
+                    )
+                    .on_input(Message::EnvironmentSecondaryChanged),
+                )
+                .push(
+                    text_input("Container working directory", &state.environment_directory)
+                        .on_input(Message::EnvironmentDirectoryChanged),
+                ),
+            EnvironmentDraftKind::Custom => settings
+                .push(
+                    text_input("Wrapper executable", &state.environment_primary)
+                        .on_input(Message::EnvironmentPrimaryChanged),
+                )
+                .push(
+                    text_input("Arguments as a JSON array", &state.environment_arguments)
+                        .on_input(Message::EnvironmentArgumentsChanged),
+                )
+                .push(
+                    text_input("Local working directory", &state.environment_directory)
+                        .on_input(Message::EnvironmentDirectoryChanged),
+                ),
+        };
+        settings = settings.push(button("Add environment").on_press(Message::CreateEnvironment));
+    }
     if !has_active_workspace {
         settings = column![
             text("Create your first workspace").size(28),
@@ -345,12 +563,14 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         settings = settings.push(text(notice));
     }
     if let Some(node_id) = selected_terminal_node(state) {
-        let active = state
+        let session = state
             .terminals
-            .get(&node_id)
-            .is_some_and(Session::is_active);
+            .get(&active_terminal_key(state, node_id).expect("an active workspace exists"));
+        let active = session.is_some_and(Session::is_active);
         settings = settings.push(text("Terminal").size(18)).push(if active {
             button("Stop terminal").on_press(Message::StopTerminal(node_id))
+        } else if session.is_some() {
+            button("Reconnect terminal").on_press(Message::StartTerminal(node_id))
         } else {
             button("Start terminal").on_press(Message::StartTerminal(node_id))
         });
@@ -397,7 +617,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
 
 impl OpenPodium {
     fn reset_canvas_session(&mut self) {
-        self.stop_all_terminals();
+        self.focused_terminal = None;
         self.camera = Camera::default();
         self.canvas_selection.clear();
         self.canvas_preview = None;
@@ -423,6 +643,7 @@ impl OpenPodium {
             self.icon.clear();
             self.working_directory.clear();
             self.instructions.clear();
+            self.selected_environment = None;
             return;
         };
 
@@ -439,6 +660,7 @@ impl OpenPodium {
             .settings()
             .instructions()
             .map_or_else(String::new, |instructions| instructions.as_str().to_owned());
+        self.selected_environment = None;
     }
 }
 
@@ -481,27 +703,43 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
         }
         canvas::Message::TerminalInput { node_id, bytes } => {
-            if let Some(session) = state.terminals.get(&node_id) {
+            if let Some(session) =
+                active_terminal_key(state, node_id).and_then(|key| state.terminals.get(&key))
+            {
                 if let Err(error) = session.write(&bytes) {
                     state.notice = Some(error);
                 }
             }
         }
         canvas::Message::TerminalPasteRequested(node_id) => {
-            return clipboard::read()
-                .map(move |contents| Message::ClipboardRead { node_id, contents });
+            let Some(workspace_id) = active_workspace_id(state) else {
+                return Task::none();
+            };
+            return clipboard::read().map(move |contents| Message::ClipboardRead {
+                workspace_id,
+                node_id,
+                contents,
+            });
         }
         canvas::Message::TerminalCopyRequested(node_id) => {
             if let Some(text) = state
-                .terminals
-                .get(&node_id)
+                .workspaces
+                .as_ref()
+                .and_then(WorkspaceManager::active_workspace_id)
+                .map(|workspace_id| TerminalKey {
+                    workspace_id,
+                    node_id,
+                })
+                .and_then(|key| state.terminals.get(&key))
                 .and_then(Session::selected_text)
             {
                 return clipboard::write(text);
             }
         }
         canvas::Message::TerminalScrolled { node_id, lines } => {
-            if let Some(session) = state.terminals.get_mut(&node_id) {
+            if let Some(session) =
+                active_terminal_key(state, node_id).and_then(|key| state.terminals.get_mut(&key))
+            {
                 session.scroll(lines);
                 state.canvas_revision = state.canvas_revision.wrapping_add(1);
             }
@@ -514,7 +752,9 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
         } => {
             state.focused_terminal = Some(node_id);
             state.canvas_selection = vec![node_id];
-            if let Some(session) = state.terminals.get_mut(&node_id) {
+            if let Some(session) =
+                active_terminal_key(state, node_id).and_then(|key| state.terminals.get_mut(&key))
+            {
                 session.clear_selection();
                 session.begin_selection(row, column, right_side);
             }
@@ -526,7 +766,9 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
             column,
             right_side,
         } => {
-            if let Some(session) = state.terminals.get_mut(&node_id) {
+            if let Some(session) =
+                active_terminal_key(state, node_id).and_then(|key| state.terminals.get_mut(&key))
+            {
                 session.update_selection(row, column, right_side);
                 state.canvas_revision = state.canvas_revision.wrapping_add(1);
             }
@@ -535,8 +777,172 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
     Task::none()
 }
 
+fn create_environment(state: &mut OpenPodium) -> Task<Message> {
+    let Some((workspace_id, profile_id)) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| {
+            next_environment_profile_id(workspace).map(|profile_id| (workspace.id(), profile_id))
+        })
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return Task::none();
+    };
+    let profile = match environment_profile_from_draft(state, profile_id) {
+        Ok(profile) => profile,
+        Err(error) => {
+            state.notice = Some(error);
+            return Task::none();
+        }
+    };
+    let result = state
+        .workspaces
+        .as_mut()
+        .expect("the active workspace came from the manager")
+        .execute(
+            workspace_id,
+            DomainCommand::AddEnvironmentProfile(profile),
+            now(),
+        );
+    match result {
+        Ok(_) => {
+            state.selected_environment = Some(profile_id);
+            state.environment_name.clear();
+            state.environment_primary.clear();
+            state.environment_secondary.clear();
+            state.environment_port.clear();
+            state.environment_directory.clear();
+            state.environment_arguments.clear();
+            state.notice = Some("Environment profile added".to_owned());
+            check_environment_task(state, profile_id)
+        }
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            Task::none()
+        }
+    }
+}
+
+fn environment_profile_from_draft(
+    state: &OpenPodium,
+    profile_id: EnvironmentProfileId,
+) -> Result<EnvironmentProfile, String> {
+    let name = Name::new(state.environment_name.clone()).map_err(|error| error.to_string())?;
+    let kind = match state.environment_kind {
+        EnvironmentDraftKind::Ssh => {
+            let port = if state.environment_port.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    state
+                        .environment_port
+                        .parse::<u16>()
+                        .map_err(|_| "SSH port must be a number from 1 to 65535".to_owned())?,
+                )
+            };
+            let user = (!state.environment_secondary.trim().is_empty())
+                .then(|| state.environment_secondary.clone());
+            EnvironmentKind::Ssh(
+                SshEnvironment::new(
+                    state.environment_primary.clone(),
+                    user,
+                    port,
+                    state.environment_directory.clone(),
+                )
+                .map_err(|error| error.to_string())?,
+            )
+        }
+        EnvironmentDraftKind::Container => EnvironmentKind::Container(
+            ContainerEnvironment::new(
+                state.environment_primary.clone(),
+                state.environment_secondary.clone(),
+                state.environment_directory.clone(),
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        EnvironmentDraftKind::Custom => {
+            let arguments = if state.environment_arguments.trim().is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_str::<Vec<String>>(&state.environment_arguments).map_err(
+                    |error| format!("custom arguments must be a JSON string array: {error}"),
+                )?
+            };
+            EnvironmentKind::Custom(
+                CustomEnvironment::new(
+                    state.environment_primary.clone(),
+                    arguments,
+                    WorkspaceDirectory::new(state.environment_directory.clone())
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?,
+            )
+        }
+    };
+    Ok(EnvironmentProfile::new(profile_id, name, kind))
+}
+
+fn remove_environment(state: &mut OpenPodium, profile_id: EnvironmentProfileId) {
+    let Some(workspace_id) = active_workspace_id(state) else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+    let result = state
+        .workspaces
+        .as_mut()
+        .expect("the active workspace came from the manager")
+        .execute(
+            workspace_id,
+            DomainCommand::RemoveEnvironmentProfile(profile_id),
+            now(),
+        );
+    state.notice = Some(match result {
+        Ok(_) => {
+            if state.selected_environment == Some(profile_id) {
+                state.selected_environment = None;
+            }
+            state.environment_health.remove(&(workspace_id, profile_id));
+            "Environment profile deleted".to_owned()
+        }
+        Err(error) => error.to_string(),
+    });
+}
+
+fn check_environment_task(
+    state: &mut OpenPodium,
+    profile_id: EnvironmentProfileId,
+) -> Task<Message> {
+    let Some((workspace_id, profile, working_directory)) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| {
+            Some((
+                workspace.id(),
+                workspace.environment_profile(profile_id)?.clone(),
+                PathBuf::from(workspace.settings().working_directory()?.as_str()),
+            ))
+        })
+    else {
+        state.notice = Some("The environment or workspace directory is unavailable".to_owned());
+        return Task::none();
+    };
+    state
+        .environment_health
+        .insert((workspace_id, profile_id), EnvironmentHealth::Checking);
+    Task::perform(
+        async move { check_environment(Some(&profile), &working_directory) },
+        move |health| Message::EnvironmentChecked {
+            workspace_id,
+            profile_id,
+            health,
+        },
+    )
+}
+
 fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
-    let Some((workspace_id, agent_id, node_id, before, node)) = state
+    let Some((workspace_id, agent_id, node_id, before, node, environment_id)) = state
         .workspaces
         .as_ref()
         .and_then(WorkspaceManager::active_workspace)
@@ -563,19 +969,32 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
                 CanvasSize::new(360.0, 260.0).expect("default node size is valid"),
                 z_index,
             );
-            Some((workspace.id(), agent_id, node_id, before, node))
+            let environment_id = state
+                .selected_environment
+                .filter(|environment_id| workspace.environment_profile(*environment_id).is_some());
+            Some((
+                workspace.id(),
+                agent_id,
+                node_id,
+                before,
+                node,
+                environment_id,
+            ))
         })
     else {
         state.notice = Some("Create or select a workspace first".to_owned());
         return Task::none();
     };
     let label = agent_program_name(program);
-    let agent = Agent::with_program(
+    let mut agent = Agent::with_program(
         agent_id,
         Name::new(format!("{label} {}", agent_id.get())).expect("generated agent name is valid"),
         None,
         program,
     );
+    if let Some(environment_id) = environment_id {
+        agent = agent.in_environment(environment_id);
+    }
     let result = state
         .workspaces
         .as_mut()
@@ -600,7 +1019,7 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
 }
 
 fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
-    let Some((program, working_directory, size)) = state
+    let Some((workspace_id, program, profile, working_directory, size)) = state
         .workspaces
         .as_ref()
         .and_then(WorkspaceManager::active_workspace)
@@ -611,8 +1030,14 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
             };
             let agent = workspace.agent(agent_id)?;
             let working_directory = workspace.settings().working_directory()?.as_str();
+            let profile = agent
+                .environment_id()
+                .and_then(|environment_id| workspace.environment_profile(environment_id))
+                .cloned();
             Some((
+                workspace.id(),
                 agent.program(),
+                profile,
                 PathBuf::from(working_directory),
                 terminal::GridSize::for_node(node.size().width(), node.size().height()),
             ))
@@ -621,16 +1046,36 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
         state.notice = Some("The selected agent has no workspace working directory".to_owned());
         return Task::none();
     };
+    let key = TerminalKey {
+        workspace_id,
+        node_id,
+    };
+    if state.terminals.get(&key).is_some_and(Session::is_active) {
+        state.focused_terminal = Some(node_id);
+        state.notice = Some("Terminal is already running".to_owned());
+        state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        return Task::none();
+    }
+
+    let spec = match prepare_environment_process(
+        profile.as_ref(),
+        session::process_spec(program, &working_directory, size),
+    ) {
+        Ok(spec) => spec,
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            return Task::none();
+        }
+    };
 
     state.terminal_generation = state.terminal_generation.wrapping_add(1);
     let generation = state.terminal_generation;
     state
         .terminals
-        .insert(node_id, Session::starting(size, generation));
+        .insert(key, Session::starting(size, generation));
     state.focused_terminal = Some(node_id);
     state.canvas_revision = state.canvas_revision.wrapping_add(1);
     state.notice = Some("Terminal starting".to_owned());
-    let spec = session::process_spec(program, &working_directory, size);
 
     Task::perform(
         async move {
@@ -639,6 +1084,7 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
                 .map(|process| Arc::new(Mutex::new(process)))
         },
         move |result| Message::TerminalStarted {
+            workspace_id,
             node_id,
             generation,
             result,
@@ -648,13 +1094,19 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
 
 fn handle_terminal_started(
     state: &mut OpenPodium,
+    workspace_id: WorkspaceId,
     node_id: NodeId,
     generation: u64,
     result: Result<ProcessStream, RuntimeError>,
 ) -> Task<Message> {
+    let is_active_workspace = active_workspace_id(state) == Some(workspace_id);
+    let key = TerminalKey {
+        workspace_id,
+        node_id,
+    };
     let Some(session) = state
         .terminals
-        .get_mut(&node_id)
+        .get_mut(&key)
         .filter(|session| session.generation() == generation)
     else {
         return Task::none();
@@ -663,12 +1115,17 @@ fn handle_terminal_started(
         Ok(stream) => {
             if let Err(error) = session.attach(stream) {
                 session.fail(error);
-                state.notice = Some(error.to_owned());
+                if is_active_workspace {
+                    state.notice = Some(error.to_owned());
+                }
                 return Task::none();
             }
-            state.notice = None;
+            if is_active_workspace {
+                state.notice = None;
+            }
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
             wait_for_terminal_event(
+                workspace_id,
                 node_id,
                 generation,
                 session.stream().expect("just attached"),
@@ -676,7 +1133,9 @@ fn handle_terminal_started(
         }
         Err(error) => {
             session.fail(&error);
-            state.notice = Some(error.to_string());
+            if is_active_workspace {
+                state.notice = Some(error.to_string());
+            }
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
             Task::none()
         }
@@ -684,6 +1143,7 @@ fn handle_terminal_started(
 }
 
 fn wait_for_terminal_event(
+    workspace_id: WorkspaceId,
     node_id: NodeId,
     generation: u64,
     stream: ProcessStream,
@@ -691,6 +1151,7 @@ fn wait_for_terminal_event(
     Task::perform(
         async move { stream.lock().await.next_event().await },
         move |event| Message::TerminalEvent {
+            workspace_id,
             node_id,
             generation,
             event,
@@ -700,13 +1161,18 @@ fn wait_for_terminal_event(
 
 fn handle_terminal_event(
     state: &mut OpenPodium,
+    workspace_id: WorkspaceId,
     node_id: NodeId,
     generation: u64,
     event: Option<ProcessEvent>,
 ) -> Task<Message> {
+    let key = TerminalKey {
+        workspace_id,
+        node_id,
+    };
     let Some(session) = state
         .terminals
-        .get_mut(&node_id)
+        .get_mut(&key)
         .filter(|session| session.generation() == generation)
     else {
         return Task::none();
@@ -728,7 +1194,12 @@ fn handle_terminal_event(
         .collect::<Vec<_>>();
     if continues {
         if let Some(stream) = session.stream() {
-            tasks.push(wait_for_terminal_event(node_id, generation, stream));
+            tasks.push(wait_for_terminal_event(
+                workspace_id,
+                node_id,
+                generation,
+                stream,
+            ));
         }
     }
     state.canvas_revision = state.canvas_revision.wrapping_add(1);
@@ -736,7 +1207,10 @@ fn handle_terminal_event(
 }
 
 fn stop_terminal(state: &mut OpenPodium, node_id: NodeId) {
-    if let Some(session) = state.terminals.get_mut(&node_id) {
+    let Some(key) = active_terminal_key(state, node_id) else {
+        return;
+    };
+    if let Some(session) = state.terminals.get_mut(&key) {
         if let Err(error) = session.stop() {
             state.notice = Some(error);
         }
@@ -860,17 +1334,26 @@ fn persist_canvas(
 }
 
 fn synchronize_terminals(state: &mut OpenPodium, layout: &CanvasLayout) {
-    state
-        .terminals
-        .retain(|node_id, _| layout.nodes().iter().any(|node| node.id() == *node_id));
-    if state
-        .focused_terminal
-        .is_some_and(|node_id| !state.terminals.contains_key(&node_id))
-    {
+    let Some(workspace_id) = active_workspace_id(state) else {
+        return;
+    };
+    state.terminals.retain(|key, _| {
+        key.workspace_id != workspace_id
+            || layout.nodes().iter().any(|node| node.id() == key.node_id)
+    });
+    if state.focused_terminal.is_some_and(|node_id| {
+        !state.terminals.contains_key(&TerminalKey {
+            workspace_id,
+            node_id,
+        })
+    }) {
         state.focused_terminal = None;
     }
     for node in layout.nodes() {
-        let Some(session) = state.terminals.get_mut(&node.id()) else {
+        let Some(session) = state.terminals.get_mut(&TerminalKey {
+            workspace_id,
+            node_id: node.id(),
+        }) else {
             continue;
         };
         let size = terminal::GridSize::for_node(node.size().width(), node.size().height());
@@ -881,6 +1364,9 @@ fn synchronize_terminals(state: &mut OpenPodium, layout: &CanvasLayout) {
 }
 
 fn terminal_views(state: &OpenPodium, layout: &CanvasLayout) -> BTreeMap<NodeId, terminal::View> {
+    let Some(workspace_id) = active_workspace_id(state) else {
+        return BTreeMap::new();
+    };
     layout
         .nodes()
         .iter()
@@ -889,7 +1375,10 @@ fn terminal_views(state: &OpenPodium, layout: &CanvasLayout) -> BTreeMap<NodeId,
                 let size = terminal::GridSize::for_node(node.size().width(), node.size().height());
                 let view = state
                     .terminals
-                    .get(&node.id())
+                    .get(&TerminalKey {
+                        workspace_id,
+                        node_id: node.id(),
+                    })
                     .map_or_else(|| terminal::View::offline(size), Session::view);
                 (node.id(), view)
             })
@@ -903,6 +1392,20 @@ fn selected_terminal_node(state: &OpenPodium) -> Option<NodeId> {
         workspace
             .node(*node_id)
             .is_some_and(|node| matches!(node.target(), NodeTarget::Agent(_)))
+    })
+}
+
+fn active_workspace_id(state: &OpenPodium) -> Option<WorkspaceId> {
+    state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace_id)
+}
+
+fn active_terminal_key(state: &OpenPodium, node_id: NodeId) -> Option<TerminalKey> {
+    Some(TerminalKey {
+        workspace_id: active_workspace_id(state)?,
+        node_id,
     })
 }
 
@@ -936,6 +1439,17 @@ fn next_node_id(workspace: &Workspace) -> Option<NodeId> {
     loop {
         let id = NodeId::new(value);
         if workspace.node(id).is_none() {
+            return Some(id);
+        }
+        value = value.checked_add(1)?;
+    }
+}
+
+fn next_environment_profile_id(workspace: &Workspace) -> Option<EnvironmentProfileId> {
+    let mut value = 1_u64;
+    loop {
+        let id = EnvironmentProfileId::new(value);
+        if workspace.environment_profile(id).is_none() {
             return Some(id);
         }
         value = value.checked_add(1)?;
@@ -1034,6 +1548,15 @@ mod tests {
             icon: String::new(),
             working_directory: String::new(),
             instructions: String::new(),
+            selected_environment: None,
+            environment_kind: EnvironmentDraftKind::default(),
+            environment_name: String::new(),
+            environment_primary: String::new(),
+            environment_secondary: String::new(),
+            environment_port: String::new(),
+            environment_directory: String::new(),
+            environment_arguments: String::new(),
+            environment_health: BTreeMap::new(),
             notice: None,
         };
 
@@ -1087,5 +1610,102 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn resetting_the_canvas_view_preserves_background_terminal_sessions() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let first_id = workspaces
+            .create_workspace(&first, Timestamp::from_unix_millis(1))
+            .unwrap();
+        let second_id = workspaces
+            .create_workspace(&second, Timestamp::from_unix_millis(2))
+            .unwrap();
+        workspaces
+            .switch(first_id, Timestamp::from_unix_millis(3))
+            .unwrap();
+        let key = TerminalKey {
+            workspace_id: first_id,
+            node_id: NodeId::new(1),
+        };
+        let mut terminals = BTreeMap::new();
+        terminals.insert(
+            key,
+            Session::starting(terminal::GridSize::for_node(640.0, 480.0), 1),
+        );
+        let mut state = test_state(workspaces, terminals);
+
+        state
+            .workspaces
+            .as_mut()
+            .unwrap()
+            .switch(second_id, Timestamp::from_unix_millis(4))
+            .unwrap();
+        state.reset_canvas_session();
+
+        assert!(state.terminals.contains_key(&key));
+    }
+
+    #[test]
+    fn starting_an_active_terminal_does_not_duplicate_its_process() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let workspace_id = workspaces
+            .create_workspace(&project, Timestamp::from_unix_millis(1))
+            .unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        let _first_start = add_agent(&mut state, AgentProgram::Shell);
+        let generation = state.terminal_generation;
+        let key = TerminalKey {
+            workspace_id,
+            node_id: NodeId::new(1),
+        };
+        assert!(state.terminals.get(&key).is_some_and(Session::is_active));
+
+        let _duplicate_start = start_terminal(&mut state, NodeId::new(1));
+
+        assert_eq!(state.terminal_generation, generation);
+        assert_eq!(state.terminals.len(), 1);
+        assert_eq!(state.notice.as_deref(), Some("Terminal is already running"));
+    }
+
+    fn test_state(
+        workspaces: WorkspaceManager,
+        terminals: BTreeMap<TerminalKey, Session>,
+    ) -> OpenPodium {
+        OpenPodium {
+            camera: Camera::default(),
+            canvas_selection: Vec::new(),
+            canvas_preview: None,
+            canvas_history: History::default(),
+            canvas_revision: 1,
+            terminals,
+            focused_terminal: None,
+            terminal_generation: 0,
+            workspaces: Some(workspaces),
+            create_directory: String::new(),
+            name: String::new(),
+            icon: String::new(),
+            working_directory: String::new(),
+            instructions: String::new(),
+            selected_environment: None,
+            environment_kind: EnvironmentDraftKind::default(),
+            environment_name: String::new(),
+            environment_primary: String::new(),
+            environment_secondary: String::new(),
+            environment_port: String::new(),
+            environment_directory: String::new(),
+            environment_arguments: String::new(),
+            environment_health: BTreeMap::new(),
+            notice: None,
+        }
     }
 }

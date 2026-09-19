@@ -2,14 +2,17 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use super::{
-    Agent, AgentId, AgentState, CanvasLayout, ConnectionId, Handoff, HandoffId, Node, NodeGroupId,
-    NodeId, NodeTarget, Role, RoleId, Task, TaskId, TaskState, TimelineEventId, Timestamp,
-    WorkspaceId, WorkspaceSettings,
+    Agent, AgentId, AgentState, CanvasLayout, ConnectionId, EnvironmentProfile,
+    EnvironmentProfileId, Handoff, HandoffId, Node, NodeGroupId, NodeId, NodeTarget, Role, RoleId,
+    Task, TaskId, TaskState, TimelineEventId, Timestamp, WorkspaceId, WorkspaceSettings,
 };
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainCommand {
     UpdateWorkspaceSettings(WorkspaceSettings),
+    AddEnvironmentProfile(EnvironmentProfile),
+    UpdateEnvironmentProfile(EnvironmentProfile),
+    RemoveEnvironmentProfile(EnvironmentProfileId),
     AddRole(Role),
     AddAgent(Agent),
     AddTask(Task),
@@ -39,6 +42,12 @@ pub enum DomainEvent {
         from: WorkspaceSettings,
         to: WorkspaceSettings,
     },
+    EnvironmentProfileAdded(EnvironmentProfile),
+    EnvironmentProfileChanged {
+        from: EnvironmentProfile,
+        to: EnvironmentProfile,
+    },
+    EnvironmentProfileRemoved(EnvironmentProfile),
     RoleAdded(Role),
     AgentAdded(Agent),
     TaskAdded(Task),
@@ -107,6 +116,7 @@ impl TimelineEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityRef {
     Workspace(WorkspaceId),
+    EnvironmentProfile(EnvironmentProfileId),
     Role(RoleId),
     Agent(AgentId),
     Task(TaskId),
@@ -121,6 +131,7 @@ impl Display for EntityRef {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Workspace(id) => write!(formatter, "workspace {id}"),
+            Self::EnvironmentProfile(id) => write!(formatter, "environment profile {id}"),
             Self::Role(id) => write!(formatter, "role {id}"),
             Self::Agent(id) => write!(formatter, "agent {id}"),
             Self::Task(id) => write!(formatter, "task {id}"),
@@ -147,6 +158,12 @@ impl From<NodeTarget> for EntityRef {
 pub enum DomainError {
     UnchangedWorkspaceSettings,
     WorkspaceSettingsConflict,
+    UnchangedEnvironmentProfile,
+    EnvironmentProfileConflict(EnvironmentProfileId),
+    EnvironmentProfileInUse {
+        profile_id: EnvironmentProfileId,
+        agent_id: AgentId,
+    },
     CanvasConflict,
     DuplicateEntity(EntityRef),
     EntityNotFound(EntityRef),
@@ -214,6 +231,20 @@ impl Display for DomainError {
             }
             Self::WorkspaceSettingsConflict => formatter.write_str(
                 "workspace settings event does not match the current workspace settings",
+            ),
+            Self::UnchangedEnvironmentProfile => {
+                formatter.write_str("environment profile is unchanged")
+            }
+            Self::EnvironmentProfileConflict(id) => write!(
+                formatter,
+                "environment profile {id} event does not match the current profile"
+            ),
+            Self::EnvironmentProfileInUse {
+                profile_id,
+                agent_id,
+            } => write!(
+                formatter,
+                "environment profile {profile_id} is still used by agent {agent_id}"
             ),
             Self::CanvasConflict => {
                 formatter.write_str("canvas edit does not match the current layout")

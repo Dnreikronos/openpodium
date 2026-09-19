@@ -2,16 +2,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize, Connection,
-    ConnectionId, ConnectionKind, Content, DomainCommand, DomainEvent, Handoff, HandoffId,
-    HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId, Task,
-    TaskId, TaskState, Workspace, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
-    WorkspaceSettings,
+    ConnectionId, ConnectionKind, ContainerEnvironment, Content, CustomEnvironment, DomainCommand,
+    DomainEvent, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId,
+    HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId,
+    SshEnvironment, Task, TaskId, TaskState, Workspace, WorkspaceDirectory, WorkspaceIcon,
+    WorkspaceId, WorkspaceSettings,
 };
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 3;
-pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 4;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 4;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
     serde_json::to_vec(&StoredEvent::from(event)).map_err(|source| {
@@ -46,6 +47,13 @@ pub(crate) fn decode_event(
             "domain event",
             sequence,
             "canvas graph edits and agent programs require event format version 3",
+        ));
+    }
+    if format_version < 4 && stored.requires_version_four() {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "environment profiles and agent environment references require event format version 4",
         ));
     }
 
@@ -96,6 +104,16 @@ enum StoredEvent {
         from: StoredWorkspaceSettings,
         to: StoredWorkspaceSettings,
     },
+    EnvironmentProfileAdded {
+        profile: EnvironmentProfileV1,
+    },
+    EnvironmentProfileChanged {
+        from: EnvironmentProfileV1,
+        to: EnvironmentProfileV1,
+    },
+    EnvironmentProfileRemoved {
+        profile: EnvironmentProfileV1,
+    },
     RoleAdded {
         role: RoleV1,
     },
@@ -137,6 +155,18 @@ impl From<&DomainEvent> for StoredEvent {
             DomainEvent::WorkspaceSettingsChanged { from, to } => Self::WorkspaceSettingsChanged {
                 from: StoredWorkspaceSettings::from(from),
                 to: StoredWorkspaceSettings::from(to),
+            },
+            DomainEvent::EnvironmentProfileAdded(profile) => Self::EnvironmentProfileAdded {
+                profile: EnvironmentProfileV1::from(profile),
+            },
+            DomainEvent::EnvironmentProfileChanged { from, to } => {
+                Self::EnvironmentProfileChanged {
+                    from: EnvironmentProfileV1::from(from),
+                    to: EnvironmentProfileV1::from(to),
+                }
+            }
+            DomainEvent::EnvironmentProfileRemoved(profile) => Self::EnvironmentProfileRemoved {
+                profile: EnvironmentProfileV1::from(profile),
             },
             DomainEvent::RoleAdded(role) => Self::RoleAdded {
                 role: RoleV1::from(role),
@@ -185,6 +215,18 @@ impl StoredEvent {
         }
     }
 
+    fn requires_version_four(&self) -> bool {
+        match self {
+            Self::EnvironmentProfileAdded { .. }
+            | Self::EnvironmentProfileChanged { .. }
+            | Self::EnvironmentProfileRemoved { .. } => true,
+            Self::AgentAdded { agent } | Self::AgentNodeAdded { agent, .. } => {
+                agent.environment_id.is_some()
+            }
+            _ => false,
+        }
+    }
+
     fn into_domain(self) -> Result<DomainEvent, String> {
         match self {
             Self::WorkspaceSettingsChanged { from, to } => {
@@ -193,6 +235,18 @@ impl StoredEvent {
                     to: to.into_domain()?,
                 })
             }
+            Self::EnvironmentProfileAdded { profile } => {
+                Ok(DomainEvent::EnvironmentProfileAdded(profile.into_domain()?))
+            }
+            Self::EnvironmentProfileChanged { from, to } => {
+                Ok(DomainEvent::EnvironmentProfileChanged {
+                    from: from.into_domain()?,
+                    to: to.into_domain()?,
+                })
+            }
+            Self::EnvironmentProfileRemoved { profile } => Ok(
+                DomainEvent::EnvironmentProfileRemoved(profile.into_domain()?),
+            ),
             Self::RoleAdded { role } => Ok(DomainEvent::RoleAdded(role.into_domain()?)),
             Self::AgentAdded { agent } => {
                 let (agent, state) = agent.into_domain()?;
@@ -251,6 +305,8 @@ struct StoredWorkspace {
     working_directory: Option<String>,
     #[serde(default)]
     instructions: Option<String>,
+    #[serde(default)]
+    environment_profiles: Vec<EnvironmentProfileV1>,
     roles: Vec<RoleV1>,
     agents: Vec<AgentV1>,
     tasks: Vec<TaskV1>,
@@ -279,6 +335,10 @@ impl From<&Workspace> for StoredWorkspace {
                 .settings()
                 .instructions()
                 .map(|instructions| instructions.as_str().to_owned()),
+            environment_profiles: workspace
+                .environment_profiles()
+                .map(EnvironmentProfileV1::from)
+                .collect(),
             roles: workspace.roles().map(RoleV1::from).collect(),
             agents: workspace.agents().map(AgentV1::from).collect(),
             tasks: workspace.tasks().map(TaskV1::from).collect(),
@@ -313,6 +373,18 @@ impl StoredWorkspace {
                     .to_owned(),
             );
         }
+        if format_version < 4
+            && (!self.environment_profiles.is_empty()
+                || self
+                    .agents
+                    .iter()
+                    .any(|agent| agent.environment_id.is_some()))
+        {
+            return Err(
+                "environment profiles and agent environment references require snapshot format version 4"
+                    .to_owned(),
+            );
+        }
 
         let settings = StoredWorkspaceSettings {
             name: self.name,
@@ -326,6 +398,13 @@ impl StoredWorkspace {
             apply_snapshot_command(
                 &mut workspace,
                 DomainCommand::UpdateWorkspaceSettings(settings),
+            )?;
+        }
+
+        for profile in self.environment_profiles {
+            apply_snapshot_command(
+                &mut workspace,
+                DomainCommand::AddEnvironmentProfile(profile.into_domain()?),
             )?;
         }
 
@@ -429,6 +508,111 @@ impl StoredWorkspaceSettings {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentProfileV1 {
+    id: u64,
+    name: String,
+    kind: EnvironmentKindV1,
+}
+
+impl From<&EnvironmentProfile> for EnvironmentProfileV1 {
+    fn from(profile: &EnvironmentProfile) -> Self {
+        Self {
+            id: profile.id().get(),
+            name: profile.name().as_str().to_owned(),
+            kind: EnvironmentKindV1::from(profile.kind()),
+        }
+    }
+}
+
+impl EnvironmentProfileV1 {
+    fn into_domain(self) -> Result<EnvironmentProfile, String> {
+        Ok(EnvironmentProfile::new(
+            EnvironmentProfileId::new(self.id),
+            Name::new(self.name).map_err(|error| error.to_string())?,
+            self.kind.into_domain()?,
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum EnvironmentKindV1 {
+    Ssh {
+        host: String,
+        user: Option<String>,
+        port: Option<u16>,
+        working_directory: String,
+    },
+    Container {
+        engine: String,
+        container: String,
+        working_directory: String,
+    },
+    Custom {
+        executable: String,
+        arguments: Vec<String>,
+        working_directory: String,
+    },
+}
+
+impl From<&EnvironmentKind> for EnvironmentKindV1 {
+    fn from(kind: &EnvironmentKind) -> Self {
+        match kind {
+            EnvironmentKind::Ssh(environment) => Self::Ssh {
+                host: environment.host().to_owned(),
+                user: environment.user().map(str::to_owned),
+                port: environment.port(),
+                working_directory: environment.working_directory().to_owned(),
+            },
+            EnvironmentKind::Container(environment) => Self::Container {
+                engine: environment.engine().to_owned(),
+                container: environment.container().to_owned(),
+                working_directory: environment.working_directory().to_owned(),
+            },
+            EnvironmentKind::Custom(environment) => Self::Custom {
+                executable: environment.executable().to_owned(),
+                arguments: environment.arguments().to_vec(),
+                working_directory: environment.working_directory().as_str().to_owned(),
+            },
+        }
+    }
+}
+
+impl EnvironmentKindV1 {
+    fn into_domain(self) -> Result<EnvironmentKind, String> {
+        match self {
+            Self::Ssh {
+                host,
+                user,
+                port,
+                working_directory,
+            } => SshEnvironment::new(host, user, port, working_directory)
+                .map(EnvironmentKind::Ssh)
+                .map_err(|error| error.to_string()),
+            Self::Container {
+                engine,
+                container,
+                working_directory,
+            } => ContainerEnvironment::new(engine, container, working_directory)
+                .map(EnvironmentKind::Container)
+                .map_err(|error| error.to_string()),
+            Self::Custom {
+                executable,
+                arguments,
+                working_directory,
+            } => CustomEnvironment::new(
+                executable,
+                arguments,
+                WorkspaceDirectory::new(working_directory).map_err(|error| error.to_string())?,
+            )
+            .map(EnvironmentKind::Custom)
+            .map_err(|error| error.to_string()),
+        }
+    }
+}
+
 fn restore_agent_state(
     workspace: &mut Workspace,
     agent_id: AgentId,
@@ -521,6 +705,8 @@ struct AgentV1 {
     role_id: Option<u64>,
     #[serde(default)]
     program: AgentProgramV1,
+    #[serde(default)]
+    environment_id: Option<u64>,
     state: AgentStateV1,
 }
 
@@ -531,6 +717,7 @@ impl From<&Agent> for AgentV1 {
             name: agent.name().as_str().to_owned(),
             role_id: agent.role_id().map(RoleId::get),
             program: agent.program().into(),
+            environment_id: agent.environment_id().map(EnvironmentProfileId::get),
             state: agent.state().into(),
         }
     }
@@ -538,15 +725,16 @@ impl From<&Agent> for AgentV1 {
 
 impl AgentV1 {
     fn into_domain(self) -> Result<(Agent, AgentState), String> {
-        Ok((
-            Agent::with_program(
-                AgentId::new(self.id),
-                Name::new(self.name).map_err(|error| error.to_string())?,
-                self.role_id.map(RoleId::new),
-                self.program.into(),
-            ),
-            self.state.into(),
-        ))
+        let mut agent = Agent::with_program(
+            AgentId::new(self.id),
+            Name::new(self.name).map_err(|error| error.to_string())?,
+            self.role_id.map(RoleId::new),
+            self.program.into(),
+        );
+        if let Some(environment_id) = self.environment_id {
+            agent = agent.in_environment(EnvironmentProfileId::new(environment_id));
+        }
+        Ok((agent, self.state.into()))
     }
 }
 
