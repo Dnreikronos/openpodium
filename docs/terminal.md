@@ -8,13 +8,14 @@ Updated: 2026-09-18
 Terminal sessions are ephemeral application state keyed by agent node ID. Creating an agent node
 starts its selected program immediately in the workspace working directory. Restored nodes remain
 offline until the user starts them, so reopening OpenPodium never launches commands unexpectedly.
-Removing a node, switching workspaces, stopping a terminal, or closing the application cancels its
-local process through the runtime boundary.
+Switching workspaces detaches the terminal view while its workspace-keyed process continues in the
+background. Removing a node, stopping a terminal, or closing the application cancels its process
+through the runtime boundary.
 
 Shell nodes launch the user's login shell on Unix and `COMSPEC` on Windows. Codex and Claude nodes
 launch the `codex` and `claude` executables. Every child receives `TERM=xterm-256color`,
-`COLORTERM=truecolor`, and `TERM_PROGRAM=OpenPodium`. Custom commands and OpenCode require durable
-launch metadata that is not present in the current domain model and remain follow-up work.
+`COLORTERM=truecolor`, and `TERM_PROGRAM=OpenPodium`. Custom agent commands and OpenCode presets
+remain follow-up work; issue #9 custom environments are argv-based wrappers around these programs.
 
 The node header reports `offline`, `starting`, `running`, `exited`, `stopped`, or `failed`. Runtime
 handles and emulator state are never serialized.
