@@ -6,16 +6,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Theme};
-use openpodium::domain::{Timestamp, WorkspaceId};
+use openpodium::domain::{
+    Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, DomainCommand, Name, Node,
+    NodeId, NodeTarget, Timestamp, Workspace, WorkspaceId,
+};
 use openpodium::workspaces::{WorkspaceManager, WorkspaceSettingsInput};
 
-use crate::canvas::{self, Camera};
+use crate::canvas::{self, Alignment, Camera, History, ZOrder};
 
 const APP_NAME: &str = "OpenPodium";
 const DATABASE_FILE: &str = "openpodium.sqlite";
 
 struct OpenPodium {
     camera: Camera,
+    canvas_selection: Vec<NodeId>,
+    canvas_preview: Option<CanvasLayout>,
+    canvas_history: History,
+    canvas_revision: u64,
     workspaces: Option<WorkspaceManager>,
     create_directory: String,
     name: String,
@@ -36,6 +43,10 @@ impl Default for OpenPodium {
         };
         let mut state = Self {
             camera: Camera::default(),
+            canvas_selection: Vec::new(),
+            canvas_preview: None,
+            canvas_history: History::default(),
+            canvas_revision: 1,
             workspaces,
             create_directory: String::new(),
             name: String::new(),
@@ -52,6 +63,8 @@ impl Default for OpenPodium {
 #[derive(Debug, Clone)]
 enum Message {
     Canvas(canvas::Message),
+    AddAgent(AgentProgram),
+    CanvasAction(CanvasAction),
     CreateDirectoryChanged(String),
     CreateWorkspace,
     SwitchWorkspace(WorkspaceId),
@@ -60,6 +73,19 @@ enum Message {
     WorkingDirectoryChanged(String),
     InstructionsChanged(String),
     SaveSettings,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CanvasAction {
+    Duplicate,
+    Remove,
+    Group,
+    Ungroup,
+    Connect,
+    Align(Alignment),
+    ZOrder(ZOrder),
+    Undo,
+    Redo,
 }
 
 pub(crate) fn run() -> iced::Result {
@@ -72,7 +98,9 @@ pub(crate) fn run() -> iced::Result {
 
 fn update(state: &mut OpenPodium, message: Message) {
     match message {
-        Message::Canvas(canvas::Message::CameraChanged(camera)) => state.camera = camera,
+        Message::Canvas(message) => handle_canvas_message(state, message),
+        Message::AddAgent(program) => add_agent(state, program),
+        Message::CanvasAction(action) => apply_canvas_action(state, action),
         Message::CreateDirectoryChanged(value) => state.create_directory = value,
         Message::NameChanged(value) => state.name = value,
         Message::IconChanged(value) => state.icon = value,
@@ -92,6 +120,7 @@ fn update(state: &mut OpenPodium, message: Message) {
                 Ok(_) => {
                     state.create_directory.clear();
                     state.notice = Some("Workspace created".to_owned());
+                    state.reset_canvas_session();
                     state.load_active_settings();
                 }
                 Err(error) => state.notice = Some(error),
@@ -110,6 +139,7 @@ fn update(state: &mut OpenPodium, message: Message) {
             match result {
                 Ok(()) => {
                     state.notice = None;
+                    state.reset_canvas_session();
                     state.load_active_settings();
                 }
                 Err(error) => state.notice = Some(error),
@@ -192,11 +222,64 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         text_input("Workspace instructions", &state.instructions)
             .on_input(Message::InstructionsChanged),
         button("Save settings").on_press(Message::SaveSettings),
+        text("Add agent").size(18),
+        row![
+            button("Codex").on_press(Message::AddAgent(AgentProgram::Codex)),
+            button("Claude").on_press(Message::AddAgent(AgentProgram::Claude)),
+            button("Shell").on_press(Message::AddAgent(AgentProgram::Shell)),
+        ]
+        .spacing(8),
+        text("Canvas tools").size(18),
+        row![
+            button("Undo").on_press(Message::CanvasAction(CanvasAction::Undo)),
+            button("Redo").on_press(Message::CanvasAction(CanvasAction::Redo)),
+            button("Duplicate").on_press(Message::CanvasAction(CanvasAction::Duplicate)),
+            button("Delete").on_press(Message::CanvasAction(CanvasAction::Remove)),
+        ]
+        .spacing(8),
+        row![
+            button("Group").on_press(Message::CanvasAction(CanvasAction::Group)),
+            button("Ungroup").on_press(Message::CanvasAction(CanvasAction::Ungroup)),
+            button("Connect").on_press(Message::CanvasAction(CanvasAction::Connect)),
+        ]
+        .spacing(8),
+        row![
+            button("Align X").on_press(Message::CanvasAction(CanvasAction::Align(
+                Alignment::HorizontalCenters,
+            ))),
+            button("Align Y").on_press(Message::CanvasAction(CanvasAction::Align(
+                Alignment::VerticalCenters,
+            ))),
+            button("Space X").on_press(Message::CanvasAction(CanvasAction::Align(
+                Alignment::DistributeHorizontally,
+            ))),
+            button("Space Y").on_press(Message::CanvasAction(CanvasAction::Align(
+                Alignment::DistributeVertically,
+            ))),
+        ]
+        .spacing(8),
+        row![
+            button("To front")
+                .on_press(Message::CanvasAction(CanvasAction::ZOrder(ZOrder::Front,))),
+            button("To back").on_press(Message::CanvasAction(CanvasAction::ZOrder(ZOrder::Back,))),
+        ]
+        .spacing(8),
         text(format!(
-            "Canvas: {}% · x {:.0} · y {:.0}",
+            "Canvas: {}% · x {:.0} · y {:.0} · {} selected · undo {} · redo {}",
             state.camera.zoom_percent(),
             state.camera.position().x,
             state.camera.position().y,
+            state.canvas_selection.len(),
+            if state.canvas_history.can_undo() {
+                "yes"
+            } else {
+                "no"
+            },
+            if state.canvas_history.can_redo() {
+                "yes"
+            } else {
+                "no"
+            },
         ))
         .size(12),
     ]
@@ -215,9 +298,28 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     }
 
     let stage: Element<'_, Message> = if has_active_workspace {
+        let workspace = state
+            .workspaces
+            .as_ref()
+            .and_then(WorkspaceManager::active_workspace)
+            .expect("active workspace was checked above");
+        let layout = state
+            .canvas_preview
+            .clone()
+            .unwrap_or_else(|| workspace.canvas_layout());
+        let document = canvas::CanvasDocument::new(workspace, layout);
         row![
-            canvas::view(state.camera).map(Message::Canvas),
-            container(settings).width(360).height(Fill).padding(24),
+            canvas::view(
+                state.camera,
+                document,
+                state.canvas_selection.clone(),
+                state.canvas_revision,
+            )
+            .map(Message::Canvas),
+            container(scrollable(settings))
+                .width(420)
+                .height(Fill)
+                .padding(24),
         ]
         .into()
     } else {
@@ -233,6 +335,14 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
 }
 
 impl OpenPodium {
+    fn reset_canvas_session(&mut self) {
+        self.camera = Camera::default();
+        self.canvas_selection.clear();
+        self.canvas_preview = None;
+        self.canvas_history.clear();
+        self.canvas_revision = self.canvas_revision.wrapping_add(1);
+    }
+
     fn load_active_settings(&mut self) {
         let Some(workspace) = self
             .workspaces
@@ -259,6 +369,258 @@ impl OpenPodium {
             .settings()
             .instructions()
             .map_or_else(String::new, |instructions| instructions.as_str().to_owned());
+    }
+}
+
+fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) {
+    match message {
+        canvas::Message::CameraChanged(camera) => {
+            state.camera = camera;
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        }
+        canvas::Message::SelectionChanged(selection) => {
+            state.canvas_selection = selection;
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        }
+        canvas::Message::PreviewLayout(layout) => {
+            state.canvas_preview = Some(layout);
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        }
+        canvas::Message::CommitLayout { before, after } => {
+            state.canvas_preview = None;
+            if persist_canvas(state, before.clone(), after).is_ok() {
+                state.canvas_history.record(before);
+                state.notice = None;
+            }
+        }
+        canvas::Message::UndoRequested => apply_canvas_action(state, CanvasAction::Undo),
+        canvas::Message::RedoRequested => apply_canvas_action(state, CanvasAction::Redo),
+        canvas::Message::DeleteRequested => apply_canvas_action(state, CanvasAction::Remove),
+        canvas::Message::DuplicateRequested => {
+            apply_canvas_action(state, CanvasAction::Duplicate);
+        }
+    }
+}
+
+fn add_agent(state: &mut OpenPodium, program: AgentProgram) {
+    let Some((workspace_id, agent_id, node_id, before, node)) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| {
+            let agent_id = next_agent_id(workspace)?;
+            let node_id = next_node_id(workspace)?;
+            let before = workspace.canvas_layout();
+            let offset = (before.nodes().len() % 6) as f64 * 40.0;
+            let z_index = before
+                .nodes()
+                .iter()
+                .map(Node::z_index)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            let node = Node::with_z_index(
+                node_id,
+                NodeTarget::Agent(agent_id),
+                CanvasPoint::new(
+                    canvas_coordinate(state.camera.position().x - 180.0 + offset),
+                    canvas_coordinate(state.camera.position().y - 130.0 + offset),
+                )
+                .expect("clamped camera coordinates are finite"),
+                CanvasSize::new(360.0, 260.0).expect("default node size is valid"),
+                z_index,
+            );
+            Some((workspace.id(), agent_id, node_id, before, node))
+        })
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+    let label = agent_program_name(program);
+    let agent = Agent::with_program(
+        agent_id,
+        Name::new(format!("{label} {}", agent_id.get())).expect("generated agent name is valid"),
+        None,
+        program,
+    );
+    let result = state
+        .workspaces
+        .as_mut()
+        .expect("active workspace came from the manager")
+        .execute(
+            workspace_id,
+            DomainCommand::AddAgentNode { agent, node },
+            now(),
+        );
+    match result {
+        Ok(_) => {
+            state.canvas_history.record(before);
+            state.canvas_selection = vec![node_id];
+            state.canvas_preview = None;
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            state.notice = Some(format!(
+                "{label} agent added; terminal runtime is not connected yet"
+            ));
+        }
+        Err(error) => state.notice = Some(error.to_string()),
+    }
+}
+
+fn apply_canvas_action(state: &mut OpenPodium, action: CanvasAction) {
+    if matches!(action, CanvasAction::Undo) {
+        undo_canvas(state);
+        return;
+    }
+    if matches!(action, CanvasAction::Redo) {
+        redo_canvas(state);
+        return;
+    }
+    let Some(before) = current_canvas(state) else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+    let mut selection = state.canvas_selection.clone();
+    let after = match action {
+        CanvasAction::Duplicate => {
+            let (after, duplicated) = canvas::editor::duplicate(&before, &selection);
+            selection = duplicated;
+            after
+        }
+        CanvasAction::Remove => {
+            selection.clear();
+            canvas::editor::remove(&before, &state.canvas_selection)
+        }
+        CanvasAction::Group => canvas::editor::group(&before, &selection),
+        CanvasAction::Ungroup => canvas::editor::ungroup(&before, &selection),
+        CanvasAction::Connect => match canvas::editor::connect(&before, &selection) {
+            Ok(after) => after,
+            Err(error) => {
+                state.notice = Some(error.to_owned());
+                return;
+            }
+        },
+        CanvasAction::Align(alignment) => canvas::editor::align(&before, &selection, alignment),
+        CanvasAction::ZOrder(order) => canvas::editor::change_z_order(&before, &selection, order),
+        CanvasAction::Undo | CanvasAction::Redo => unreachable!("handled above"),
+    };
+    if before == after {
+        return;
+    }
+    if persist_canvas(state, before.clone(), after).is_ok() {
+        state.canvas_history.record(before);
+        state.canvas_selection = selection;
+        state.notice = None;
+    }
+}
+
+fn undo_canvas(state: &mut OpenPodium) {
+    let Some(target) = state.canvas_history.undo_target().cloned() else {
+        return;
+    };
+    let Some(current) = current_canvas(state) else {
+        return;
+    };
+    if persist_canvas(state, current.clone(), target.clone()).is_ok() {
+        state.canvas_history.complete_undo(current);
+        retain_existing_selection(state, &target);
+        state.notice = None;
+    }
+}
+
+fn redo_canvas(state: &mut OpenPodium) {
+    let Some(target) = state.canvas_history.redo_target().cloned() else {
+        return;
+    };
+    let Some(current) = current_canvas(state) else {
+        return;
+    };
+    if persist_canvas(state, current.clone(), target.clone()).is_ok() {
+        state.canvas_history.complete_redo(current);
+        retain_existing_selection(state, &target);
+        state.notice = None;
+    }
+}
+
+fn persist_canvas(
+    state: &mut OpenPodium,
+    before: CanvasLayout,
+    after: CanvasLayout,
+) -> Result<(), ()> {
+    let Some(workspace_id) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace_id)
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return Err(());
+    };
+    state.canvas_preview = None;
+    match state
+        .workspaces
+        .as_mut()
+        .expect("active workspace came from the manager")
+        .execute(
+            workspace_id,
+            DomainCommand::ReplaceCanvas { before, after },
+            now(),
+        ) {
+        Ok(_) => {
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            Ok(())
+        }
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            Err(())
+        }
+    }
+}
+
+fn current_canvas(state: &OpenPodium) -> Option<CanvasLayout> {
+    state
+        .workspaces
+        .as_ref()?
+        .active_workspace()
+        .map(Workspace::canvas_layout)
+}
+
+fn retain_existing_selection(state: &mut OpenPodium, layout: &CanvasLayout) {
+    state
+        .canvas_selection
+        .retain(|node_id| layout.nodes().iter().any(|node| node.id() == *node_id));
+}
+
+fn next_agent_id(workspace: &Workspace) -> Option<AgentId> {
+    let mut value = 1_u64;
+    loop {
+        let id = AgentId::new(value);
+        if workspace.agent(id).is_none() {
+            return Some(id);
+        }
+        value = value.checked_add(1)?;
+    }
+}
+
+fn next_node_id(workspace: &Workspace) -> Option<NodeId> {
+    let mut value = 1_u64;
+    loop {
+        let id = NodeId::new(value);
+        if workspace.node(id).is_none() {
+            return Some(id);
+        }
+        value = value.checked_add(1)?;
+    }
+}
+
+fn canvas_coordinate(value: f64) -> f32 {
+    value.clamp(-1_000_000_000.0, 1_000_000_000.0) as f32
+}
+
+fn agent_program_name(program: AgentProgram) -> &'static str {
+    match program {
+        AgentProgram::Codex => "Codex",
+        AgentProgram::Claude => "Claude",
+        AgentProgram::Shell => "Shell",
     }
 }
 
@@ -309,4 +671,88 @@ fn now() -> Timestamp {
         .unwrap_or_default()
         .as_millis();
     Timestamp::from_unix_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn adding_an_agent_is_persisted_and_participates_in_undo_redo() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let database = temp.path().join("state.sqlite");
+        let mut workspaces = WorkspaceManager::open(&database).unwrap();
+        let workspace_id = workspaces
+            .create_workspace(&project, Timestamp::from_unix_millis(1))
+            .unwrap();
+        let mut state = OpenPodium {
+            camera: Camera::default(),
+            canvas_selection: Vec::new(),
+            canvas_preview: None,
+            canvas_history: History::default(),
+            canvas_revision: 1,
+            workspaces: Some(workspaces),
+            create_directory: String::new(),
+            name: String::new(),
+            icon: String::new(),
+            working_directory: String::new(),
+            instructions: String::new(),
+            notice: None,
+        };
+
+        add_agent(&mut state, AgentProgram::Codex);
+        let workspace = state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .active_workspace()
+            .unwrap();
+        assert_eq!(workspace.canvas_layout().nodes().len(), 1);
+        assert_eq!(
+            workspace.agent(AgentId::new(1)).unwrap().program(),
+            AgentProgram::Codex
+        );
+
+        undo_canvas(&mut state);
+        assert!(
+            state
+                .workspaces
+                .as_ref()
+                .unwrap()
+                .active_workspace()
+                .unwrap()
+                .canvas_layout()
+                .nodes()
+                .is_empty()
+        );
+        redo_canvas(&mut state);
+        assert_eq!(
+            state
+                .workspaces
+                .as_ref()
+                .unwrap()
+                .active_workspace()
+                .unwrap()
+                .canvas_layout()
+                .nodes()
+                .len(),
+            1
+        );
+
+        drop(state);
+        let restored = WorkspaceManager::open(database).unwrap();
+        assert_eq!(
+            restored
+                .workspace(workspace_id)
+                .unwrap()
+                .canvas_layout()
+                .nodes()
+                .len(),
+            1
+        );
+    }
 }
