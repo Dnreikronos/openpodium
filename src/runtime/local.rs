@@ -1,11 +1,14 @@
 use std::io::{self, Read, Write};
 #[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc as std_mpsc};
 use std::thread;
+use std::time::Duration;
 
-use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+#[cfg(unix)]
+use portable_pty::ChildKiller;
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
@@ -14,6 +17,7 @@ use super::{
 };
 
 const OUTPUT_CHUNK_SIZE: usize = 8 * 1024;
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RUNNING: u8 = 0;
 const CANCELLATION_REQUESTED: u8 = 1;
 const FINISHED: u8 = 2;
@@ -70,6 +74,7 @@ impl ProcessRuntime for LocalProcessRuntime {
             writer: Mutex::new(Some(writer)),
             #[cfg(unix)]
             killer: Mutex::new(child.clone_killer()),
+            lifecycle: Mutex::new(()),
             state: AtomicU8::new(RUNNING),
             #[cfg(unix)]
             native_process_id,
@@ -95,9 +100,14 @@ impl ProcessRuntime for LocalProcessRuntime {
                         )
                     })
                 });
-                let waited = child.and_then(wait_for_child);
-                let was_cancelled = waiter_control.finish();
-                let close_result = waiter_control.close_pty();
+                let waited = match child {
+                    Ok(child) => wait_for_child(child, &waiter_control),
+                    Err(error) => {
+                        let _ = waiter_control.finish_waiting();
+                        Err(error)
+                    }
+                };
+                let close_result = waiter_control.close_pty(RuntimeOperation::Wait);
                 let reader_result = reader_done.recv().unwrap_or_else(|_| {
                     Err(RuntimeError::new(
                         RuntimeOperation::ReadOutput,
@@ -108,14 +118,13 @@ impl ProcessRuntime for LocalProcessRuntime {
                     (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                         ProcessTermination::Failed(error)
                     }
-                    (Ok(exit), Ok(()), Ok(())) if was_cancelled => {
-                        ProcessTermination::Cancelled(exit)
-                    }
-                    (Ok(exit), Ok(()), Ok(())) => ProcessTermination::Exited(exit),
+                    (Ok((exit, true)), Ok(()), Ok(())) => ProcessTermination::Cancelled(exit),
+                    (Ok((exit, false)), Ok(()), Ok(())) => ProcessTermination::Exited(exit),
                 };
                 let _ = termination_sender.send(termination);
             })
             .map_err(|error| {
+                let _ = control.cancel();
                 cleanup_unstarted_child(&child_slot);
                 RuntimeError::new(RuntimeOperation::SpawnWorker, error.to_string())
             })?;
@@ -214,6 +223,9 @@ struct ProcessControl {
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     #[cfg(unix)]
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    // A PID is safe to signal only until the waiter reaps it. This lock keeps
+    // that transition atomic with cancellation on every platform.
+    lifecycle: Mutex<()>,
     state: AtomicU8,
     #[cfg(unix)]
     native_process_id: Option<i32>,
@@ -247,20 +259,25 @@ impl ProcessControl {
             }
         }
 
-        let kill_result = self.kill_process();
-        kill_result?;
-        self.close_pty()
+        {
+            let lifecycle = lock(&self.lifecycle, RuntimeOperation::Cancel)?;
+            if self.state.load(Ordering::Acquire) == FINISHED {
+                return Ok(());
+            }
+            self.kill_process(&lifecycle)?;
+        }
+        self.close_pty(RuntimeOperation::Cancel)
     }
 
-    fn close_pty(&self) -> Result<(), RuntimeError> {
-        let writer = lock(&self.writer, RuntimeOperation::Cancel)?.take();
-        let master = lock(&self.master, RuntimeOperation::Cancel)?.take();
+    fn close_pty(&self, operation: RuntimeOperation) -> Result<(), RuntimeError> {
+        let writer = lock(&self.writer, operation)?.take();
+        let master = lock(&self.master, operation)?.take();
         drop(writer);
         drop(master);
         Ok(())
     }
 
-    fn kill_process(&self) -> Result<(), RuntimeError> {
+    fn kill_process(&self, _lifecycle: &MutexGuard<'_, ()>) -> Result<(), RuntimeError> {
         #[cfg(windows)]
         {
             let result = unsafe {
@@ -272,10 +289,10 @@ impl ProcessControl {
             if result != 0 || self.state.load(Ordering::Acquire) == FINISHED {
                 return Ok(());
             }
-            return Err(RuntimeError::new(
+            Err(RuntimeError::new(
                 RuntimeOperation::Cancel,
                 io::Error::last_os_error().to_string(),
-            ));
+            ))
         }
 
         #[cfg(unix)]
@@ -311,8 +328,35 @@ impl ProcessControl {
         }
     }
 
-    fn finish(&self) -> bool {
+    fn finish_waiting(&self) -> Result<bool, RuntimeError> {
+        let lifecycle = lock(&self.lifecycle, RuntimeOperation::Wait)?;
+        Ok(self.finish_locked(&lifecycle))
+    }
+
+    fn finish_locked(&self, _lifecycle: &MutexGuard<'_, ()>) -> bool {
         self.state.swap(FINISHED, Ordering::AcqRel) == CANCELLATION_REQUESTED
+    }
+
+    fn try_wait_child(
+        &self,
+        child: &mut dyn Child,
+    ) -> Result<Option<(ProcessExit, bool)>, RuntimeError> {
+        let lifecycle = lock(&self.lifecycle, RuntimeOperation::Wait)?;
+        match child.try_wait() {
+            Ok(Some(status)) => Ok(Some((
+                ProcessExit {
+                    code: status.exit_code(),
+                    signal: status.signal().map(ToOwned::to_owned),
+                    success: status.success(),
+                },
+                self.finish_locked(&lifecycle),
+            ))),
+            Ok(None) => Ok(None),
+            Err(error) => {
+                self.finish_locked(&lifecycle);
+                Err(RuntimeError::new(RuntimeOperation::Wait, error.to_string()))
+            }
+        }
     }
 }
 
@@ -328,15 +372,16 @@ fn clone_process_handle(child: &dyn Child) -> io::Result<OwnedHandle> {
     borrowed.try_clone_to_owned()
 }
 
-fn wait_for_child(mut child: Box<dyn Child + Send + Sync>) -> Result<ProcessExit, RuntimeError> {
-    child
-        .wait()
-        .map(|status| ProcessExit {
-            code: status.exit_code(),
-            signal: status.signal().map(ToOwned::to_owned),
-            success: status.success(),
-        })
-        .map_err(|error| RuntimeError::new(RuntimeOperation::Wait, error.to_string()))
+fn wait_for_child(
+    mut child: Box<dyn Child + Send + Sync>,
+    control: &ProcessControl,
+) -> Result<(ProcessExit, bool), RuntimeError> {
+    loop {
+        if let Some(termination) = control.try_wait_child(child.as_mut())? {
+            return Ok(termination);
+        }
+        thread::sleep(CHILD_POLL_INTERVAL);
+    }
 }
 
 fn read_output(
