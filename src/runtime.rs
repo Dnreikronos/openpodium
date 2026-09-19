@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 mod local;
 
-pub use local::{LocalProcessRuntime, RunningProcess};
+pub use local::{LocalProcessRuntime, ProcessController, RunningProcess};
 
 const DEFAULT_OUTPUT_CAPACITY: usize = 64;
 

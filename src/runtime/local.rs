@@ -162,32 +162,28 @@ pub struct RunningProcess {
     termination: Option<oneshot::Receiver<ProcessTermination>>,
 }
 
+#[derive(Clone)]
+pub struct ProcessController {
+    control: Arc<ProcessControl>,
+}
+
 impl RunningProcess {
     pub const fn process_id(&self) -> Option<u32> {
         self.process_id
     }
 
+    pub fn controller(&self) -> ProcessController {
+        ProcessController {
+            control: Arc::clone(&self.control),
+        }
+    }
+
     pub fn write_input(&self, bytes: &[u8]) -> Result<(), RuntimeError> {
-        self.control.ensure_running(RuntimeOperation::WriteInput)?;
-        let mut writer_handle = lock(&self.control.writer, RuntimeOperation::WriteInput)?;
-        let writer = writer_handle.as_mut().ok_or_else(|| {
-            RuntimeError::new(RuntimeOperation::WriteInput, "the process is not running")
-        })?;
-        writer
-            .write_all(bytes)
-            .and_then(|()| writer.flush())
-            .map_err(|error| RuntimeError::new(RuntimeOperation::WriteInput, error.to_string()))
+        self.controller().write_input(bytes)
     }
 
     pub fn resize(&self, size: TerminalSize) -> Result<(), RuntimeError> {
-        self.control.ensure_running(RuntimeOperation::Resize)?;
-        let master_handle = lock(&self.control.master, RuntimeOperation::Resize)?;
-        let master = master_handle.as_ref().ok_or_else(|| {
-            RuntimeError::new(RuntimeOperation::Resize, "the process is not running")
-        })?;
-        master
-            .resize(size.into())
-            .map_err(|error| RuntimeError::new(RuntimeOperation::Resize, error.to_string()))
+        self.controller().resize(size)
     }
 
     pub fn cancel(&mut self) -> Result<(), RuntimeError> {
@@ -213,6 +209,35 @@ impl RunningProcess {
     #[cfg(test)]
     pub(super) fn lifecycle_state(&self) -> &'static str {
         self.control.lifecycle_state()
+    }
+}
+
+impl ProcessController {
+    pub fn write_input(&self, bytes: &[u8]) -> Result<(), RuntimeError> {
+        self.control.ensure_running(RuntimeOperation::WriteInput)?;
+        let mut writer_handle = lock(&self.control.writer, RuntimeOperation::WriteInput)?;
+        let writer = writer_handle.as_mut().ok_or_else(|| {
+            RuntimeError::new(RuntimeOperation::WriteInput, "the process is not running")
+        })?;
+        writer
+            .write_all(bytes)
+            .and_then(|()| writer.flush())
+            .map_err(|error| RuntimeError::new(RuntimeOperation::WriteInput, error.to_string()))
+    }
+
+    pub fn resize(&self, size: TerminalSize) -> Result<(), RuntimeError> {
+        self.control.ensure_running(RuntimeOperation::Resize)?;
+        let master_handle = lock(&self.control.master, RuntimeOperation::Resize)?;
+        let master = master_handle.as_ref().ok_or_else(|| {
+            RuntimeError::new(RuntimeOperation::Resize, "the process is not running")
+        })?;
+        master
+            .resize(size.into())
+            .map_err(|error| RuntimeError::new(RuntimeOperation::Resize, error.to_string()))
+    }
+
+    pub fn cancel(&self) -> Result<(), RuntimeError> {
+        self.control.cancel()
     }
 }
 
