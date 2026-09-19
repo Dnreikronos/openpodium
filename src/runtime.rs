@@ -3,8 +3,10 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 
+mod environments;
 mod local;
 
+pub use environments::{EnvironmentHealth, check_environment, prepare_environment_process};
 pub use local::{LocalProcessRuntime, ProcessController, RunningProcess};
 
 const DEFAULT_OUTPUT_CAPACITY: usize = 64;
@@ -203,6 +205,8 @@ impl ProcessExit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeOperation {
     Validate,
+    PrepareEnvironment,
+    CheckEnvironment,
     OpenPty,
     CloneReader,
     TakeWriter,
@@ -219,6 +223,8 @@ impl Display for RuntimeOperation {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Validate => "validate process specification",
+            Self::PrepareEnvironment => "prepare runtime environment",
+            Self::CheckEnvironment => "check runtime environment",
             Self::OpenPty => "open pseudo-terminal",
             Self::CloneReader => "create pseudo-terminal reader",
             Self::TakeWriter => "create pseudo-terminal writer",
