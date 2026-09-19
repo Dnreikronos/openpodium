@@ -19,6 +19,9 @@ pub use value_objects::*;
 mod lifecycle;
 pub use lifecycle::*;
 
+mod environments;
+pub use environments::*;
+
 mod entities;
 pub use entities::*;
 

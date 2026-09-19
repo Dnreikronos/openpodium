@@ -90,6 +90,119 @@ fn value_objects_reject_invalid_values() {
 }
 
 #[test]
+fn environment_profiles_validate_transport_fields() {
+    assert_eq!(
+        SshEnvironment::new("-unsafe", None, None, "/workspace")
+            .unwrap_err()
+            .problem(),
+        EnvironmentValidationProblem::InvalidIdentifier
+    );
+    assert_eq!(
+        SshEnvironment::new("example.com", None, Some(0), "/workspace")
+            .unwrap_err()
+            .problem(),
+        EnvironmentValidationProblem::Zero
+    );
+    assert_eq!(
+        ContainerEnvironment::new("docker", "dev container", "/workspace")
+            .unwrap_err()
+            .problem(),
+        EnvironmentValidationProblem::InvalidIdentifier
+    );
+    assert_eq!(
+        CustomEnvironment::new(
+            "devbox",
+            vec!["bad\0argument".to_owned()],
+            WorkspaceDirectory::new("/workspace").unwrap(),
+        )
+        .unwrap_err()
+        .problem(),
+        EnvironmentValidationProblem::ControlCharacter
+    );
+}
+
+#[test]
+fn environment_profiles_are_explicit_and_referenced_by_agents() {
+    let mut workspace = test_workspace();
+    let profile_id = EnvironmentProfileId::new(1);
+    let profile = ssh_profile(profile_id, "Remote", "build.example.com");
+
+    assert_eq!(
+        workspace
+            .execute(DomainCommand::AddEnvironmentProfile(profile.clone()))
+            .unwrap(),
+        DomainEvent::EnvironmentProfileAdded(profile.clone())
+    );
+    let agent = Agent::with_program(
+        AgentId::new(1),
+        name("Remote Codex"),
+        None,
+        AgentProgram::Codex,
+    )
+    .in_environment(profile_id);
+    workspace
+        .execute(DomainCommand::AddAgent(agent.clone()))
+        .unwrap();
+
+    assert_eq!(
+        workspace.agent(agent.id()).unwrap().environment_id(),
+        Some(profile_id)
+    );
+    assert_eq!(
+        workspace.execute(DomainCommand::RemoveEnvironmentProfile(profile_id)),
+        Err(DomainError::EnvironmentProfileInUse {
+            profile_id,
+            agent_id: agent.id(),
+        })
+    );
+}
+
+#[test]
+fn environment_profile_updates_reject_no_ops_and_stale_events() {
+    let mut workspace = test_workspace();
+    let profile_id = EnvironmentProfileId::new(1);
+    let original = ssh_profile(profile_id, "Remote", "build.example.com");
+    workspace
+        .execute(DomainCommand::AddEnvironmentProfile(original.clone()))
+        .unwrap();
+
+    assert_eq!(
+        workspace.execute(DomainCommand::UpdateEnvironmentProfile(original.clone())),
+        Err(DomainError::UnchangedEnvironmentProfile)
+    );
+
+    let changed = ssh_profile(profile_id, "Remote", "new.example.com");
+    workspace
+        .execute(DomainCommand::UpdateEnvironmentProfile(changed.clone()))
+        .unwrap();
+    let before = workspace.clone();
+    assert_eq!(
+        workspace.apply(&DomainEvent::EnvironmentProfileChanged {
+            from: original,
+            to: changed,
+        }),
+        Err(DomainError::EnvironmentProfileConflict(profile_id))
+    );
+    assert_eq!(workspace, before);
+}
+
+#[test]
+fn agents_reject_missing_environment_profiles() {
+    let mut workspace = test_workspace();
+    let profile_id = EnvironmentProfileId::new(99);
+    let agent = Agent::new(AgentId::new(1), name("Remote shell"), None).in_environment(profile_id);
+
+    assert_eq!(
+        workspace.execute(DomainCommand::AddAgent(agent)),
+        Err(DomainError::InvalidReference {
+            entity: EntityRef::Agent(AgentId::new(1)),
+            field: "environment_id",
+            target: EntityRef::EnvironmentProfile(profile_id),
+        })
+    );
+}
+
+#[test]
 fn workspace_settings_changes_are_explicit_and_atomic() {
     let mut workspace = test_workspace();
     let before = workspace.settings().clone();
@@ -527,4 +640,14 @@ fn name(value: &str) -> Name {
 
 fn content(value: &str) -> Content {
     Content::new(value).unwrap()
+}
+
+fn ssh_profile(id: EnvironmentProfileId, profile_name: &str, host: &str) -> EnvironmentProfile {
+    EnvironmentProfile::new(
+        id,
+        name(profile_name),
+        EnvironmentKind::Ssh(
+            SshEnvironment::new(host, Some("builder".to_owned()), Some(22), "/workspace").unwrap(),
+        ),
+    )
 }
