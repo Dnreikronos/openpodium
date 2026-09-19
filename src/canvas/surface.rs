@@ -805,6 +805,11 @@ mod tests {
 
     #[test]
     fn terminal_focus_keeps_escape_and_canvas_shortcuts_for_the_pty() {
+        #[cfg(target_os = "macos")]
+        let (canvas_command, encoded_undo) = (Modifiers::COMMAND, b"z".to_vec());
+        #[cfg(not(target_os = "macos"))]
+        let (canvas_command, encoded_undo) = (Modifiers::CTRL, vec![0x1a]);
+
         assert!(!is_release_focus_shortcut(
             &Key::Named(Named::Escape),
             Modifiers::empty()
@@ -822,14 +827,14 @@ mod tests {
             terminal::encode_key(
                 &Key::Character("z".into()),
                 Some("z"),
-                Modifiers::COMMAND,
+                canvas_command,
                 terminal::InputMode::default(),
             ),
-            Some(b"z".to_vec())
+            Some(encoded_undo)
         );
         assert!(is_release_focus_shortcut(
             &Key::Named(Named::Escape),
-            Modifiers::COMMAND | Modifiers::SHIFT
+            canvas_command | Modifiers::SHIFT
         ));
     }
 }
