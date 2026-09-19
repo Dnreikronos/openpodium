@@ -1,6 +1,6 @@
 # Authenticated local IPC and command-line client
 
-Status: Issue #12 implementation contract
+Status: Issue #12 base contract, extended by issue #13
 Updated: 2026-09-19
 
 ## Boundary
@@ -44,12 +44,13 @@ Local agent processes receive:
 - `OPENPODIUM_AGENT_ID`
 - `OPENPODIUM_CLI`, containing the absolute path to the current executable
 
-Remote, container, and custom environment wrappers receive the two identity
-values and `OPENPODIUM_IPC_AVAILABLE=0`, but no endpoint or token. Host
-forwarding for those environments requires an explicit transport design and is
-outside this issue.
+Remote and container environment wrappers receive the two identity values and
+`OPENPODIUM_IPC_AVAILABLE=0`, but no endpoint or token. Local Shell agents and
+custom presets are also unavailable because OpenPodium cannot safely inject an
+automatic prompt into an arbitrary command. Host forwarding and custom delivery
+strategies require an explicit transport design.
 
-## Protocol version 1
+## Protocol versions
 
 Every request identifies the protocol as `openpodium-ipc`, supplies all client
 versions in preference order, a request ID, authentication claims, and one
@@ -62,7 +63,7 @@ A request envelope has this shape:
 ```json
 {
   "protocol": "openpodium-ipc",
-  "supported_versions": [1],
+  "supported_versions": [2, 1],
   "request_id": "request-7d3464d3",
   "credentials": {
     "workspace_id": 4,
@@ -82,6 +83,10 @@ Command payloads are:
 {"type":"send_task","message_id":"task-1","recipient_agent_id":8,"title":"Review IPC","body":"Check the protocol implementation."}
 {"type":"report_progress","message_id":"progress-1","task_message_id":"task-1","body":"Targeted tests are running."}
 {"type":"respond","message_id":"response-1","task_message_id":"task-1","status":"completed","body":"Review complete."}
+{"type":"send_handoff","message_id":"question-1","recipient_agent_id":8,"kind":"question","body":"Which API should I use?"}
+{"type":"report_handoff_progress","message_id":"progress-2","handoff_message_id":"question-1","body":"Checking the domain model."}
+{"type":"respond_to_handoff","message_id":"response-2","handoff_message_id":"question-1","status":"completed","body":"Use the workspace aggregate."}
+{"type":"cancel_handoff","message_id":"cancel-1","handoff_message_id":"question-1","reason":"Answered elsewhere."}
 ```
 
 `status` is `completed`, `failed`, or `blocked`. IDs contain 1–128 ASCII
@@ -92,10 +97,10 @@ A successful response echoes the protocol, selected version, and request ID,
 then returns either an agent list or an acknowledgement:
 
 ```json
-{"protocol":"openpodium-ipc","version":1,"request_id":"request-7d3464d3","result":{"type":"accepted","message_id":"task-1","duplicate":false}}
+{"protocol":"openpodium-ipc","version":2,"request_id":"request-7d3464d3","result":{"type":"accepted","message_id":"task-1","duplicate":false}}
 ```
 
-Failures omit `result` and return an error object. Stable version 1 codes are
+Failures omit `result` and return an error object. Stable protocol error codes are
 `malformed_request`, `frame_too_large`, `incompatible_protocol`, `unauthorized`,
 `invalid_request`, `agent_not_visible`, `idempotency_conflict`, and
 `service_unavailable`. Compatibility failures also include
@@ -112,14 +117,22 @@ Version 1 supports:
 - `respond`: publishes a successful, failed, or blocked response associated
   with an earlier task message.
 
+Version 2 is preferred and adds typed `send_handoff`,
+`report_handoff_progress`, `respond_to_handoff`, and `cancel_handoff` commands.
+It distinguishes tasks from questions, supports parent-message correlation and
+optional response deadlines, and generalizes progress and responses to either
+handoff kind. Version 1 remains available to existing clients; orchestration
+normalizes both versions into the same durable domain model.
+
 Each structured message has a client-generated opaque ID. The server validates
-IDs and text sizes before publishing. During one OpenPodium process lifetime,
-the first accepted `(workspace, message ID)` records the authenticated sender,
-canonical payload, and acknowledgement. An identical retry by that sender
+IDs and text sizes before publishing. The first accepted `(workspace, message
+ID)` durably records the authenticated sender, canonical payload, and
+acknowledgement before success is returned. An identical retry by that sender
 returns the acknowledgement without publishing twice; reuse by another sender
 or with a different payload returns
-`idempotency_conflict`. Restart-safe deduplication will be added with issue #13
-where it can be atomic with durable orchestration effects.
+`idempotency_conflict`. Pending messages and deduplication receipts survive an
+OpenPodium restart; domain application is acknowledged separately after the
+orchestrator has journaled the message.
 
 Errors are tagged objects with a stable code, a human-readable message, and
 optional structured details. Authentication failures deliberately do not reveal
@@ -134,9 +147,11 @@ arguments and exposes these non-interactive commands:
 
 ```text
 openpodium ipc agents list
-openpodium ipc task send --to <agent-id> --title <title> --body <text> [--message-id <id>]
-openpodium ipc progress report --task <message-id> --body <text> [--message-id <id>]
-openpodium ipc respond --task <message-id> --status <completed|failed|blocked> --body <text> [--message-id <id>]
+openpodium ipc task send --to <agent-id> --title <title> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]
+openpodium ipc question send --to <agent-id> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]
+openpodium ipc progress report --handoff <message-id> --body <text> [--message-id <id>]
+openpodium ipc respond --handoff <message-id> --status <completed|failed|blocked> --body <text> [--message-id <id>]
+openpodium ipc cancel --handoff <message-id> --reason <text> [--message-id <id>]
 ```
 
 Connection and identity values default to the injected environment variables.
@@ -151,7 +166,8 @@ Protocol tests cover serialization, negotiation, validation, and stable error
 codes. Temporary-directory service tests prove secret-file permissions where
 supported, invalid-token rejection, cross-workspace isolation, exact retry
 deduplication, conflicting ID reuse, concurrent clients, malformed input,
-oversized frames, and clean shutdown. CLI tests exercise argument parsing and
-environment discovery without opening the desktop window. Adapter tests verify
-that local launches receive scoped connection metadata while remote launches do
+oversized frames, durable restart recovery, unavailable recipient adapters, and
+clean shutdown. CLI tests exercise argument parsing and environment discovery
+without opening the desktop window. Adapter tests verify that supported local
+launches receive scoped connection metadata while remote and unsafe launches do
 not receive the endpoint or token.

@@ -6,8 +6,8 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::Duration;
 
 use super::{
-    Credentials, MAX_FRAME_BYTES, MessageId, PROTOCOL_NAME, PROTOCOL_VERSION, ProtocolCommand,
-    ProtocolRequest, ProtocolResponse,
+    Credentials, MAX_FRAME_BYTES, MessageId, PROTOCOL_NAME, ProtocolCommand, ProtocolRequest,
+    ProtocolResponse, SUPPORTED_VERSIONS,
 };
 
 pub const AVAILABLE_ENV: &str = "OPENPODIUM_IPC_AVAILABLE";
@@ -137,10 +137,14 @@ impl IpcClient {
                 response.protocol
             )));
         }
-        if response.error.is_none() && response.version != Some(PROTOCOL_VERSION) {
+        if response.error.is_none()
+            && !response
+                .version
+                .is_some_and(|version| SUPPORTED_VERSIONS.contains(&version))
+        {
             return Err(ClientError::InvalidResponse(format!(
-                "server returned version {:?}; expected {PROTOCOL_VERSION}",
-                response.version
+                "server returned unsupported version {:?}; expected one of {SUPPORTED_VERSIONS:?}",
+                response.version,
             )));
         }
         Ok(response)

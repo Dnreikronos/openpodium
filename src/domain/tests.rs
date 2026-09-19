@@ -30,8 +30,9 @@ const TASK_STATES: [TaskState; 7] = [
     TaskState::Failed,
     TaskState::Cancelled,
 ];
-const ALLOWED_TASK_TRANSITIONS: [(TaskState, TaskState); 12] = [
+const ALLOWED_TASK_TRANSITIONS: [(TaskState, TaskState); 13] = [
     (TaskState::Queued, TaskState::Delivered),
+    (TaskState::Queued, TaskState::Failed),
     (TaskState::Queued, TaskState::Cancelled),
     (TaskState::Delivered, TaskState::Running),
     (TaskState::Delivered, TaskState::Failed),
@@ -601,6 +602,185 @@ fn retries_preserve_a_terminal_attempt() {
     assert_eq!(
         workspace.task(TaskId::new(2)).unwrap().retry_of(),
         Some(original_id)
+    );
+}
+
+#[test]
+fn typed_task_handoffs_record_atomic_delivery_progress_and_response() {
+    let mut workspace = test_workspace();
+    for (id, agent_name) in [(1, "Lead"), (2, "Builder")] {
+        workspace
+            .execute(DomainCommand::AddAgent(Agent::new(
+                AgentId::new(id),
+                name(agent_name),
+                None,
+            )))
+            .unwrap();
+    }
+    let task = Task::new(
+        TaskId::new(1),
+        name("Implement orchestration"),
+        content("Build the durable handoff path"),
+        Some(AgentId::new(2)),
+        None,
+    );
+    let handoff = Handoff::tracked(
+        HandoffId::new(1),
+        HandoffMessageId::new("task-1").unwrap(),
+        AgentId::new(1),
+        AgentId::new(2),
+        HandoffPayload::Task(task.id()),
+        None,
+        Timestamp::from_unix_millis(100),
+        Some(Timestamp::from_unix_millis(10_000)),
+    )
+    .unwrap();
+    workspace
+        .execute(DomainCommand::AddTaskHandoff { task, handoff })
+        .unwrap();
+
+    let before = workspace.handoff(HandoffId::new(1)).unwrap().clone();
+    let mut started = before.clone();
+    assert_eq!(
+        started
+            .begin_delivery(
+                HandoffMessageId::new("task-1").unwrap(),
+                DeliveryMechanism::CodexTerminal,
+                Timestamp::from_unix_millis(110),
+            )
+            .unwrap(),
+        1
+    );
+    workspace
+        .execute(DomainCommand::UpdateHandoff {
+            before,
+            after: started.clone(),
+        })
+        .unwrap();
+
+    let mut delivered = started.clone();
+    delivered
+        .complete_delivery(1, Timestamp::from_unix_millis(120))
+        .unwrap();
+    workspace
+        .execute(DomainCommand::UpdateHandoff {
+            before: started,
+            after: delivered.clone(),
+        })
+        .unwrap();
+
+    let mut progressed = delivered.clone();
+    progressed
+        .report_progress(HandoffProgress::new(
+            HandoffMessageId::new("progress-1").unwrap(),
+            content("Running targeted tests"),
+            Timestamp::from_unix_millis(130),
+        ))
+        .unwrap();
+    workspace
+        .execute(DomainCommand::UpdateHandoff {
+            before: delivered,
+            after: progressed.clone(),
+        })
+        .unwrap();
+
+    let mut responded = progressed.clone();
+    responded
+        .respond(HandoffResponse::new(
+            HandoffMessageId::new("response-1").unwrap(),
+            HandoffResponseStatus::Completed,
+            content("Implementation complete"),
+            Timestamp::from_unix_millis(140),
+        ))
+        .unwrap();
+    workspace
+        .execute(DomainCommand::UpdateHandoff {
+            before: progressed,
+            after: responded,
+        })
+        .unwrap();
+
+    let stored = workspace.handoff(HandoffId::new(1)).unwrap();
+    assert!(stored.is_delivered());
+    assert_eq!(stored.delivery_attempts().len(), 1);
+    assert_eq!(stored.progress().len(), 1);
+    assert_eq!(
+        stored.response().unwrap().status(),
+        HandoffResponseStatus::Completed
+    );
+}
+
+#[test]
+fn handoff_updates_reject_combined_transitions_and_bound_parent_chains() {
+    let mut workspace = test_workspace();
+    for (id, agent_name) in [(1, "Lead"), (2, "Builder")] {
+        workspace
+            .execute(DomainCommand::AddAgent(Agent::new(
+                AgentId::new(id),
+                name(agent_name),
+                None,
+            )))
+            .unwrap();
+    }
+
+    let mut parent = None;
+    for raw_id in 1..=MAX_HANDOFF_DEPTH {
+        let id = HandoffId::new(u64::try_from(raw_id).unwrap());
+        let source = if raw_id % 2 == 0 { 2 } else { 1 };
+        let recipient = if source == 1 { 2 } else { 1 };
+        let handoff = Handoff::tracked(
+            id,
+            HandoffMessageId::new(format!("question-{raw_id}")).unwrap(),
+            AgentId::new(source),
+            AgentId::new(recipient),
+            HandoffPayload::Question(content("Ask back")),
+            parent,
+            Timestamp::from_unix_millis(u64::try_from(raw_id).unwrap()),
+            None,
+        )
+        .unwrap();
+        workspace
+            .execute(DomainCommand::AddHandoff(handoff))
+            .unwrap();
+        parent = Some(id);
+    }
+
+    let too_deep = Handoff::tracked(
+        HandoffId::new(17),
+        HandoffMessageId::new("question-17").unwrap(),
+        AgentId::new(1),
+        AgentId::new(2),
+        HandoffPayload::Question(content("One too many")),
+        parent,
+        Timestamp::from_unix_millis(17),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        workspace.execute(DomainCommand::AddHandoff(too_deep)),
+        Err(DomainError::HandoffChainTooDeep {
+            handoff_id: HandoffId::new(17),
+            max_depth: MAX_HANDOFF_DEPTH,
+        })
+    );
+
+    let before = workspace.handoff(HandoffId::new(1)).unwrap().clone();
+    let mut after = before.clone();
+    after
+        .begin_delivery(
+            HandoffMessageId::new("question-1").unwrap(),
+            DeliveryMechanism::ClaudeTerminal,
+            Timestamp::from_unix_millis(20),
+        )
+        .unwrap();
+    after
+        .complete_delivery(1, Timestamp::from_unix_millis(21))
+        .unwrap();
+    assert_eq!(
+        workspace.execute(DomainCommand::UpdateHandoff { before, after }),
+        Err(DomainError::InvalidHandoff(
+            HandoffMutationError::NonAtomicChange
+        ))
     );
 }
 

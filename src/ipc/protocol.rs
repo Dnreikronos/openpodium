@@ -3,7 +3,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 
-use super::{PROTOCOL_NAME, PROTOCOL_VERSION};
+use super::{PROTOCOL_NAME, SUPPORTED_VERSIONS};
 
 const MAX_ID_CHARS: usize = 128;
 const MAX_TITLE_CHARS: usize = 255;
@@ -90,7 +90,7 @@ impl ProtocolRequest {
     pub fn new(request_id: MessageId, credentials: Credentials, command: ProtocolCommand) -> Self {
         Self {
             protocol: PROTOCOL_NAME.to_owned(),
-            supported_versions: vec![PROTOCOL_VERSION],
+            supported_versions: SUPPORTED_VERSIONS.to_vec(),
             request_id,
             credentials,
             command,
@@ -108,6 +108,18 @@ pub enum ProtocolCommand {
         title: String,
         body: String,
     },
+    SendHandoff {
+        message_id: MessageId,
+        recipient_agent_id: u64,
+        kind: HandoffKind,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        body: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_message_id: Option<MessageId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response_timeout_ms: Option<u64>,
+    },
     ReportProgress {
         message_id: MessageId,
         task_message_id: MessageId,
@@ -119,6 +131,22 @@ pub enum ProtocolCommand {
         status: ResponseStatus,
         body: String,
     },
+    ReportHandoffProgress {
+        message_id: MessageId,
+        handoff_message_id: MessageId,
+        body: String,
+    },
+    RespondToHandoff {
+        message_id: MessageId,
+        handoff_message_id: MessageId,
+        status: ResponseStatus,
+        body: String,
+    },
+    CancelHandoff {
+        message_id: MessageId,
+        handoff_message_id: MessageId,
+        reason: String,
+    },
 }
 
 impl ProtocolCommand {
@@ -126,8 +154,25 @@ impl ProtocolCommand {
         match self {
             Self::ListAgents => None,
             Self::SendTask { message_id, .. }
+            | Self::SendHandoff { message_id, .. }
             | Self::ReportProgress { message_id, .. }
-            | Self::Respond { message_id, .. } => Some(message_id),
+            | Self::Respond { message_id, .. }
+            | Self::ReportHandoffProgress { message_id, .. }
+            | Self::RespondToHandoff { message_id, .. }
+            | Self::CancelHandoff { message_id, .. } => Some(message_id),
+        }
+    }
+
+    pub const fn minimum_version(&self) -> u16 {
+        match self {
+            Self::ListAgents
+            | Self::SendTask { .. }
+            | Self::ReportProgress { .. }
+            | Self::Respond { .. } => 1,
+            Self::SendHandoff { .. }
+            | Self::ReportHandoffProgress { .. }
+            | Self::RespondToHandoff { .. }
+            | Self::CancelHandoff { .. } => 2,
         }
     }
 
@@ -146,11 +191,52 @@ impl ProtocolCommand {
                 validate_text(title, MAX_TITLE_CHARS, "task title")?;
                 validate_text(body, MAX_BODY_CHARS, "task body")
             }
-            Self::ReportProgress { body, .. } | Self::Respond { body, .. } => {
+            Self::SendHandoff {
+                recipient_agent_id,
+                kind,
+                title,
+                body,
+                response_timeout_ms,
+                ..
+            } => {
+                if *recipient_agent_id == 0 {
+                    return Err(ProtocolValidationError::InvalidAgentId);
+                }
+                match (kind, title) {
+                    (HandoffKind::Task, Some(title)) => {
+                        validate_text(title, MAX_TITLE_CHARS, "task title")?;
+                    }
+                    (HandoffKind::Task, None) => {
+                        return Err(ProtocolValidationError::MissingTaskTitle);
+                    }
+                    (HandoffKind::Question, Some(_)) => {
+                        return Err(ProtocolValidationError::UnexpectedQuestionTitle);
+                    }
+                    (HandoffKind::Question, None) => {}
+                }
+                if response_timeout_ms == &Some(0) {
+                    return Err(ProtocolValidationError::InvalidResponseTimeout);
+                }
+                validate_text(body, MAX_BODY_CHARS, "handoff body")
+            }
+            Self::ReportProgress { body, .. }
+            | Self::Respond { body, .. }
+            | Self::ReportHandoffProgress { body, .. }
+            | Self::RespondToHandoff { body, .. } => {
                 validate_text(body, MAX_BODY_CHARS, "message body")
+            }
+            Self::CancelHandoff { reason, .. } => {
+                validate_text(reason, MAX_BODY_CHARS, "cancellation reason")
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffKind {
+    Task,
+    Question,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,21 +250,29 @@ pub enum ResponseStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCapabilities {
     pub accepts_tasks: bool,
+    #[serde(default)]
+    pub accepts_questions: bool,
     pub reports_progress: bool,
     pub responds: bool,
+    #[serde(default)]
+    pub supports_cancellation: bool,
 }
 
 impl AgentCapabilities {
     pub const CONNECTED: Self = Self {
         accepts_tasks: true,
+        accepts_questions: true,
         reports_progress: true,
         responds: true,
+        supports_cancellation: true,
     };
 
     pub const UNAVAILABLE: Self = Self {
         accepts_tasks: false,
+        accepts_questions: false,
         reports_progress: false,
         responds: false,
+        supports_cancellation: false,
     };
 }
 
@@ -206,10 +300,10 @@ pub struct ProtocolResponse {
 }
 
 impl ProtocolResponse {
-    pub fn success(request_id: MessageId, result: ProtocolResult) -> Self {
+    pub fn success(version: u16, request_id: MessageId, result: ProtocolResult) -> Self {
         Self {
             protocol: PROTOCOL_NAME.to_owned(),
-            version: Some(PROTOCOL_VERSION),
+            version: Some(version),
             request_id: Some(request_id),
             result: Some(result),
             error: None,
@@ -286,6 +380,9 @@ pub enum ErrorCode {
 pub enum ProtocolValidationError {
     InvalidIdentifier,
     InvalidAgentId,
+    MissingTaskTitle,
+    UnexpectedQuestionTitle,
+    InvalidResponseTimeout,
     EmptyText {
         field: &'static str,
     },
@@ -305,6 +402,13 @@ impl Display for ProtocolValidationError {
                 "identifier must contain 1 to 128 ASCII letters, digits, dots, dashes, or underscores",
             ),
             Self::InvalidAgentId => formatter.write_str("agent ID must be greater than zero"),
+            Self::MissingTaskTitle => formatter.write_str("task handoffs require a title"),
+            Self::UnexpectedQuestionTitle => {
+                formatter.write_str("question handoffs cannot include a title")
+            }
+            Self::InvalidResponseTimeout => {
+                formatter.write_str("response timeout must be greater than zero")
+            }
             Self::EmptyText { field } => write!(formatter, "{field} cannot be empty"),
             Self::TextTooLong { field, max_chars } => {
                 write!(formatter, "{field} cannot exceed {max_chars} characters")
@@ -388,8 +492,38 @@ mod tests {
     }
 
     #[test]
+    fn version_two_handoffs_validate_kind_specific_fields() {
+        let question = ProtocolCommand::SendHandoff {
+            message_id: MessageId::new("question-1").unwrap(),
+            recipient_agent_id: 8,
+            kind: HandoffKind::Question,
+            title: None,
+            body: "Which API should I use?".to_owned(),
+            parent_message_id: Some(MessageId::new("task-1").unwrap()),
+            response_timeout_ms: Some(30_000),
+        };
+        assert_eq!(question.minimum_version(), 2);
+        assert_eq!(question.validate(), Ok(()));
+
+        let missing_title = ProtocolCommand::SendHandoff {
+            message_id: MessageId::new("task-2").unwrap(),
+            recipient_agent_id: 8,
+            kind: HandoffKind::Task,
+            title: None,
+            body: "Do work".to_owned(),
+            parent_message_id: None,
+            response_timeout_ms: None,
+        };
+        assert_eq!(
+            missing_title.validate(),
+            Err(ProtocolValidationError::MissingTaskTitle)
+        );
+    }
+
+    #[test]
     fn response_has_exactly_one_outcome() {
         let success = ProtocolResponse::success(
+            2,
             MessageId::new("request-1").unwrap(),
             ProtocolResult::Agents { agents: Vec::new() },
         );
@@ -397,7 +531,7 @@ mod tests {
         assert!(success.error.is_none());
 
         let failure = ProtocolResponse::failure(
-            Some(PROTOCOL_VERSION),
+            Some(2),
             None,
             ProtocolError::new(ErrorCode::MalformedRequest, "invalid JSON"),
         );

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
@@ -11,16 +11,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use super::store::{InsertResult, MessageStore, StoreError, StoredMessage};
 use super::{
     AgentCapabilities, AgentDescriptor, AuthenticationError, CapabilityIssuer, Credentials,
-    ErrorCode, MAX_FRAME_BYTES, MessageId, PROTOCOL_NAME, PROTOCOL_VERSION, ProtocolCommand,
-    ProtocolError, ProtocolRequest, ProtocolResponse, ProtocolResult, SECRET_FILE_NAME,
-    SUPPORTED_VERSIONS,
+    ErrorCode, MAX_FRAME_BYTES, MESSAGE_STORE_FILE_NAME, MessageId, PROTOCOL_NAME,
+    PROTOCOL_VERSION, ProtocolCommand, ProtocolError, ProtocolRequest, ProtocolResponse,
+    ProtocolResult, SECRET_FILE_NAME, SUPPORTED_VERSIONS,
 };
 
 const WORKER_COUNT: usize = 4;
 const CONNECTION_QUEUE_CAPACITY: usize = 64;
-const INCOMING_QUEUE_CAPACITY: usize = 1024;
 const MESSAGE_CAPACITY: usize = 10_000;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -86,7 +86,8 @@ pub struct IpcService {
     endpoint: SocketAddr,
     issuer: Arc<CapabilityIssuer>,
     directory: Arc<RwLock<Directory>>,
-    incoming: Receiver<AcceptedMessage>,
+    messages: Arc<Mutex<MessageStore>>,
+    leased_messages: Mutex<BTreeSet<(u64, MessageId)>>,
     shutdown: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
     worker_threads: Vec<JoinHandle<()>>,
@@ -109,20 +110,20 @@ impl IpcService {
         let endpoint = listener.local_addr().map_err(ServiceError::Configure)?;
 
         let directory = Arc::new(RwLock::new(Directory::default()));
-        let broker = Arc::new(Mutex::new(Broker::default()));
+        let messages = Arc::new(Mutex::new(MessageStore::open(
+            data_directory.join(MESSAGE_STORE_FILE_NAME),
+        )?));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (connection_sender, connection_receiver) =
             mpsc::sync_channel(CONNECTION_QUEUE_CAPACITY);
         let connection_receiver = Arc::new(Mutex::new(connection_receiver));
-        let (incoming_sender, incoming) = mpsc::sync_channel(INCOMING_QUEUE_CAPACITY);
 
         let mut worker_threads = Vec::with_capacity(WORKER_COUNT);
         for index in 0..WORKER_COUNT {
             let context = ServerContext {
                 issuer: Arc::clone(&issuer),
                 directory: Arc::clone(&directory),
-                broker: Arc::clone(&broker),
-                incoming: incoming_sender.clone(),
+                messages: Arc::clone(&messages),
             };
             let receiver = Arc::clone(&connection_receiver);
             let worker_shutdown = Arc::clone(&shutdown);
@@ -136,8 +137,6 @@ impl IpcService {
                     })?,
             );
         }
-        drop(incoming_sender);
-
         let accept_shutdown = Arc::clone(&shutdown);
         let accept_thread = thread::Builder::new()
             .name("openpodium-ipc-accept".to_owned())
@@ -151,7 +150,8 @@ impl IpcService {
             endpoint,
             issuer,
             directory,
-            incoming,
+            messages,
+            leased_messages: Mutex::new(BTreeSet::new()),
             shutdown,
             accept_thread: Some(accept_thread),
             worker_threads,
@@ -189,7 +189,32 @@ impl IpcService {
     }
 
     pub fn try_recv(&self) -> Option<AcceptedMessage> {
-        self.incoming.try_recv().ok()
+        self.next_message().ok().flatten()
+    }
+
+    pub fn next_message(&self) -> Result<Option<AcceptedMessage>, ServiceError> {
+        let messages = mutex_lock(&self.messages);
+        let mut leased = mutex_lock(&self.leased_messages);
+        let Some(message) = messages.next_pending(&leased)? else {
+            return Ok(None);
+        };
+        leased.insert(message_key(&message));
+        Ok(Some(message))
+    }
+
+    pub fn mark_processed(&self, message: &AcceptedMessage) -> Result<bool, ServiceError> {
+        let message_id = message
+            .command
+            .message_id()
+            .expect("accepted messages always have an ID");
+        let processed =
+            mutex_lock(&self.messages).mark_processed(message.workspace_id, message_id)?;
+        mutex_lock(&self.leased_messages).remove(&message_key(message));
+        Ok(processed)
+    }
+
+    pub fn release(&self, message: &AcceptedMessage) {
+        mutex_lock(&self.leased_messages).remove(&message_key(message));
     }
 }
 
@@ -210,22 +235,10 @@ struct Directory {
     workspaces: BTreeMap<u64, BTreeMap<u64, AgentRegistration>>,
 }
 
-#[derive(Default)]
-struct Broker {
-    messages: BTreeMap<(u64, MessageId), PublishedMessage>,
-}
-
-struct PublishedMessage {
-    sender_agent_id: u64,
-    recipient_agent_id: u64,
-    command: ProtocolCommand,
-}
-
 struct ServerContext {
     issuer: Arc<CapabilityIssuer>,
     directory: Arc<RwLock<Directory>>,
-    broker: Arc<Mutex<Broker>>,
-    incoming: SyncSender<AcceptedMessage>,
+    messages: Arc<Mutex<MessageStore>>,
 }
 
 fn accept_loop(
@@ -353,36 +366,50 @@ fn process_request(request: ProtocolRequest, context: &ServerContext) -> Protoco
             format!("unsupported protocol; expected {PROTOCOL_NAME:?}"),
         );
     }
-    if !request
+    let Some(version) = request
         .supported_versions
         .iter()
-        .any(|version| SUPPORTED_VERSIONS.contains(version))
-    {
+        .copied()
+        .find(|version| SUPPORTED_VERSIONS.contains(version))
+    else {
         return incompatible_response(
             Some(request_id),
             "client protocol versions are incompatible; upgrade OpenPodium or its CLI".to_owned(),
         );
-    }
+    };
     if !context.issuer.authenticates(&request.credentials)
         || !authenticated_agent_exists(&context.directory, &request.credentials)
     {
         return ProtocolResponse::failure(
-            Some(PROTOCOL_VERSION),
+            Some(version),
             Some(request_id),
             ProtocolError::new(ErrorCode::Unauthorized, "IPC authentication failed"),
         );
     }
+    if request.command.minimum_version() > version {
+        return ProtocolResponse::failure(
+            Some(version),
+            Some(request_id),
+            ProtocolError::incompatible(
+                format!(
+                    "command requires protocol version {}; selected version is {version}",
+                    request.command.minimum_version()
+                ),
+                SUPPORTED_VERSIONS.to_vec(),
+            ),
+        );
+    }
     if let Err(error) = request.command.validate() {
         return ProtocolResponse::failure(
-            Some(PROTOCOL_VERSION),
+            Some(version),
             Some(request_id),
             ProtocolError::new(ErrorCode::InvalidRequest, error.to_string()),
         );
     }
 
     match execute_command(&request.credentials, request.command, context) {
-        Ok(result) => ProtocolResponse::success(request_id, result),
-        Err(error) => ProtocolResponse::failure(Some(PROTOCOL_VERSION), Some(request_id), error),
+        Ok(result) => ProtocolResponse::success(version, request_id, result),
+        Err(error) => ProtocolResponse::failure(Some(version), Some(request_id), error),
     }
 }
 
@@ -414,9 +441,11 @@ fn execute_command(
         .message_id()
         .expect("non-list commands have message IDs")
         .clone();
-    let key = (credentials.workspace_id, message_id.clone());
-    let mut broker = mutex_lock(&context.broker);
-    if let Some(published) = broker.messages.get(&key) {
+    let mut messages = mutex_lock(&context.messages);
+    if let Some(published) = messages
+        .message(credentials.workspace_id, &message_id)
+        .map_err(store_protocol_error)?
+    {
         if published.sender_agent_id == credentials.agent_id && published.command == command {
             return Ok(ProtocolResult::Accepted {
                 message_id,
@@ -428,14 +457,8 @@ fn execute_command(
             "message ID was already used with a different sender or payload",
         ));
     }
-    if broker.messages.len() >= MESSAGE_CAPACITY {
-        return Err(ProtocolError::new(
-            ErrorCode::ServiceUnavailable,
-            "the IPC message capacity is exhausted; restart OpenPodium or retry after orchestration drains messages",
-        ));
-    }
 
-    let recipient_agent_id = route_message(credentials, &command, &broker)?;
+    let recipient_agent_id = route_message(credentials, &command, &messages)?;
     if recipient_agent_id == credentials.agent_id {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
@@ -452,6 +475,13 @@ fn execute_command(
             "recipient agent is not visible in the authenticated workspace",
         ));
     }
+    validate_capabilities(
+        &context.directory,
+        credentials.workspace_id,
+        credentials.agent_id,
+        recipient_agent_id,
+        &command,
+    )?;
 
     let accepted = AcceptedMessage {
         workspace_id: credentials.workspace_id,
@@ -459,45 +489,131 @@ fn execute_command(
         recipient_agent_id,
         command: command.clone(),
     };
-    context.incoming.try_send(accepted).map_err(|error| {
-        let message = match error {
-            TrySendError::Full(_) => "the application message queue is full; retry shortly",
-            TrySendError::Disconnected(_) => "the application message receiver is unavailable",
-        };
-        ProtocolError::new(ErrorCode::ServiceUnavailable, message)
-    })?;
-    broker.messages.insert(
-        key,
-        PublishedMessage {
-            sender_agent_id: credentials.agent_id,
-            recipient_agent_id,
-            command,
-        },
-    );
+    match messages
+        .insert(&accepted, MESSAGE_CAPACITY)
+        .map_err(store_protocol_error)?
+    {
+        InsertResult::Inserted => {}
+        InsertResult::Duplicate => {
+            return Ok(ProtocolResult::Accepted {
+                message_id,
+                duplicate: true,
+            });
+        }
+        InsertResult::Conflict => {
+            return Err(ProtocolError::new(
+                ErrorCode::IdempotencyConflict,
+                "message ID was already used with a different sender or payload",
+            ));
+        }
+        InsertResult::CapacityExhausted => {
+            return Err(ProtocolError::new(
+                ErrorCode::ServiceUnavailable,
+                "the durable IPC message capacity is exhausted",
+            ));
+        }
+    }
     Ok(ProtocolResult::Accepted {
         message_id,
         duplicate: false,
     })
 }
 
+fn validate_capabilities(
+    directory: &RwLock<Directory>,
+    workspace_id: u64,
+    sender_agent_id: u64,
+    recipient_agent_id: u64,
+    command: &ProtocolCommand,
+) -> Result<(), ProtocolError> {
+    let directory = read_lock(directory);
+    let agents = directory
+        .workspaces
+        .get(&workspace_id)
+        .expect("authenticated workspaces remain registered during a request");
+    let sender = agents
+        .get(&sender_agent_id)
+        .expect("authenticated agents remain registered during a request");
+    let recipient = agents
+        .get(&recipient_agent_id)
+        .expect("visible recipients remain registered during a request");
+    let (supported, message) = match command {
+        ProtocolCommand::SendTask { .. }
+        | ProtocolCommand::SendHandoff {
+            kind: super::HandoffKind::Task,
+            ..
+        } => (
+            recipient.capabilities.accepts_tasks,
+            "recipient agent does not accept task handoffs",
+        ),
+        ProtocolCommand::SendHandoff {
+            kind: super::HandoffKind::Question,
+            ..
+        } => (
+            recipient.capabilities.accepts_questions,
+            "recipient agent does not accept question handoffs",
+        ),
+        ProtocolCommand::ReportProgress { .. } | ProtocolCommand::ReportHandoffProgress { .. } => (
+            sender.capabilities.reports_progress,
+            "sending agent does not support progress updates",
+        ),
+        ProtocolCommand::Respond { .. } | ProtocolCommand::RespondToHandoff { .. } => (
+            sender.capabilities.responds,
+            "sending agent does not support responses",
+        ),
+        ProtocolCommand::CancelHandoff { .. } => (
+            recipient.capabilities.supports_cancellation,
+            "recipient agent does not support cancellation",
+        ),
+        ProtocolCommand::ListAgents => unreachable!("list commands are handled before routing"),
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(ProtocolError::new(ErrorCode::InvalidRequest, message))
+    }
+}
+
 fn route_message(
     credentials: &Credentials,
     command: &ProtocolCommand,
-    broker: &Broker,
+    messages: &MessageStore,
 ) -> Result<u64, ProtocolError> {
     match command {
         ProtocolCommand::SendTask {
             recipient_agent_id, ..
         } => Ok(*recipient_agent_id),
+        ProtocolCommand::SendHandoff {
+            recipient_agent_id,
+            parent_message_id,
+            ..
+        } => {
+            if let Some(parent_message_id) = parent_message_id {
+                let parent =
+                    handoff_message(messages, credentials.workspace_id, parent_message_id)?
+                        .filter(|parent| {
+                            parent.sender_agent_id == credentials.agent_id
+                                || parent.recipient_agent_id == credentials.agent_id
+                        })
+                        .ok_or_else(|| {
+                            ProtocolError::new(
+                                ErrorCode::InvalidRequest,
+                                "parent message does not identify a handoff involving this agent",
+                            )
+                        })?;
+                let _ = parent;
+            }
+            Ok(*recipient_agent_id)
+        }
         ProtocolCommand::ReportProgress {
             task_message_id, ..
         }
         | ProtocolCommand::Respond {
             task_message_id, ..
         } => {
-            let task = broker
-                .messages
-                .get(&(credentials.workspace_id, task_message_id.clone()))
+            let task = messages
+                .message(credentials.workspace_id, task_message_id)
+                .map_err(store_protocol_error)?
                 .filter(|message| {
                     message.recipient_agent_id == credentials.agent_id
                         && matches!(message.command, ProtocolCommand::SendTask { .. })
@@ -510,8 +626,71 @@ fn route_message(
                 })?;
             Ok(task.sender_agent_id)
         }
+        ProtocolCommand::ReportHandoffProgress {
+            handoff_message_id, ..
+        }
+        | ProtocolCommand::RespondToHandoff {
+            handoff_message_id, ..
+        } => {
+            let handoff = handoff_message(messages, credentials.workspace_id, handoff_message_id)?
+                .filter(|message| message.recipient_agent_id == credentials.agent_id)
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ErrorCode::InvalidRequest,
+                        "handoff message does not identify work assigned to this agent",
+                    )
+                })?;
+            Ok(handoff.sender_agent_id)
+        }
+        ProtocolCommand::CancelHandoff {
+            handoff_message_id, ..
+        } => {
+            let handoff = handoff_message(messages, credentials.workspace_id, handoff_message_id)?
+                .filter(|message| message.sender_agent_id == credentials.agent_id)
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ErrorCode::InvalidRequest,
+                        "only the originating agent can cancel a handoff",
+                    )
+                })?;
+            Ok(handoff.recipient_agent_id)
+        }
         ProtocolCommand::ListAgents => unreachable!("list commands are handled before routing"),
     }
+}
+
+fn handoff_message(
+    messages: &MessageStore,
+    workspace_id: u64,
+    message_id: &MessageId,
+) -> Result<Option<StoredMessage>, ProtocolError> {
+    Ok(messages
+        .message(workspace_id, message_id)
+        .map_err(store_protocol_error)?
+        .filter(|message| {
+            matches!(
+                message.command,
+                ProtocolCommand::SendTask { .. } | ProtocolCommand::SendHandoff { .. }
+            )
+        }))
+}
+
+fn store_protocol_error(error: StoreError) -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::ServiceUnavailable,
+        format!("durable IPC state is unavailable: {error}"),
+    )
+}
+
+fn message_key(message: &AcceptedMessage) -> (u64, MessageId) {
+    (
+        message.workspace_id,
+        message
+            .command
+            .message_id()
+            .expect("accepted messages always have an ID")
+            .clone(),
+    )
 }
 
 fn authenticated_agent_exists(directory: &RwLock<Directory>, credentials: &Credentials) -> bool {
@@ -562,6 +741,7 @@ pub enum ServiceError {
         source: io::Error,
     },
     Authentication(AuthenticationError),
+    Store(String),
     Bind(io::Error),
     Configure(io::Error),
     Spawn {
@@ -579,6 +759,7 @@ impl Display for ServiceError {
                 path.display()
             ),
             Self::Authentication(source) => source.fmt(formatter),
+            Self::Store(message) => formatter.write_str(message),
             Self::Bind(source) => write!(formatter, "failed to bind local IPC service: {source}"),
             Self::Configure(source) => {
                 write!(formatter, "failed to configure local IPC service: {source}")
@@ -598,6 +779,7 @@ impl Error for ServiceError {
             | Self::Configure(source)
             | Self::Spawn { source, .. } => Some(source),
             Self::Authentication(source) => Some(source),
+            Self::Store(_) => None,
         }
     }
 }
@@ -605,6 +787,12 @@ impl Error for ServiceError {
 impl From<AuthenticationError> for ServiceError {
     fn from(value: AuthenticationError) -> Self {
         Self::Authentication(value)
+    }
+}
+
+impl From<StoreError> for ServiceError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value.to_string())
     }
 }
 

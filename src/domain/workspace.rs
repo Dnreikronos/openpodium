@@ -4,9 +4,9 @@ use super::{
     Agent, AgentId, CanvasLayout, ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft,
     ChatMessage, ChatThread, ChatThreadId, CommandPreset, CommandPresetId, Connection,
     ConnectionId, ConnectionKind, Content, DomainCommand, DomainError, DomainEvent, EntityRef,
-    EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffPayload, Name, Node,
-    NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId, Task, TaskId, TaskState,
-    TimelineEvent, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
+    EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffPayload,
+    MAX_HANDOFF_DEPTH, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId, Task,
+    TaskId, TaskState, TimelineEvent, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,6 +349,12 @@ impl Workspace {
                 }
                 DomainCommand::AddTask(task) => DomainEvent::TaskAdded(task),
                 DomainCommand::AddHandoff(handoff) => DomainEvent::HandoffAdded(handoff),
+                DomainCommand::AddTaskHandoff { task, handoff } => {
+                    DomainEvent::TaskHandoffAdded { task, handoff }
+                }
+                DomainCommand::UpdateHandoff { before, after } => {
+                    DomainEvent::HandoffChanged { before, after }
+                }
                 DomainCommand::AddNode(node) => DomainEvent::NodeAdded(node),
                 DomainCommand::AddAgentNode { agent, node } => {
                     DomainEvent::AgentNodeAdded { agent, node }
@@ -675,59 +681,37 @@ impl Workspace {
                     .push_message(message.clone());
             }
             DomainEvent::TaskAdded(task) => {
-                self.ensure_absent(EntityRef::Task(task.id()))?;
-                if let Some(assignee) = task.assignee() {
-                    self.ensure_reference(
-                        EntityRef::Task(task.id()),
-                        "assignee",
-                        EntityRef::Agent(assignee),
-                    )?;
-                }
-                if let Some(retry_of) = task.retry_of() {
-                    let previous =
-                        self.tasks
-                            .get(&retry_of)
-                            .ok_or(DomainError::InvalidReference {
-                                entity: EntityRef::Task(task.id()),
-                                field: "retry_of",
-                                target: EntityRef::Task(retry_of),
-                            })?;
-                    if !matches!(previous.state(), TaskState::Failed | TaskState::Cancelled) {
-                        return Err(DomainError::InvalidRetrySource {
-                            task_id: task.id(),
-                            retry_of,
-                            state: previous.state(),
-                        });
-                    }
-                }
+                self.validate_new_task(task)?;
                 self.tasks.insert(task.id(), task.clone());
             }
             DomainEvent::HandoffAdded(handoff) => {
-                self.ensure_absent(EntityRef::Handoff(handoff.id()))?;
-                if handoff.source() == handoff.recipient() {
-                    return Err(DomainError::SameHandoffParticipant {
+                self.validate_new_handoff(handoff, None)?;
+                self.handoffs.insert(handoff.id(), handoff.clone());
+            }
+            DomainEvent::TaskHandoffAdded { task, handoff } => {
+                self.validate_new_task(task)?;
+                if handoff.payload() != &HandoffPayload::Task(task.id())
+                    || task.assignee() != Some(handoff.recipient())
+                {
+                    return Err(DomainError::TaskHandoffMismatch {
                         handoff_id: handoff.id(),
-                        agent_id: handoff.source(),
+                        task_id: task.id(),
                     });
                 }
-                self.ensure_reference(
-                    EntityRef::Handoff(handoff.id()),
-                    "source",
-                    EntityRef::Agent(handoff.source()),
-                )?;
-                self.ensure_reference(
-                    EntityRef::Handoff(handoff.id()),
-                    "recipient",
-                    EntityRef::Agent(handoff.recipient()),
-                )?;
-                if let HandoffPayload::Task(task_id) = handoff.payload() {
-                    self.ensure_reference(
-                        EntityRef::Handoff(handoff.id()),
-                        "payload",
-                        EntityRef::Task(*task_id),
-                    )?;
-                }
+                self.validate_new_handoff(handoff, Some(task))?;
+                self.tasks.insert(task.id(), task.clone());
                 self.handoffs.insert(handoff.id(), handoff.clone());
+            }
+            DomainEvent::HandoffChanged { before, after } => {
+                let current = self
+                    .handoffs
+                    .get(&before.id())
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Handoff(before.id())))?;
+                if current != before {
+                    return Err(DomainError::HandoffConflict(before.id()));
+                }
+                after.validate_successor(before)?;
+                self.handoffs.insert(after.id(), after.clone());
             }
             DomainEvent::NodeAdded(node) => {
                 self.ensure_absent(EntityRef::Node(node.id()))?;
@@ -861,6 +845,98 @@ impl Workspace {
         } else {
             Ok(())
         }
+    }
+
+    fn validate_new_task(&self, task: &Task) -> Result<(), DomainError> {
+        self.ensure_absent(EntityRef::Task(task.id()))?;
+        if let Some(assignee) = task.assignee() {
+            self.ensure_reference(
+                EntityRef::Task(task.id()),
+                "assignee",
+                EntityRef::Agent(assignee),
+            )?;
+        }
+        if let Some(retry_of) = task.retry_of() {
+            let previous = self
+                .tasks
+                .get(&retry_of)
+                .ok_or(DomainError::InvalidReference {
+                    entity: EntityRef::Task(task.id()),
+                    field: "retry_of",
+                    target: EntityRef::Task(retry_of),
+                })?;
+            if !matches!(previous.state(), TaskState::Failed | TaskState::Cancelled) {
+                return Err(DomainError::InvalidRetrySource {
+                    task_id: task.id(),
+                    retry_of,
+                    state: previous.state(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_new_handoff(
+        &self,
+        handoff: &Handoff,
+        pending_task: Option<&Task>,
+    ) -> Result<(), DomainError> {
+        self.ensure_absent(EntityRef::Handoff(handoff.id()))?;
+        if handoff.source() == handoff.recipient() {
+            return Err(DomainError::SameHandoffParticipant {
+                handoff_id: handoff.id(),
+                agent_id: handoff.source(),
+            });
+        }
+        self.ensure_reference(
+            EntityRef::Handoff(handoff.id()),
+            "source",
+            EntityRef::Agent(handoff.source()),
+        )?;
+        self.ensure_reference(
+            EntityRef::Handoff(handoff.id()),
+            "recipient",
+            EntityRef::Agent(handoff.recipient()),
+        )?;
+        if let HandoffPayload::Task(task_id) = handoff.payload()
+            && pending_task.is_none_or(|task| task.id() != *task_id)
+        {
+            self.ensure_reference(
+                EntityRef::Handoff(handoff.id()),
+                "payload",
+                EntityRef::Task(*task_id),
+            )?;
+        }
+        if let Some(message_id) = handoff.message_id()
+            && self
+                .handoffs
+                .values()
+                .any(|existing| existing.message_id() == Some(message_id))
+        {
+            return Err(DomainError::DuplicateHandoffMessageId);
+        }
+
+        let mut depth = 1_usize;
+        let mut parent = handoff.parent();
+        while let Some(parent_id) = parent {
+            let parent_handoff =
+                self.handoffs
+                    .get(&parent_id)
+                    .ok_or(DomainError::InvalidReference {
+                        entity: EntityRef::Handoff(handoff.id()),
+                        field: "parent",
+                        target: EntityRef::Handoff(parent_id),
+                    })?;
+            depth += 1;
+            if depth > MAX_HANDOFF_DEPTH {
+                return Err(DomainError::HandoffChainTooDeep {
+                    handoff_id: handoff.id(),
+                    max_depth: MAX_HANDOFF_DEPTH,
+                });
+            }
+            parent = parent_handoff.parent();
+        }
+        Ok(())
     }
 
     fn ensure_reference(
