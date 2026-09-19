@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
 use super::{
-    Agent, AgentId, CanvasLayout, CommandPreset, CommandPresetId, Connection, ConnectionId,
-    ConnectionKind, Content, DomainCommand, DomainError, DomainEvent, EntityRef,
+    Agent, AgentId, CanvasLayout, ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft,
+    ChatMessage, ChatThread, ChatThreadId, CommandPreset, CommandPresetId, Connection,
+    ConnectionId, ConnectionKind, Content, DomainCommand, DomainError, DomainEvent, EntityRef,
     EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffPayload, Name, Node,
-    NodeGroup, NodeGroupId, NodeId, Role, RoleId, Task, TaskId, TaskState, TimelineEvent,
-    WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
+    NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId, Task, TaskId, TaskState,
+    TimelineEvent, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,8 @@ pub struct Workspace {
     command_presets: BTreeMap<CommandPresetId, CommandPreset>,
     roles: BTreeMap<RoleId, Role>,
     agents: BTreeMap<AgentId, Agent>,
+    chat_threads: BTreeMap<ChatThreadId, ChatThread>,
+    chat_attachments: BTreeMap<ChatAttachmentId, ChatAttachment>,
     tasks: BTreeMap<TaskId, Task>,
     handoffs: BTreeMap<HandoffId, Handoff>,
     nodes: BTreeMap<NodeId, Node>,
@@ -72,6 +75,8 @@ impl Workspace {
             command_presets: BTreeMap::new(),
             roles: BTreeMap::new(),
             agents: BTreeMap::new(),
+            chat_threads: BTreeMap::new(),
+            chat_attachments: BTreeMap::new(),
             tasks: BTreeMap::new(),
             handoffs: BTreeMap::new(),
             nodes: BTreeMap::new(),
@@ -120,6 +125,14 @@ impl Workspace {
         self.agents.values()
     }
 
+    pub fn chat_threads(&self) -> impl Iterator<Item = &ChatThread> {
+        self.chat_threads.values()
+    }
+
+    pub fn chat_attachments(&self) -> impl Iterator<Item = &ChatAttachment> {
+        self.chat_attachments.values()
+    }
+
     pub(crate) fn tasks(&self) -> impl Iterator<Item = &Task> {
         self.tasks.values()
     }
@@ -154,6 +167,14 @@ impl Workspace {
 
     pub fn agent(&self, id: AgentId) -> Option<&Agent> {
         self.agents.get(&id)
+    }
+
+    pub fn chat_thread(&self, id: ChatThreadId) -> Option<&ChatThread> {
+        self.chat_threads.get(&id)
+    }
+
+    pub fn chat_attachment(&self, id: ChatAttachmentId) -> Option<&ChatAttachment> {
+        self.chat_attachments.get(&id)
     }
 
     pub fn task(&self, id: TaskId) -> Option<&Task> {
@@ -259,6 +280,73 @@ impl Workspace {
                     }
                 }
                 DomainCommand::AddAgent(agent) => DomainEvent::AgentAdded(agent),
+                DomainCommand::AddChatThread(thread) => DomainEvent::ChatThreadAdded(thread),
+                DomainCommand::UpdateChatThread {
+                    thread_id,
+                    name,
+                    color,
+                } => {
+                    let current =
+                        self.chat_threads
+                            .get(&thread_id)
+                            .ok_or(DomainError::EntityNotFound(EntityRef::ChatThread(
+                                thread_id,
+                            )))?;
+                    if current.name() == &name && current.color() == &color {
+                        return Err(DomainError::UnchangedChatThread);
+                    }
+                    DomainEvent::ChatThreadChanged {
+                        thread_id,
+                        from_name: current.name().clone(),
+                        to_name: name,
+                        from_color: current.color().clone(),
+                        to_color: color,
+                    }
+                }
+                DomainCommand::AddChatAttachment(attachment) => {
+                    DomainEvent::ChatAttachmentAdded(attachment)
+                }
+                DomainCommand::UpdateChatDraft { thread_id, draft } => {
+                    let current =
+                        self.chat_threads
+                            .get(&thread_id)
+                            .ok_or(DomainError::EntityNotFound(EntityRef::ChatThread(
+                                thread_id,
+                            )))?;
+                    if current.draft() == &draft {
+                        return Err(DomainError::UnchangedChatDraft);
+                    }
+                    DomainEvent::ChatDraftChanged {
+                        thread_id,
+                        from: current.draft().clone(),
+                        to: draft,
+                    }
+                }
+                DomainCommand::SubmitChatDraft {
+                    thread_id,
+                    message_id,
+                    sent_at,
+                } => {
+                    let thread =
+                        self.chat_threads
+                            .get(&thread_id)
+                            .ok_or(DomainError::EntityNotFound(EntityRef::ChatThread(
+                                thread_id,
+                            )))?;
+                    DomainEvent::ChatDraftSubmitted {
+                        thread_id,
+                        from: thread.draft().clone(),
+                        message: ChatMessage::from_draft(
+                            message_id,
+                            thread_id,
+                            thread.draft(),
+                            sent_at,
+                        )?,
+                    }
+                }
+                DomainCommand::AppendAgentChatMessage(message) => {
+                    DomainEvent::AgentChatMessageAppended(message)
+                }
                 DomainCommand::AddTask(task) => DomainEvent::TaskAdded(task),
                 DomainCommand::AddHandoff(handoff) => DomainEvent::HandoffAdded(handoff),
                 DomainCommand::AddNode(node) => DomainEvent::NodeAdded(node),
@@ -469,6 +557,122 @@ impl Workspace {
                     )?;
                 }
                 self.agents.insert(agent.id(), agent.clone());
+            }
+            DomainEvent::ChatThreadAdded(thread) => {
+                self.ensure_absent(EntityRef::ChatThread(thread.id()))?;
+                self.ensure_reference(
+                    EntityRef::ChatThread(thread.id()),
+                    "agent_id",
+                    EntityRef::Agent(thread.agent_id()),
+                )?;
+                if !thread.draft().is_empty() || !thread.messages().is_empty() {
+                    return Err(DomainError::ChatThreadConflict(thread.id()));
+                }
+                self.chat_threads.insert(thread.id(), thread.clone());
+            }
+            DomainEvent::ChatThreadChanged {
+                thread_id,
+                from_name,
+                to_name,
+                from_color,
+                to_color,
+            } => {
+                let thread =
+                    self.chat_threads
+                        .get(thread_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::ChatThread(
+                            *thread_id,
+                        )))?;
+                if thread.name() != from_name || thread.color() != from_color {
+                    return Err(DomainError::ChatThreadConflict(*thread_id));
+                }
+                self.chat_threads
+                    .get_mut(thread_id)
+                    .expect("thread existence was checked before mutation")
+                    .set_appearance(to_name.clone(), to_color.clone());
+            }
+            DomainEvent::ChatAttachmentAdded(attachment) => {
+                self.ensure_absent(EntityRef::ChatAttachment(attachment.id()))?;
+                self.ensure_reference(
+                    EntityRef::ChatAttachment(attachment.id()),
+                    "thread_id",
+                    EntityRef::ChatThread(attachment.thread_id()),
+                )?;
+                self.chat_attachments
+                    .insert(attachment.id(), attachment.clone());
+            }
+            DomainEvent::ChatDraftChanged {
+                thread_id,
+                from,
+                to,
+            } => {
+                let thread =
+                    self.chat_threads
+                        .get(thread_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::ChatThread(
+                            *thread_id,
+                        )))?;
+                if thread.draft() != from {
+                    return Err(DomainError::ChatDraftConflict(*thread_id));
+                }
+                self.validate_chat_references(*thread_id, to.attachments(), to.mentions())?;
+                self.chat_threads
+                    .get_mut(thread_id)
+                    .expect("thread existence was checked before mutation")
+                    .set_draft(to.clone());
+            }
+            DomainEvent::ChatDraftSubmitted {
+                thread_id,
+                from,
+                message,
+            } => {
+                let thread =
+                    self.chat_threads
+                        .get(thread_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::ChatThread(
+                            *thread_id,
+                        )))?;
+                if thread.draft() != from {
+                    return Err(DomainError::ChatDraftConflict(*thread_id));
+                }
+                let expected =
+                    ChatMessage::from_draft(message.id(), *thread_id, from, message.sent_at())?;
+                if &expected != message {
+                    return Err(DomainError::ChatMessageConflict(message.id()));
+                }
+                self.ensure_absent(EntityRef::ChatMessage(message.id()))?;
+                self.validate_chat_references(
+                    *thread_id,
+                    message.attachments(),
+                    message.mentions(),
+                )?;
+                let thread = self
+                    .chat_threads
+                    .get_mut(thread_id)
+                    .expect("thread existence was checked before mutation");
+                thread.push_message(message.clone());
+                thread.set_draft(ChatDraft::default());
+            }
+            DomainEvent::AgentChatMessageAppended(message) => {
+                let thread = self.chat_threads.get(&message.thread_id()).ok_or(
+                    DomainError::EntityNotFound(EntityRef::ChatThread(message.thread_id())),
+                )?;
+                if message.author() != ChatAuthor::Agent(thread.agent_id()) {
+                    return Err(DomainError::InvalidChatAuthor {
+                        message_id: message.id(),
+                        expected: thread.agent_id(),
+                    });
+                }
+                self.ensure_absent(EntityRef::ChatMessage(message.id()))?;
+                self.validate_chat_references(
+                    message.thread_id(),
+                    message.attachments(),
+                    message.mentions(),
+                )?;
+                self.chat_threads
+                    .get_mut(&message.thread_id())
+                    .expect("thread existence was checked before mutation")
+                    .push_message(message.clone());
             }
             DomainEvent::TaskAdded(task) => {
                 self.ensure_absent(EntityRef::Task(task.id()))?;
@@ -683,6 +887,12 @@ impl Workspace {
             EntityRef::CommandPreset(id) => self.command_presets.contains_key(&id),
             EntityRef::Role(id) => self.roles.contains_key(&id),
             EntityRef::Agent(id) => self.agents.contains_key(&id),
+            EntityRef::ChatThread(id) => self.chat_threads.contains_key(&id),
+            EntityRef::ChatMessage(id) => self
+                .chat_threads
+                .values()
+                .any(|thread| thread.messages().iter().any(|message| message.id() == id)),
+            EntityRef::ChatAttachment(id) => self.chat_attachments.contains_key(&id),
             EntityRef::Task(id) => self.tasks.contains_key(&id),
             EntityRef::Handoff(id) => self.handoffs.contains_key(&id),
             EntityRef::Node(id) => self.nodes.contains_key(&id),
@@ -690,6 +900,77 @@ impl Workspace {
             EntityRef::Connection(id) => self.connections.contains_key(&id),
             EntityRef::TimelineEvent(_) => false,
         }
+    }
+
+    fn validate_chat_references(
+        &self,
+        thread_id: ChatThreadId,
+        attachments: &[ChatAttachmentId],
+        mentions: &[NodeTarget],
+    ) -> Result<(), DomainError> {
+        let thread = self
+            .chat_threads
+            .get(&thread_id)
+            .ok_or(DomainError::EntityNotFound(EntityRef::ChatThread(
+                thread_id,
+            )))?;
+        let mut total_bytes = 0_u64;
+        for attachment_id in attachments {
+            let attachment =
+                self.chat_attachments
+                    .get(attachment_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::ChatAttachment(
+                        *attachment_id,
+                    )))?;
+            if attachment.thread_id() != thread_id {
+                return Err(DomainError::ChatAttachmentWrongThread {
+                    attachment_id: *attachment_id,
+                    expected: thread_id,
+                    actual: attachment.thread_id(),
+                });
+            }
+            total_bytes = total_bytes.saturating_add(attachment.byte_len());
+        }
+        if total_bytes > ChatDraft::MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(DomainError::ChatAttachmentTotalTooLarge {
+                thread_id,
+                max_bytes: ChatDraft::MAX_TOTAL_ATTACHMENT_BYTES,
+                actual_bytes: total_bytes,
+            });
+        }
+
+        let owner_nodes: Vec<NodeId> = self
+            .nodes
+            .values()
+            .filter(|node| node.target() == NodeTarget::Agent(thread.agent_id()))
+            .map(Node::id)
+            .collect();
+        for mention in mentions {
+            self.ensure_reference(
+                EntityRef::ChatThread(thread_id),
+                "mention",
+                (*mention).into(),
+            )?;
+            let target_nodes: Vec<NodeId> = self
+                .nodes
+                .values()
+                .filter(|node| node.target() == *mention)
+                .map(Node::id)
+                .collect();
+            let connected = self.connections.values().any(|connection| {
+                (owner_nodes.contains(&connection.source())
+                    && target_nodes.contains(&connection.target()))
+                    || (owner_nodes.contains(&connection.target())
+                        && target_nodes.contains(&connection.source()))
+            });
+            if !connected {
+                return Err(DomainError::MentionNotConnected {
+                    thread_id,
+                    target: *mention,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn validate_canvas(&self, layout: &CanvasLayout) -> Result<(), DomainError> {

@@ -5,12 +5,13 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use crate::domain::{
-    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize, CommandPreset,
-    CommandPresetId, Connection as DomainConnection, ConnectionId, ConnectionKind, Content,
-    DomainCommand, DomainEvent, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Handoff,
-    HandoffId, HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role,
-    RoleColor, RoleIcon, RoleId, SshEnvironment, Task, TaskId, TaskState, Timestamp, Workspace,
-    WorkspaceId,
+    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize,
+    ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft, ChatMessage, ChatMessageId,
+    ChatThread, ChatThreadId, CommandPreset, CommandPresetId, Connection as DomainConnection,
+    ConnectionId, ConnectionKind, Content, DomainCommand, DomainEvent, EnvironmentKind,
+    EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffPayload, Name, Node,
+    NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleColor, RoleIcon, RoleId, SshEnvironment,
+    Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceId,
 };
 
 use super::codec::{decode_event, decode_workspace};
@@ -381,6 +382,153 @@ fn command_presets_role_appearance_and_assignments_survive_restart() {
     assert_eq!(
         recovered.agent(AgentId::new(1)).unwrap().program(),
         AgentProgram::Custom(CommandPresetId::new(1))
+    );
+}
+
+#[test]
+fn chat_messages_attachments_and_unsent_drafts_survive_restart() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    let thread_id = ChatThreadId::new(1);
+    let attachment_id = ChatAttachmentId::new(1);
+    let expected = {
+        let mut journal = Journal::open(&path).unwrap();
+        let mut workspace = test_workspace();
+        for (id, agent_name) in [(1, "Builder"), (2, "Reviewer")] {
+            persist(
+                &mut journal,
+                &mut workspace,
+                DomainCommand::AddAgent(Agent::new(AgentId::new(id), name(agent_name), None)),
+                id,
+            );
+        }
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::ReplaceCanvas {
+                before: CanvasLayout::default(),
+                after: CanvasLayout::new(
+                    vec![
+                        Node::new(
+                            NodeId::new(1),
+                            NodeTarget::Agent(AgentId::new(1)),
+                            CanvasPoint::new(0.0, 0.0).unwrap(),
+                            CanvasSize::new(400.0, 300.0).unwrap(),
+                        ),
+                        Node::new(
+                            NodeId::new(2),
+                            NodeTarget::Agent(AgentId::new(2)),
+                            CanvasPoint::new(500.0, 0.0).unwrap(),
+                            CanvasSize::new(400.0, 300.0).unwrap(),
+                        ),
+                    ],
+                    Vec::new(),
+                    vec![DomainConnection::new(
+                        ConnectionId::new(1),
+                        NodeId::new(1),
+                        NodeId::new(2),
+                        ConnectionKind::Coordination,
+                    )],
+                ),
+            },
+            3,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddChatThread(ChatThread::with_color(
+                thread_id,
+                AgentId::new(1),
+                name("Implementation"),
+                ThreadColor::new("#0F766E").unwrap(),
+            )),
+            4,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddChatAttachment(
+                ChatAttachment::new(
+                    attachment_id,
+                    thread_id,
+                    "1-notes.md",
+                    "notes.md",
+                    "text/markdown",
+                    512,
+                )
+                .unwrap(),
+            ),
+            5,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::UpdateChatDraft {
+                thread_id,
+                draft: ChatDraft::new(
+                    "Please review **notes.md**",
+                    vec![attachment_id],
+                    vec![NodeTarget::Agent(AgentId::new(2))],
+                )
+                .unwrap(),
+            },
+            6,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::SubmitChatDraft {
+                thread_id,
+                message_id: ChatMessageId::new(1),
+                sent_at: timestamp(7),
+            },
+            7,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AppendAgentChatMessage(
+                ChatMessage::new(
+                    ChatMessageId::new(2),
+                    thread_id,
+                    ChatAuthor::Agent(AgentId::new(1)),
+                    content("Reviewed the table and code block."),
+                    Vec::new(),
+                    Vec::new(),
+                    timestamp(8),
+                )
+                .unwrap(),
+            ),
+            8,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::UpdateChatDraft {
+                thread_id,
+                draft: ChatDraft::new("Unsent follow-up", Vec::new(), Vec::new()).unwrap(),
+            },
+            9,
+        );
+        workspace
+    };
+
+    let recovered = Journal::open(&path)
+        .unwrap()
+        .recover(WorkspaceId::new(7))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(recovered, expected);
+    let thread = recovered.chat_thread(thread_id).unwrap();
+    assert_eq!(thread.messages().len(), 2);
+    assert_eq!(thread.draft().text(), "Unsent follow-up");
+    assert_eq!(
+        recovered
+            .chat_attachment(attachment_id)
+            .unwrap()
+            .display_name(),
+        "notes.md"
     );
 }
 

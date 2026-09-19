@@ -2,10 +2,11 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use super::{
-    Agent, AgentId, AgentState, CanvasLayout, CommandPreset, CommandPresetId, ConnectionId,
-    EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, Node, NodeGroupId, NodeId,
-    NodeTarget, Role, RoleId, Task, TaskId, TaskState, TimelineEventId, Timestamp, WorkspaceId,
-    WorkspaceSettings,
+    Agent, AgentId, AgentState, CanvasLayout, ChatAttachment, ChatAttachmentId, ChatDraft,
+    ChatMessage, ChatMessageId, ChatThread, ChatThreadId, ChatValidationError, CommandPreset,
+    CommandPresetId, ConnectionId, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId,
+    Name, Node, NodeGroupId, NodeId, NodeTarget, Role, RoleId, Task, TaskId, TaskState,
+    ThreadColor, TimelineEventId, Timestamp, WorkspaceId, WorkspaceSettings,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +26,23 @@ pub enum DomainCommand {
         role_id: Option<RoleId>,
     },
     AddAgent(Agent),
+    AddChatThread(ChatThread),
+    UpdateChatThread {
+        thread_id: ChatThreadId,
+        name: Name,
+        color: ThreadColor,
+    },
+    AddChatAttachment(ChatAttachment),
+    UpdateChatDraft {
+        thread_id: ChatThreadId,
+        draft: ChatDraft,
+    },
+    SubmitChatDraft {
+        thread_id: ChatThreadId,
+        message_id: ChatMessageId,
+        sent_at: Timestamp,
+    },
+    AppendAgentChatMessage(ChatMessage),
     AddTask(Task),
     AddHandoff(Handoff),
     AddNode(Node),
@@ -76,6 +94,26 @@ pub enum DomainEvent {
         to: Option<RoleId>,
     },
     AgentAdded(Agent),
+    ChatThreadAdded(ChatThread),
+    ChatThreadChanged {
+        thread_id: ChatThreadId,
+        from_name: Name,
+        to_name: Name,
+        from_color: ThreadColor,
+        to_color: ThreadColor,
+    },
+    ChatAttachmentAdded(ChatAttachment),
+    ChatDraftChanged {
+        thread_id: ChatThreadId,
+        from: ChatDraft,
+        to: ChatDraft,
+    },
+    ChatDraftSubmitted {
+        thread_id: ChatThreadId,
+        from: ChatDraft,
+        message: ChatMessage,
+    },
+    AgentChatMessageAppended(ChatMessage),
     TaskAdded(Task),
     HandoffAdded(Handoff),
     NodeAdded(Node),
@@ -146,6 +184,9 @@ pub enum EntityRef {
     CommandPreset(CommandPresetId),
     Role(RoleId),
     Agent(AgentId),
+    ChatThread(ChatThreadId),
+    ChatMessage(ChatMessageId),
+    ChatAttachment(ChatAttachmentId),
     Task(TaskId),
     Handoff(HandoffId),
     Node(NodeId),
@@ -162,6 +203,9 @@ impl Display for EntityRef {
             Self::CommandPreset(id) => write!(formatter, "command preset {id}"),
             Self::Role(id) => write!(formatter, "role {id}"),
             Self::Agent(id) => write!(formatter, "agent {id}"),
+            Self::ChatThread(id) => write!(formatter, "chat thread {id}"),
+            Self::ChatMessage(id) => write!(formatter, "chat message {id}"),
+            Self::ChatAttachment(id) => write!(formatter, "chat attachment {id}"),
             Self::Task(id) => write!(formatter, "task {id}"),
             Self::Handoff(id) => write!(formatter, "handoff {id}"),
             Self::Node(id) => write!(formatter, "node {id}"),
@@ -205,6 +249,30 @@ pub enum DomainError {
         agent_id: AgentId,
     },
     UnchangedAgentRole,
+    UnchangedChatThread,
+    UnchangedChatDraft,
+    ChatThreadConflict(ChatThreadId),
+    ChatDraftConflict(ChatThreadId),
+    ChatMessageConflict(ChatMessageId),
+    ChatAttachmentWrongThread {
+        attachment_id: ChatAttachmentId,
+        expected: ChatThreadId,
+        actual: ChatThreadId,
+    },
+    ChatAttachmentTotalTooLarge {
+        thread_id: ChatThreadId,
+        max_bytes: u64,
+        actual_bytes: u64,
+    },
+    InvalidChatAuthor {
+        message_id: ChatMessageId,
+        expected: AgentId,
+    },
+    MentionNotConnected {
+        thread_id: ChatThreadId,
+        target: NodeTarget,
+    },
+    InvalidChat(ChatValidationError),
     AgentRoleConflict {
         agent_id: AgentId,
         expected: Option<RoleId>,
@@ -315,6 +383,48 @@ impl Display for DomainError {
                 )
             }
             Self::UnchangedAgentRole => formatter.write_str("agent role is unchanged"),
+            Self::UnchangedChatThread => formatter.write_str("chat thread is unchanged"),
+            Self::UnchangedChatDraft => formatter.write_str("chat draft is unchanged"),
+            Self::ChatThreadConflict(id) => {
+                write!(
+                    formatter,
+                    "chat thread {id} event does not match the current thread"
+                )
+            }
+            Self::ChatDraftConflict(id) => {
+                write!(formatter, "chat draft event does not match thread {id}")
+            }
+            Self::ChatMessageConflict(id) => {
+                write!(formatter, "chat message {id} does not match its draft")
+            }
+            Self::ChatAttachmentWrongThread {
+                attachment_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "chat attachment {attachment_id} belongs to thread {actual}, not thread {expected}"
+            ),
+            Self::ChatAttachmentTotalTooLarge {
+                thread_id,
+                max_bytes,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "chat draft for thread {thread_id} attaches {actual_bytes} bytes; the limit is {max_bytes} bytes"
+            ),
+            Self::InvalidChatAuthor {
+                message_id,
+                expected,
+            } => write!(
+                formatter,
+                "chat message {message_id} must be authored by agent {expected}"
+            ),
+            Self::MentionNotConnected { thread_id, target } => write!(
+                formatter,
+                "chat thread {thread_id} cannot mention unconnected target {target:?}"
+            ),
+            Self::InvalidChat(error) => error.fmt(formatter),
             Self::AgentRoleConflict {
                 agent_id,
                 expected,
@@ -399,3 +509,9 @@ impl Display for DomainError {
 }
 
 impl Error for DomainError {}
+
+impl From<ChatValidationError> for DomainError {
+    fn from(error: ChatValidationError) -> Self {
+        Self::InvalidChat(error)
+    }
+}
