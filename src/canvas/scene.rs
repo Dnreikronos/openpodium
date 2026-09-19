@@ -2,13 +2,20 @@ use std::collections::BTreeSet;
 
 use iced::theme::palette;
 use iced::widget::canvas::{self, Path, Stroke};
-use iced::{Color, Pixels, Point, Size, Theme};
+use iced::{Color, Font, Pixels, Point, Size, Theme, font};
 use openpodium::domain::{AgentProgram, ConnectionKind, Node, NodeGroup, NodeId};
+
+use crate::terminal::{self, BODY_PADDING, CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT};
 
 use super::{Camera, CanvasDocument, NodeKind, ViewportSize, WorldPoint, WorldRect};
 
 const BASE_GRID_STEP: f64 = 40.0;
 const MIN_GRID_PIXELS: f64 = 24.0;
+
+pub(super) struct TerminalOverlay<'a> {
+    pub(super) focused: Option<NodeId>,
+    pub(super) preedit: &'a str,
+}
 
 pub(super) fn draw(
     frame: &mut canvas::Frame,
@@ -16,6 +23,7 @@ pub(super) fn draw(
     viewport: ViewportSize,
     document: &CanvasDocument,
     selection: &[NodeId],
+    terminal_overlay: TerminalOverlay<'_>,
     theme: &Theme,
 ) {
     let palette = theme.extended_palette();
@@ -24,7 +32,15 @@ pub(super) fn draw(
     draw_grid(frame, camera, viewport, palette);
     draw_groups(frame, camera, viewport, document, palette);
     draw_connections(frame, camera, viewport, document, palette);
-    draw_nodes(frame, camera, viewport, document, selection, palette);
+    draw_nodes(
+        frame,
+        camera,
+        viewport,
+        document,
+        selection,
+        terminal_overlay,
+        palette,
+    );
 }
 
 fn draw_grid(
@@ -171,6 +187,7 @@ fn draw_nodes(
     viewport: ViewportSize,
     document: &CanvasDocument,
     selection: &[NodeId],
+    terminal_overlay: TerminalOverlay<'_>,
     palette: &palette::Extended,
 ) {
     let visible = camera.visible_world_rect(viewport);
@@ -213,7 +230,8 @@ fn draw_nodes(
                 })
                 .with_width(if is_selected { 3.0 } else { 1.5 }),
         );
-        let header_height = (48.0 * camera.zoom() as f32).clamp(28.0, 60.0);
+        let zoom = camera.zoom() as f32;
+        let header_height = (HEADER_HEIGHT * zoom).clamp(28.0, 60.0);
         frame.fill_rectangle(
             top_left,
             Size::new(size.width, header_height),
@@ -226,34 +244,32 @@ fn draw_nodes(
         );
 
         if camera.zoom() >= 0.4 {
-            let padding = (15.0 * camera.zoom() as f32).clamp(8.0, 18.0);
+            let padding = (12.0 * zoom).clamp(7.0, 16.0);
             frame.fill_text(canvas::Text {
                 content: label.title.clone(),
-                position: Point::new(top_left.x + padding, top_left.y + padding * 0.75),
+                position: Point::new(top_left.x + padding, top_left.y + padding * 0.45),
                 color: palette.background.strong.text,
-                size: Pixels((16.0 * camera.zoom() as f32).clamp(10.0, 19.0)),
+                size: Pixels((14.0 * zoom).clamp(9.0, 17.0)),
                 ..canvas::Text::default()
             });
             frame.fill_text(canvas::Text {
                 content: label.subtitle.clone(),
-                position: Point::new(
-                    top_left.x + padding,
-                    top_left.y + header_height + padding * 1.4,
-                ),
+                position: Point::new(top_left.x + padding, top_left.y + header_height * 0.56),
                 color: palette.secondary.base.color,
-                size: Pixels((13.0 * camera.zoom() as f32).clamp(9.0, 15.0)),
+                size: Pixels((10.0 * zoom).clamp(7.0, 12.0)),
                 ..canvas::Text::default()
             });
-            frame.fill_text(canvas::Text {
-                content: "$ terminal will connect in runtime setup".to_owned(),
-                position: Point::new(
-                    top_left.x + padding,
-                    top_left.y + header_height + padding * 3.0,
-                ),
-                color: palette.background.base.text,
-                size: Pixels((12.0 * camera.zoom() as f32).clamp(8.0, 14.0)),
-                ..canvas::Text::default()
-            });
+            if let Some(terminal) = document.terminal(node.id()) {
+                draw_terminal(
+                    frame,
+                    top_left,
+                    header_height,
+                    zoom,
+                    terminal,
+                    (terminal_overlay.focused == Some(node.id()))
+                        .then_some(terminal_overlay.preedit),
+                );
+            }
         }
 
         if is_selected {
@@ -268,6 +284,109 @@ fn draw_nodes(
             );
         }
     }
+}
+
+fn draw_terminal(
+    frame: &mut canvas::Frame,
+    top_left: Point,
+    header_height: f32,
+    zoom: f32,
+    terminal: &terminal::View,
+    preedit: Option<&str>,
+) {
+    let origin = Point::new(
+        top_left.x + BODY_PADDING * zoom,
+        top_left.y + header_height + BODY_PADDING * zoom,
+    );
+    let cell_size = Size::new(CELL_WIDTH * zoom, CELL_HEIGHT * zoom);
+    for cell in &terminal.cells {
+        let position = Point::new(
+            origin.x + cell.column as f32 * cell_size.width,
+            origin.y + cell.row as f32 * cell_size.height,
+        );
+        let mut background = terminal_color(cell.background);
+        if cell.selected {
+            background.a = 1.0;
+        }
+        frame.fill_rectangle(position, cell_size, background);
+        if cell.text != " " {
+            frame.fill_text(canvas::Text {
+                content: cell.text.clone(),
+                position: Point::new(position.x, position.y - cell_size.height * 0.04),
+                color: terminal_color(cell.foreground),
+                size: Pixels((13.0 * zoom).max(5.0)),
+                font: Font {
+                    family: font::Family::Monospace,
+                    weight: if cell.bold {
+                        font::Weight::Bold
+                    } else {
+                        font::Weight::Normal
+                    },
+                    style: if cell.italic {
+                        font::Style::Italic
+                    } else {
+                        font::Style::Normal
+                    },
+                    ..Font::MONOSPACE
+                },
+                ..canvas::Text::default()
+            });
+        }
+        if cell.underline || cell.hyperlink.is_some() {
+            frame.fill_rectangle(
+                Point::new(position.x, position.y + cell_size.height - zoom.max(1.0)),
+                Size::new(cell_size.width, zoom.max(1.0)),
+                terminal_color(cell.foreground),
+            );
+        }
+        if cell.strikeout {
+            frame.fill_rectangle(
+                Point::new(position.x, position.y + cell_size.height * 0.52),
+                Size::new(cell_size.width, zoom.max(1.0)),
+                terminal_color(cell.foreground),
+            );
+        }
+    }
+
+    if let Some(cursor) = terminal.cursor {
+        let position = Point::new(
+            origin.x + cursor.column as f32 * cell_size.width,
+            origin.y + cursor.row as f32 * cell_size.height,
+        );
+        let (cursor_position, cursor_size) = match cursor.style {
+            terminal::CursorStyle::Block => (position, cell_size),
+            terminal::CursorStyle::Underline => (
+                Point::new(
+                    position.x,
+                    position.y + cell_size.height - (2.0 * zoom).max(1.0),
+                ),
+                Size::new(cell_size.width, (2.0 * zoom).max(1.0)),
+            ),
+            terminal::CursorStyle::Beam => {
+                (position, Size::new((2.0 * zoom).max(1.0), cell_size.height))
+            }
+        };
+        frame.fill_rectangle(
+            cursor_position,
+            cursor_size,
+            Color::from_rgba(0.9, 0.93, 0.98, 0.55),
+        );
+
+        if let Some(preedit) = preedit.filter(|preedit| !preedit.is_empty()) {
+            frame.fill_text(canvas::Text {
+                content: preedit.to_owned(),
+                position,
+                color: Color::WHITE,
+                size: Pixels((13.0 * zoom).max(5.0)),
+                font: Font::MONOSPACE,
+                ..canvas::Text::default()
+            });
+        }
+    }
+}
+
+fn terminal_color(color: terminal::CellColor) -> Color {
+    Color::from_rgb8(color.red, color.green, color.blue)
 }
 
 fn group_bounds(group: &NodeGroup, document: &CanvasDocument) -> Option<WorldRect> {

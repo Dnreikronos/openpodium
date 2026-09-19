@@ -1,10 +1,16 @@
 use std::cell::Cell;
 
+use iced::advanced::widget::{self, Tree};
+use iced::advanced::{
+    Clipboard, InputMethod, Layout, Shell, Widget, input_method, layout, renderer,
+};
 use iced::keyboard::{self, Key, Modifiers, key::Named};
 use iced::mouse;
 use iced::widget::canvas::{self, Action};
-use iced::{Element, Fill, Point, Rectangle, Renderer, Theme};
+use iced::{Element, Fill, Length, Point, Rectangle, Renderer, Size, Theme};
 use openpodium::domain::{CanvasLayout, Node, NodeId};
+
+use crate::terminal::{self, BODY_PADDING, CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT};
 
 use super::{Camera, CanvasDocument, ScreenPoint, ViewportSize, editor, scene};
 
@@ -28,23 +34,142 @@ pub(crate) enum Message {
     RedoRequested,
     DeleteRequested,
     DuplicateRequested,
+    TerminalFocused(Option<NodeId>),
+    TerminalInput {
+        node_id: NodeId,
+        bytes: Vec<u8>,
+    },
+    TerminalPasteRequested(NodeId),
+    TerminalCopyRequested(NodeId),
+    TerminalScrolled {
+        node_id: NodeId,
+        lines: i32,
+    },
+    TerminalSelectionStarted {
+        node_id: NodeId,
+        row: usize,
+        column: usize,
+        right_side: bool,
+    },
+    TerminalSelectionUpdated {
+        node_id: NodeId,
+        row: usize,
+        column: usize,
+        right_side: bool,
+    },
 }
 
 pub(crate) fn view(
     camera: Camera,
     document: CanvasDocument,
     selection: Vec<NodeId>,
+    focused_terminal: Option<NodeId>,
     revision: u64,
 ) -> Element<'static, Message> {
-    canvas::Canvas::new(Surface {
+    TerminalCanvas::element(Surface {
         camera,
         document,
         selection,
+        focused_terminal,
         revision,
     })
-    .width(Fill)
-    .height(Fill)
-    .into()
+}
+
+struct TerminalCanvas {
+    inner: canvas::Canvas<Surface, Message>,
+    surface: Surface,
+}
+
+impl TerminalCanvas {
+    fn element(surface: Surface) -> Element<'static, Message> {
+        Element::new(Self {
+            inner: canvas::Canvas::new(surface.clone())
+                .width(Fill)
+                .height(Fill),
+            surface,
+        })
+    }
+}
+
+impl Widget<Message, Theme, Renderer> for TerminalCanvas {
+    fn tag(&self) -> widget::tree::Tag {
+        self.inner.tag()
+    }
+
+    fn state(&self) -> widget::tree::State {
+        self.inner.state()
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.inner.size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.inner.layout(tree, renderer, limits)
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &canvas::Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.inner.update(
+            tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+        );
+        let state = tree.state.downcast_ref::<State>();
+        let input_method =
+            if self.surface.focused_terminal.is_some() && cursor.is_over(layout.bounds()) {
+                InputMethod::Enabled {
+                    cursor: self.surface.ime_cursor(layout.bounds()),
+                    purpose: input_method::Purpose::Normal,
+                    preedit: (!state.preedit.is_empty()).then_some(input_method::Preedit {
+                        content: state.preedit.as_str(),
+                        selection: None,
+                        text_size: None,
+                    }),
+                }
+            } else {
+                InputMethod::Disabled
+            };
+        shell.request_input_method(&input_method);
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.inner
+            .mouse_interaction(tree, layout, cursor, viewport, renderer)
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.inner
+            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +177,7 @@ struct Surface {
     camera: Camera,
     document: CanvasDocument,
     selection: Vec<NodeId>,
+    focused_terminal: Option<NodeId>,
     revision: u64,
 }
 
@@ -61,6 +187,7 @@ struct State {
     drag: Option<Drag>,
     modifiers: Modifiers,
     rendered_revision: Cell<u64>,
+    preedit: String,
 }
 
 #[derive(Debug, Clone)]
@@ -85,14 +212,19 @@ enum Drag {
         initial_height: f32,
         preview: CanvasLayout,
     },
+    TerminalSelection {
+        button: mouse::Button,
+        node_id: NodeId,
+    },
 }
 
 impl Drag {
     fn button(&self) -> mouse::Button {
         match self {
-            Self::Pan { button, .. } | Self::Move { button, .. } | Self::Resize { button, .. } => {
-                *button
-            }
+            Self::Pan { button, .. }
+            | Self::Move { button, .. }
+            | Self::Resize { button, .. }
+            | Self::TerminalSelection { button, .. } => *button,
         }
     }
 }
@@ -112,11 +244,45 @@ impl canvas::Program<Message> for Surface {
                 state.modifiers = *modifiers;
                 None
             }
-            canvas::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
-                if cursor.is_over(bounds) =>
-            {
+            canvas::Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                text,
+                modifiers,
+                ..
+            }) if cursor.is_over(bounds) => {
                 state.modifiers = *modifiers;
-                self.handle_key(state, key, *modifiers, bounds)
+                if let Some(node_id) = self.focused_terminal {
+                    self.handle_terminal_key(state, node_id, key, text.as_deref(), *modifiers)
+                } else {
+                    self.handle_key(state, key, *modifiers, bounds)
+                }
+            }
+            canvas::Event::InputMethod(input_method::Event::Preedit(text, _))
+                if self.focused_terminal.is_some() && cursor.is_over(bounds) =>
+            {
+                state.preedit.clone_from(text);
+                state.geometry.clear();
+                Some(Action::request_redraw().and_capture())
+            }
+            canvas::Event::InputMethod(input_method::Event::Commit(text))
+                if self.focused_terminal.is_some() && cursor.is_over(bounds) =>
+            {
+                state.preedit.clear();
+                state.geometry.clear();
+                Some(
+                    Action::publish(Message::TerminalInput {
+                        node_id: self.focused_terminal?,
+                        bytes: text.as_bytes().to_vec(),
+                    })
+                    .and_capture(),
+                )
+            }
+            canvas::Event::InputMethod(input_method::Event::Closed)
+                if self.focused_terminal.is_some() =>
+            {
+                state.preedit.clear();
+                state.geometry.clear();
+                Some(Action::request_redraw())
             }
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)) => {
                 let position = cursor.position_in(bounds)?;
@@ -134,7 +300,7 @@ impl canvas::Program<Message> for Surface {
                 if state.drag.is_some() =>
             {
                 let position = Point::new(position.x - bounds.x, position.y - bounds.y);
-                self.update_drag(state, position)
+                self.update_drag(state, position, bounds)
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(button))
                 if state
@@ -156,12 +322,33 @@ impl canvas::Program<Message> for Surface {
                         })
                         .and_capture(),
                     ),
+                    Drag::TerminalSelection { .. } => Some(Action::capture()),
                     _ => Some(Action::capture()),
                 }
             }
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let anchor = cursor.position_in(bounds)?;
                 let (x, y, zoom_sensitivity) = scroll_delta(*delta);
+                if !(state.modifiers.command() || state.modifiers.control()) {
+                    if let Some((node_id, row, column, _)) = self.terminal_cell_at(anchor, bounds) {
+                        let lines = (y / f64::from(CELL_HEIGHT)).round() as i32;
+                        if lines != 0 {
+                            if self.document.terminal(node_id)?.mode.mouse_reporting {
+                                return Some(
+                                    Action::publish(Message::TerminalInput {
+                                        node_id,
+                                        bytes: terminal::encode_mouse_wheel(row, column, lines > 0),
+                                    })
+                                    .and_capture(),
+                                );
+                            }
+                            return Some(
+                                Action::publish(Message::TerminalScrolled { node_id, lines })
+                                    .and_capture(),
+                            );
+                        }
+                    }
+                }
                 let camera = if state.modifiers.command() || state.modifiers.control() {
                     self.camera.zoom_at(
                         (y * zoom_sensitivity).exp(),
@@ -197,6 +384,10 @@ impl canvas::Program<Message> for Surface {
                 viewport,
                 &self.document,
                 &self.selection,
+                scene::TerminalOverlay {
+                    focused: self.focused_terminal,
+                    preedit: &state.preedit,
+                },
                 theme,
             );
         });
@@ -217,6 +408,8 @@ impl canvas::Program<Message> for Surface {
         };
         if self.resize_hit(position, bounds).is_some() {
             mouse::Interaction::Pointer
+        } else if self.terminal_cell_at(position, bounds).is_some() {
+            mouse::Interaction::Text
         } else if self.hit_node(position, bounds).is_some() {
             mouse::Interaction::Grab
         } else {
@@ -226,6 +419,50 @@ impl canvas::Program<Message> for Surface {
 }
 
 impl Surface {
+    fn ime_cursor(&self, bounds: Rectangle) -> Rectangle {
+        let Some(node_id) = self.focused_terminal else {
+            return Rectangle::new(bounds.position(), Size::new(1.0, CELL_HEIGHT));
+        };
+        let Some(node) = self
+            .document
+            .layout()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == node_id)
+        else {
+            return Rectangle::new(bounds.position(), Size::new(1.0, CELL_HEIGHT));
+        };
+        let Some(terminal) = self.document.terminal(node_id) else {
+            return Rectangle::new(bounds.position(), Size::new(1.0, CELL_HEIGHT));
+        };
+        let top_left = self.camera.world_to_screen(
+            super::WorldPoint::new(
+                f64::from(node.position().x()),
+                f64::from(node.position().y()),
+            ),
+            viewport(bounds),
+        );
+        let zoom = self.camera.zoom() as f32;
+        let header_height = (HEADER_HEIGHT * zoom).clamp(28.0, 60.0);
+        let cursor = terminal.cursor.unwrap_or(terminal::CursorView {
+            row: 0,
+            column: 0,
+            style: terminal::CursorStyle::Block,
+        });
+        Rectangle::new(
+            Point::new(
+                bounds.x
+                    + top_left.x as f32
+                    + (BODY_PADDING + cursor.column as f32 * CELL_WIDTH) * zoom,
+                bounds.y
+                    + top_left.y as f32
+                    + header_height
+                    + (BODY_PADDING + cursor.row as f32 * CELL_HEIGHT) * zoom,
+            ),
+            Size::new((CELL_WIDTH * zoom).max(1.0), (CELL_HEIGHT * zoom).max(1.0)),
+        )
+    }
+
     fn begin_left_drag(
         &self,
         state: &mut State,
@@ -243,9 +480,27 @@ impl Surface {
                 initial_height: node.size().height(),
                 preview: before,
             });
-            return Some(Action::capture());
+            return Some(Action::publish(Message::TerminalFocused(None)).and_capture());
         }
         if let Some(node) = self.hit_node(position, bounds) {
+            if let Some((node_id, row, column, right_side)) =
+                self.terminal_cell_at(position, bounds)
+            {
+                state.drag = Some(Drag::TerminalSelection {
+                    button: mouse::Button::Left,
+                    node_id,
+                });
+                state.geometry.clear();
+                return Some(
+                    Action::publish(Message::TerminalSelectionStarted {
+                        node_id,
+                        row,
+                        column,
+                        right_side,
+                    })
+                    .and_capture(),
+                );
+            }
             let selection = editor::selection_for_click(
                 &before,
                 &self.selection,
@@ -271,7 +526,12 @@ impl Surface {
         Some(Action::publish(Message::SelectionChanged(Vec::new())).and_capture())
     }
 
-    fn update_drag(&self, state: &mut State, position: Point) -> Option<Action<Message>> {
+    fn update_drag(
+        &self,
+        state: &mut State,
+        position: Point,
+        bounds: Rectangle,
+    ) -> Option<Action<Message>> {
         let message = match state.drag.as_mut()? {
             Drag::Pan { last_position, .. } => {
                 let delta = position - *last_position;
@@ -315,6 +575,16 @@ impl Surface {
                     *initial_height + delta.y / self.camera.zoom() as f32,
                 );
                 Message::PreviewLayout(preview.clone())
+            }
+            Drag::TerminalSelection { node_id, .. } => {
+                let (_, row, column, right_side) =
+                    self.terminal_cell_for_node(*node_id, position, bounds)?;
+                Message::TerminalSelectionUpdated {
+                    node_id: *node_id,
+                    row,
+                    column,
+                    right_side,
+                }
             }
         };
         state.geometry.clear();
@@ -368,6 +638,29 @@ impl Surface {
         self.publish_camera(state, camera)
     }
 
+    fn handle_terminal_key(
+        &self,
+        state: &State,
+        node_id: NodeId,
+        key: &Key,
+        text: Option<&str>,
+        modifiers: Modifiers,
+    ) -> Option<Action<Message>> {
+        if is_release_focus_shortcut(key, modifiers) {
+            return Some(Action::publish(Message::TerminalFocused(None)).and_capture());
+        }
+        if is_copy_shortcut(key, modifiers) {
+            return Some(Action::publish(Message::TerminalCopyRequested(node_id)).and_capture());
+        }
+        if is_paste_shortcut(key, modifiers) {
+            return Some(Action::publish(Message::TerminalPasteRequested(node_id)).and_capture());
+        }
+        let mode = self.document.terminal(node_id)?.mode;
+        let bytes = terminal::encode_key(key, text, modifiers, mode)?;
+        state.geometry.clear();
+        Some(Action::publish(Message::TerminalInput { node_id, bytes }).and_capture())
+    }
+
     fn hit_node(&self, position: Point, bounds: Rectangle) -> Option<&Node> {
         let world = self.camera.screen_to_world(
             ScreenPoint::new(f64::from(position.x), f64::from(position.y)),
@@ -407,6 +700,55 @@ impl Surface {
             .max_by_key(|node| (node.z_index(), node.id()))
     }
 
+    fn terminal_cell_at(
+        &self,
+        position: Point,
+        bounds: Rectangle,
+    ) -> Option<(NodeId, usize, usize, bool)> {
+        let node = self.hit_node(position, bounds)?;
+        self.terminal_cell_for_node(node.id(), position, bounds)
+    }
+
+    fn terminal_cell_for_node(
+        &self,
+        node_id: NodeId,
+        position: Point,
+        bounds: Rectangle,
+    ) -> Option<(NodeId, usize, usize, bool)> {
+        let node = self
+            .document
+            .layout()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == node_id)?;
+        let terminal = self.document.terminal(node_id)?;
+        let top_left = self.camera.world_to_screen(
+            super::WorldPoint::new(
+                f64::from(node.position().x()),
+                f64::from(node.position().y()),
+            ),
+            viewport(bounds),
+        );
+        let zoom = self.camera.zoom() as f32;
+        let header_height = (HEADER_HEIGHT * zoom).clamp(28.0, 60.0);
+        let body_x = top_left.x as f32 + BODY_PADDING * zoom;
+        let body_y = top_left.y as f32 + header_height + BODY_PADDING * zoom;
+        let local_x = position.x - body_x;
+        let local_y = position.y - body_y;
+        if local_x < 0.0 || local_y < 0.0 {
+            return None;
+        }
+        let cell_width = CELL_WIDTH * zoom;
+        let cell_height = CELL_HEIGHT * zoom;
+        let column = (local_x / cell_width).floor() as usize;
+        let row = (local_y / cell_height).floor() as usize;
+        if column >= usize::from(terminal.size.columns) || row >= usize::from(terminal.size.rows) {
+            return None;
+        }
+        let right_side = local_x % cell_width >= cell_width / 2.0;
+        Some((node_id, row, column, right_side))
+    }
+
     fn publish_camera(&self, state: &State, camera: Camera) -> Option<Action<Message>> {
         if camera == self.camera {
             return Some(Action::capture());
@@ -414,6 +756,32 @@ impl Surface {
         state.geometry.clear();
         Some(Action::publish(Message::CameraChanged(camera)).and_capture())
     }
+}
+
+fn is_release_focus_shortcut(key: &Key, modifiers: Modifiers) -> bool {
+    matches!(key.as_ref(), Key::Named(Named::Escape))
+        && modifiers.shift()
+        && (modifiers.command() || modifiers.control())
+}
+
+#[cfg(target_os = "macos")]
+fn is_copy_shortcut(key: &Key, modifiers: Modifiers) -> bool {
+    matches!(key.as_ref(), Key::Character("c")) && modifiers.command()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_copy_shortcut(key: &Key, modifiers: Modifiers) -> bool {
+    matches!(key.as_ref(), Key::Character("c")) && modifiers.control() && modifiers.shift()
+}
+
+#[cfg(target_os = "macos")]
+fn is_paste_shortcut(key: &Key, modifiers: Modifiers) -> bool {
+    matches!(key.as_ref(), Key::Character("v")) && modifiers.command()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_paste_shortcut(key: &Key, modifiers: Modifiers) -> bool {
+    matches!(key.as_ref(), Key::Character("v")) && modifiers.control() && modifiers.shift()
 }
 
 fn viewport(bounds: Rectangle) -> ViewportSize {
@@ -428,5 +796,40 @@ fn scroll_delta(delta: mouse::ScrollDelta) -> (f64, f64, f64) {
             LINE_ZOOM_SENSITIVITY,
         ),
         mouse::ScrollDelta::Pixels { x, y } => (f64::from(x), f64::from(y), PIXEL_ZOOM_SENSITIVITY),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_focus_keeps_escape_and_canvas_shortcuts_for_the_pty() {
+        assert!(!is_release_focus_shortcut(
+            &Key::Named(Named::Escape),
+            Modifiers::empty()
+        ));
+        assert_eq!(
+            terminal::encode_key(
+                &Key::Named(Named::Escape),
+                None,
+                Modifiers::empty(),
+                terminal::InputMode::default(),
+            ),
+            Some(vec![0x1b])
+        );
+        assert_eq!(
+            terminal::encode_key(
+                &Key::Character("z".into()),
+                Some("z"),
+                Modifiers::COMMAND,
+                terminal::InputMode::default(),
+            ),
+            Some(b"z".to_vec())
+        );
+        assert!(is_release_focus_shortcut(
+            &Key::Named(Named::Escape),
+            Modifiers::COMMAND | Modifiers::SHIFT
+        ));
     }
 }

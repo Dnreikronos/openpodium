@@ -11,12 +11,15 @@ use std::collections::BTreeMap;
 
 use openpodium::domain::{AgentProgram, CanvasLayout, NodeId, NodeTarget, Workspace};
 
+use crate::terminal;
+
 use camera::{ScreenPoint, ViewportSize, WorldPoint, WorldRect};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CanvasDocument {
     layout: CanvasLayout,
     labels: BTreeMap<NodeId, NodeLabel>,
+    terminals: BTreeMap<NodeId, terminal::View>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,7 +37,11 @@ pub(super) enum NodeKind {
 }
 
 impl CanvasDocument {
-    pub(crate) fn new(workspace: &Workspace, layout: CanvasLayout) -> Self {
+    pub(crate) fn new(
+        workspace: &Workspace,
+        layout: CanvasLayout,
+        terminals: BTreeMap<NodeId, terminal::View>,
+    ) -> Self {
         let labels = layout
             .nodes()
             .iter()
@@ -46,13 +53,23 @@ impl CanvasDocument {
                             subtitle: "Unavailable".to_owned(),
                             kind: NodeKind::Agent(AgentProgram::Shell),
                         },
-                        |agent| NodeLabel {
-                            title: agent.name().as_str().to_owned(),
-                            subtitle: format!(
-                                "{} · terminal offline",
-                                program_name(agent.program())
-                            ),
-                            kind: NodeKind::Agent(agent.program()),
+                        |agent| {
+                            let status = terminals.get(&node.id()).map_or_else(
+                                || "terminal offline".to_owned(),
+                                |terminal| terminal.status.label(),
+                            );
+                            let title = terminals
+                                .get(&node.id())
+                                .and_then(|terminal| terminal.title.as_deref())
+                                .map_or_else(
+                                    || agent.name().as_str().to_owned(),
+                                    |title| format!("{} — {title}", agent.name().as_str()),
+                                );
+                            NodeLabel {
+                                title,
+                                subtitle: format!("{} · {status}", program_name(agent.program())),
+                                kind: NodeKind::Agent(agent.program()),
+                            }
                         },
                     ),
                     NodeTarget::Task(task_id) => workspace.task(task_id).map_or_else(
@@ -85,7 +102,11 @@ impl CanvasDocument {
                 (node.id(), label)
             })
             .collect();
-        Self { layout, labels }
+        Self {
+            layout,
+            labels,
+            terminals,
+        }
     }
 
     pub(crate) fn layout(&self) -> &CanvasLayout {
@@ -96,6 +117,10 @@ impl CanvasDocument {
         self.labels
             .get(&node_id)
             .expect("every document node receives a label")
+    }
+
+    pub(super) fn terminal(&self, node_id: NodeId) -> Option<&terminal::View> {
+        self.terminals.get(&node_id)
     }
 }
 
