@@ -25,6 +25,9 @@ pub use environments::*;
 mod agents;
 pub use agents::*;
 
+mod chat;
+pub use chat::*;
+
 mod entities;
 pub use entities::*;
 

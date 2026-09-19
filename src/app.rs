@@ -9,10 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Task, Theme, clipboard};
 use openpodium::domain::{
-    Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, CommandPreset,
-    CommandPresetId, ContainerEnvironment, Content, CustomEnvironment, DomainCommand,
-    EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Name, Node, NodeId, NodeTarget,
-    Role, RoleColor, RoleIcon, RoleId, SshEnvironment, Timestamp, Workspace, WorkspaceDirectory,
+    Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, ChatAttachmentId,
+    ChatDraft, ChatMessageId, ChatThread, ChatThreadId, CommandPreset, CommandPresetId,
+    ContainerEnvironment, Content, CustomEnvironment, DomainCommand, EnvironmentKind,
+    EnvironmentProfile, EnvironmentProfileId, Name, Node, NodeId, NodeTarget, Role, RoleColor,
+    RoleIcon, RoleId, SshEnvironment, ThreadColor, Timestamp, Workspace, WorkspaceDirectory,
     WorkspaceId,
 };
 use openpodium::persistence::{export_role, import_role};
@@ -24,6 +25,7 @@ use openpodium::workspaces::{WorkspaceManager, WorkspaceSettingsInput};
 use tokio::sync::Mutex;
 
 use crate::canvas::{self, Alignment, Camera, History, ZOrder};
+use crate::chat::{self, AttachmentStore, LinkTarget};
 use crate::terminal;
 use crate::terminal::session::{self, Action as TerminalAction, ProcessStream, Session};
 
@@ -53,6 +55,8 @@ struct OpenPodium {
     terminals: BTreeMap<TerminalKey, Session>,
     focused_terminal: Option<NodeId>,
     terminal_generation: u64,
+    chat_ui: chat::UiState,
+    attachment_store: Option<AttachmentStore>,
     workspaces: Option<WorkspaceManager>,
     create_directory: String,
     name: String,
@@ -83,12 +87,17 @@ struct OpenPodium {
 
 impl Default for OpenPodium {
     fn default() -> Self {
-        let (workspaces, notice) = match application_database_path()
-            .map_err(|error| error.to_string())
-            .and_then(|path| WorkspaceManager::open(path).map_err(|error| error.to_string()))
-        {
-            Ok(workspaces) => (Some(workspaces), None),
-            Err(error) => (None, Some(error)),
+        let (workspaces, attachment_store, notice) = match application_database_path() {
+            Ok(path) => {
+                let attachment_store = path
+                    .parent()
+                    .map(|directory| AttachmentStore::new(directory.join("attachments")));
+                match WorkspaceManager::open(path) {
+                    Ok(workspaces) => (Some(workspaces), attachment_store, None),
+                    Err(error) => (None, attachment_store, Some(error.to_string())),
+                }
+            }
+            Err(error) => (None, None, Some(error.to_string())),
         };
         let mut state = Self {
             camera: Camera::default(),
@@ -99,6 +108,8 @@ impl Default for OpenPodium {
             terminals: BTreeMap::new(),
             focused_terminal: None,
             terminal_generation: 0,
+            chat_ui: chat::UiState::default(),
+            attachment_store,
             workspaces,
             create_directory: String::new(),
             name: String::new(),
@@ -134,6 +145,7 @@ impl Default for OpenPodium {
 #[derive(Clone)]
 enum Message {
     Canvas(canvas::Message),
+    Chat(chat::Message),
     AddAgent(AgentProgram),
     PreviewAgent(AgentProgram),
     CanvasAction(CanvasAction),
@@ -224,6 +236,7 @@ pub(crate) fn run() -> iced::Result {
 fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
         Message::Canvas(message) => return handle_canvas_message(state, message),
+        Message::Chat(message) => return handle_chat_message(state, message),
         Message::AddAgent(program) => return add_agent(state, program),
         Message::PreviewAgent(program) => preview_agent(state, program),
         Message::CanvasAction(action) => apply_canvas_action(state, action),
@@ -726,6 +739,22 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     if let Some(notice) = &state.notice {
         settings = settings.push(text(notice));
     }
+    if let Some((workspace_id, agent_id)) = selected_agent(state)
+        && let Some(workspace) = state
+            .workspaces
+            .as_ref()
+            .and_then(|workspaces| workspaces.workspace(workspace_id))
+    {
+        settings = settings.push(
+            chat::conversation_panel(
+                workspace,
+                agent_id,
+                &state.chat_ui,
+                state.attachment_store.as_ref(),
+            )
+            .map(Message::Chat),
+        );
+    }
     if let Some(node_id) = selected_terminal_node(state) {
         let session = state
             .terminals
@@ -827,6 +856,7 @@ impl OpenPodium {
             .settings()
             .instructions()
             .map_or_else(String::new, |instructions| instructions.as_str().to_owned());
+        self.chat_ui.sync(workspace);
         self.selected_environment = None;
         self.selected_role = None;
         clear_preset_draft(self);
@@ -945,6 +975,379 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
         }
     }
     Task::none()
+}
+
+fn handle_chat_message(state: &mut OpenPodium, message: chat::Message) -> Task<Message> {
+    match message {
+        chat::Message::SurfaceChanged(surface) => {
+            let Some((workspace_id, agent_id)) = selected_agent(state) else {
+                state.notice = Some("Select an agent node first".to_owned());
+                return Task::none();
+            };
+            state.chat_ui.set_surface(workspace_id, agent_id, surface);
+        }
+        chat::Message::ThreadSelected(thread_id) => {
+            let Some((workspace_id, agent_id)) = selected_agent(state) else {
+                state.notice = Some("Select an agent node first".to_owned());
+                return Task::none();
+            };
+            let valid = state
+                .workspaces
+                .as_ref()
+                .and_then(|workspaces| workspaces.workspace(workspace_id))
+                .and_then(|workspace| workspace.chat_thread(thread_id))
+                .is_some_and(|thread| thread.agent_id() == agent_id);
+            if valid {
+                state
+                    .chat_ui
+                    .select_thread(workspace_id, agent_id, thread_id);
+            }
+        }
+        chat::Message::NewThreadNameChanged(value) => {
+            if let Some((workspace_id, agent_id)) = selected_agent(state) {
+                state
+                    .chat_ui
+                    .set_new_thread_name(workspace_id, agent_id, value);
+            }
+        }
+        chat::Message::NewThreadColorChanged(value) => {
+            if let Some((workspace_id, agent_id)) = selected_agent(state) {
+                state
+                    .chat_ui
+                    .set_new_thread_color(workspace_id, agent_id, value);
+            }
+        }
+        chat::Message::CreateThread => create_chat_thread(state),
+        chat::Message::DraftChanged(text) => update_chat_draft_text(state, text),
+        chat::Message::MentionToggled(target) => toggle_chat_mention(state, target),
+        chat::Message::AttachmentPathChanged(value) => {
+            if let Some((workspace_id, _, thread_id)) = selected_chat_context(state) {
+                state
+                    .chat_ui
+                    .set_attachment_path(workspace_id, thread_id, value);
+            }
+        }
+        chat::Message::Attach => attach_chat_file(state),
+        chat::Message::Submit => submit_chat_draft(state),
+        chat::Message::Rich(chat::Action::LinkClicked(uri)) => {
+            return handle_chat_link(state, &uri);
+        }
+    }
+    Task::none()
+}
+
+fn create_chat_thread(state: &mut OpenPodium) {
+    let Some((workspace_id, agent_id)) = selected_agent(state) else {
+        state.notice = Some("Select an agent node first".to_owned());
+        return;
+    };
+    let Some(workspace) = state
+        .workspaces
+        .as_ref()
+        .and_then(|workspaces| workspaces.workspace(workspace_id))
+    else {
+        state.notice = Some("The selected workspace is unavailable".to_owned());
+        return;
+    };
+    let Some(thread_id) = next_chat_thread_id(workspace) else {
+        state.notice = Some("No chat thread identifiers remain".to_owned());
+        return;
+    };
+    let thread = Name::new(state.chat_ui.new_thread_name(workspace_id, agent_id))
+        .map_err(|error| error.to_string())
+        .and_then(|name| {
+            Ok(ChatThread::with_color(
+                thread_id,
+                agent_id,
+                name,
+                ThreadColor::new(state.chat_ui.new_thread_color(workspace_id, agent_id))
+                    .map_err(|error| error.to_string())?,
+            ))
+        })
+        .and_then(|thread| {
+            state
+                .workspaces
+                .as_mut()
+                .expect("the workspace was checked")
+                .execute(workspace_id, DomainCommand::AddChatThread(thread), now())
+                .map_err(|error| error.to_string())
+        });
+    state.notice = Some(match thread {
+        Ok(_) => {
+            state
+                .chat_ui
+                .select_thread(workspace_id, agent_id, thread_id);
+            state.chat_ui.clear_new_thread(workspace_id, agent_id);
+            "Chat thread created".to_owned()
+        }
+        Err(error) => error,
+    });
+}
+
+fn update_chat_draft_text(state: &mut OpenPodium, text: String) {
+    let Some((workspace_id, _, thread_id)) = selected_chat_context(state) else {
+        return;
+    };
+    let Some(thread) = state
+        .workspaces
+        .as_ref()
+        .and_then(|workspaces| workspaces.workspace(workspace_id))
+        .and_then(|workspace| workspace.chat_thread(thread_id))
+    else {
+        return;
+    };
+    let draft = ChatDraft::new(
+        text,
+        thread.draft().attachments().to_vec(),
+        thread.draft().mentions().to_vec(),
+    );
+    persist_chat_draft(state, workspace_id, thread_id, draft);
+}
+
+fn toggle_chat_mention(state: &mut OpenPodium, target: NodeTarget) {
+    let Some((workspace_id, _, thread_id)) = selected_chat_context(state) else {
+        return;
+    };
+    let Some(thread) = state
+        .workspaces
+        .as_ref()
+        .and_then(|workspaces| workspaces.workspace(workspace_id))
+        .and_then(|workspace| workspace.chat_thread(thread_id))
+    else {
+        return;
+    };
+    let mut mentions = thread.draft().mentions().to_vec();
+    if let Some(index) = mentions.iter().position(|mention| *mention == target) {
+        mentions.remove(index);
+    } else {
+        mentions.push(target);
+    }
+    let draft = ChatDraft::new(
+        thread.draft().text(),
+        thread.draft().attachments().to_vec(),
+        mentions,
+    );
+    persist_chat_draft(state, workspace_id, thread_id, draft);
+}
+
+fn persist_chat_draft(
+    state: &mut OpenPodium,
+    workspace_id: WorkspaceId,
+    thread_id: ChatThreadId,
+    draft: Result<ChatDraft, openpodium::domain::ChatValidationError>,
+) {
+    let result = draft.map_err(|error| error.to_string()).and_then(|draft| {
+        let unchanged = state
+            .workspaces
+            .as_ref()
+            .and_then(|workspaces| workspaces.workspace(workspace_id))
+            .and_then(|workspace| workspace.chat_thread(thread_id))
+            .is_some_and(|thread| thread.draft() == &draft);
+        if unchanged {
+            return Ok(());
+        }
+        state
+            .workspaces
+            .as_mut()
+            .expect("the workspace was checked")
+            .execute(
+                workspace_id,
+                DomainCommand::UpdateChatDraft { thread_id, draft },
+                now(),
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    });
+    if let Err(error) = result {
+        state.notice = Some(error);
+    }
+}
+
+fn attach_chat_file(state: &mut OpenPodium) {
+    let Some((workspace_id, _, thread_id)) = selected_chat_context(state) else {
+        state.notice = Some("Select a chat thread first".to_owned());
+        return;
+    };
+    let Some(store) = state.attachment_store.clone() else {
+        state.notice = Some("Attachment storage is unavailable".to_owned());
+        return;
+    };
+    let Some((attachment_id, path, current_draft, current_bytes)) = state
+        .workspaces
+        .as_ref()
+        .and_then(|workspaces| workspaces.workspace(workspace_id))
+        .and_then(|workspace| {
+            let thread = workspace.chat_thread(thread_id)?;
+            Some((
+                next_chat_attachment_id(workspace)?,
+                PathBuf::from(state.chat_ui.attachment_path(workspace_id, thread_id)),
+                thread.draft().clone(),
+                thread
+                    .draft()
+                    .attachments()
+                    .iter()
+                    .filter_map(|id| workspace.chat_attachment(*id))
+                    .map(|attachment| attachment.byte_len())
+                    .sum::<u64>(),
+            ))
+        })
+    else {
+        state.notice = Some("The selected chat thread is unavailable".to_owned());
+        return;
+    };
+    if current_draft.attachments().len() == ChatDraft::MAX_ATTACHMENTS {
+        state.notice = Some(format!(
+            "A draft can contain at most {} attachments",
+            ChatDraft::MAX_ATTACHMENTS
+        ));
+        return;
+    }
+    let result = store
+        .import(&path, workspace_id, thread_id, attachment_id)
+        .map_err(|error| error.to_string())
+        .and_then(|attachment| {
+            let total = current_bytes.saturating_add(attachment.byte_len());
+            if total > ChatDraft::MAX_TOTAL_ATTACHMENT_BYTES {
+                let _ = store.remove(workspace_id, &attachment);
+                return Err(format!(
+                    "Draft attachments total {total} bytes; the limit is {} bytes",
+                    ChatDraft::MAX_TOTAL_ATTACHMENT_BYTES
+                ));
+            }
+            let add_result = state
+                .workspaces
+                .as_mut()
+                .expect("the workspace was checked")
+                .execute(
+                    workspace_id,
+                    DomainCommand::AddChatAttachment(attachment.clone()),
+                    now(),
+                );
+            if let Err(error) = add_result {
+                let _ = store.remove(workspace_id, &attachment);
+                return Err(error.to_string());
+            }
+            let mut attachments = current_draft.attachments().to_vec();
+            attachments.push(attachment.id());
+            let draft = ChatDraft::new(
+                current_draft.text(),
+                attachments,
+                current_draft.mentions().to_vec(),
+            )
+            .map_err(|error| error.to_string())?;
+            state
+                .workspaces
+                .as_mut()
+                .expect("the workspace was checked")
+                .execute(
+                    workspace_id,
+                    DomainCommand::UpdateChatDraft { thread_id, draft },
+                    now(),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(attachment.display_name().to_owned())
+        });
+    state.notice = Some(match result {
+        Ok(name) => {
+            state.chat_ui.clear_attachment_path(workspace_id, thread_id);
+            format!("Attached {name}")
+        }
+        Err(error) => error,
+    });
+}
+
+fn submit_chat_draft(state: &mut OpenPodium) {
+    let Some((workspace_id, _, thread_id)) = selected_chat_context(state) else {
+        state.notice = Some("Select a chat thread first".to_owned());
+        return;
+    };
+    let Some((message_id, prompt)) = state
+        .workspaces
+        .as_ref()
+        .and_then(|workspaces| workspaces.workspace(workspace_id))
+        .and_then(|workspace| {
+            Some((
+                next_chat_message_id(workspace)?,
+                workspace.chat_thread(thread_id)?.draft().text().to_owned(),
+            ))
+        })
+    else {
+        state.notice = Some("The selected chat thread is unavailable".to_owned());
+        return;
+    };
+    let result = state
+        .workspaces
+        .as_mut()
+        .expect("the workspace was checked")
+        .execute(
+            workspace_id,
+            DomainCommand::SubmitChatDraft {
+                thread_id,
+                message_id,
+                sent_at: now(),
+            },
+            now(),
+        );
+    if let Err(error) = result {
+        state.notice = Some(error.to_string());
+        return;
+    }
+    if let Some(workspace) = state
+        .workspaces
+        .as_ref()
+        .and_then(|workspaces| workspaces.workspace(workspace_id))
+    {
+        state.chat_ui.sync(workspace);
+    }
+
+    let terminal = selected_terminal_node(state).and_then(|node_id| {
+        state.terminals.get(&TerminalKey {
+            workspace_id,
+            node_id,
+        })
+    });
+    let mut input = prompt.into_bytes();
+    input.push(b'\r');
+    state.notice = Some(match terminal {
+        Some(session) => match session.write(&input) {
+            Ok(()) => "Prompt saved and sent to the terminal".to_owned(),
+            Err(error) => format!("Prompt saved, but terminal delivery failed: {error}"),
+        },
+        None => "Prompt saved; start the terminal to deliver it manually".to_owned(),
+    });
+}
+
+fn handle_chat_link(state: &mut OpenPodium, uri: &str) -> Task<Message> {
+    let Some(workspace) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+    else {
+        state.notice = Some("No workspace is active".to_owned());
+        return Task::none();
+    };
+    let Some(root) = workspace.settings().working_directory() else {
+        state.notice = Some("The workspace has no working directory".to_owned());
+        return Task::none();
+    };
+    match chat::classify_link(uri, PathBuf::from(root.as_str()).as_path()) {
+        LinkTarget::Web(url) => {
+            state.notice = Some("Web link copied to the clipboard".to_owned());
+            clipboard::write(url)
+        }
+        LinkTarget::WorkspaceFile(path) => {
+            state.notice = Some("Workspace file path copied to the clipboard".to_owned());
+            clipboard::write(path.display().to_string())
+        }
+        LinkTarget::Attachment(id) => {
+            state.notice = Some(format!("Local attachment {id}"));
+            Task::none()
+        }
+        LinkTarget::Blocked => {
+            state.notice = Some("Blocked an unsafe or unsupported link".to_owned());
+            Task::none()
+        }
+    }
 }
 
 fn create_environment(state: &mut OpenPodium) -> Task<Message> {
@@ -1980,6 +2383,13 @@ fn selected_agent(state: &OpenPodium) -> Option<(WorkspaceId, AgentId)> {
     Some((workspace.id(), agent_id))
 }
 
+fn selected_chat_context(state: &OpenPodium) -> Option<(WorkspaceId, AgentId, ChatThreadId)> {
+    let (workspace_id, agent_id) = selected_agent(state)?;
+    let workspace = state.workspaces.as_ref()?.workspace(workspace_id)?;
+    let thread_id = state.chat_ui.selected_thread(workspace, agent_id)?;
+    Some((workspace_id, agent_id, thread_id))
+}
+
 fn active_workspace_id(state: &OpenPodium) -> Option<WorkspaceId> {
     state
         .workspaces
@@ -2063,6 +2473,42 @@ fn next_role_id(workspace: &Workspace) -> Option<RoleId> {
     }
 }
 
+fn next_chat_thread_id(workspace: &Workspace) -> Option<ChatThreadId> {
+    let mut value = 1_u64;
+    loop {
+        let id = ChatThreadId::new(value);
+        if workspace.chat_thread(id).is_none() {
+            return Some(id);
+        }
+        value = value.checked_add(1)?;
+    }
+}
+
+fn next_chat_message_id(workspace: &Workspace) -> Option<ChatMessageId> {
+    let mut value = 1_u64;
+    loop {
+        let id = ChatMessageId::new(value);
+        if workspace
+            .chat_threads()
+            .all(|thread| thread.messages().iter().all(|message| message.id() != id))
+        {
+            return Some(id);
+        }
+        value = value.checked_add(1)?;
+    }
+}
+
+fn next_chat_attachment_id(workspace: &Workspace) -> Option<ChatAttachmentId> {
+    let mut value = 1_u64;
+    loop {
+        let id = ChatAttachmentId::new(value);
+        if workspace.chat_attachment(id).is_none() {
+            return Some(id);
+        }
+        value = value.checked_add(1)?;
+    }
+}
+
 fn canvas_coordinate(value: f64) -> f32 {
     value.clamp(-1_000_000_000.0, 1_000_000_000.0) as f32
 }
@@ -2118,6 +2564,8 @@ fn now() -> Timestamp {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use tempfile::TempDir;
 
     use super::*;
@@ -2141,6 +2589,8 @@ mod tests {
             terminals: BTreeMap::new(),
             focused_terminal: None,
             terminal_generation: 0,
+            chat_ui: chat::UiState::default(),
+            attachment_store: None,
             workspaces: Some(workspaces),
             create_directory: String::new(),
             name: String::new(),
@@ -2309,6 +2759,97 @@ mod tests {
     }
 
     #[test]
+    fn chat_draft_is_journaled_and_restored() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let (mut state, workspace_id, thread_id) = state_with_chat(&temp, &database);
+
+        update_chat_draft_text(&mut state, "Unsent **draft**".to_owned());
+        assert_eq!(
+            state
+                .workspaces
+                .as_ref()
+                .unwrap()
+                .workspace(workspace_id)
+                .unwrap()
+                .chat_thread(thread_id)
+                .unwrap()
+                .draft()
+                .text(),
+            "Unsent **draft**"
+        );
+
+        drop(state);
+        let restored = WorkspaceManager::open(database).unwrap();
+        assert_eq!(
+            restored
+                .workspace(workspace_id)
+                .unwrap()
+                .chat_thread(thread_id)
+                .unwrap()
+                .draft()
+                .text(),
+            "Unsent **draft**"
+        );
+    }
+
+    #[test]
+    fn switching_chat_and_terminal_preserves_the_live_session() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let (mut state, workspace_id, _) = state_with_chat(&temp, &database);
+        let key = TerminalKey {
+            workspace_id,
+            node_id: NodeId::new(1),
+        };
+        state.terminals.insert(
+            key,
+            Session::starting(terminal::GridSize::for_node(400.0, 300.0), 17),
+        );
+
+        let _task = handle_chat_message(
+            &mut state,
+            chat::Message::SurfaceChanged(chat::Surface::Chat),
+        );
+        let session = state.terminals.get(&key).expect("terminal is preserved");
+        assert_eq!(session.generation(), 17);
+        assert!(session.is_active());
+        assert_eq!(
+            state.chat_ui.surface(workspace_id, AgentId::new(1)),
+            chat::Surface::Chat
+        );
+    }
+
+    #[test]
+    fn submitting_without_a_terminal_keeps_the_durable_message() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let (mut state, workspace_id, thread_id) = state_with_chat(&temp, &database);
+        update_chat_draft_text(&mut state, "Run the targeted tests".to_owned());
+
+        submit_chat_draft(&mut state);
+
+        let thread = state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .workspace(workspace_id)
+            .unwrap()
+            .chat_thread(thread_id)
+            .unwrap();
+        assert_eq!(thread.messages().len(), 1);
+        assert_eq!(
+            thread.messages()[0].content().as_str(),
+            "Run the targeted tests"
+        );
+        assert!(thread.draft().is_empty());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Prompt saved; start the terminal to deliver it manually")
+        );
+    }
+
+    #[test]
     fn starting_an_active_terminal_does_not_duplicate_its_process() {
         let temp = TempDir::new().unwrap();
         let project = temp.path().join("project");
@@ -2347,6 +2888,8 @@ mod tests {
             terminals,
             focused_terminal: None,
             terminal_generation: 0,
+            chat_ui: chat::UiState::default(),
+            attachment_store: None,
             workspaces: Some(workspaces),
             create_directory: String::new(),
             name: String::new(),
@@ -2374,5 +2917,48 @@ mod tests {
             role_instructions: String::new(),
             notice: None,
         }
+    }
+
+    fn state_with_chat(temp: &TempDir, database: &Path) -> (OpenPodium, WorkspaceId, ChatThreadId) {
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut workspaces = WorkspaceManager::open(database).unwrap();
+        let workspace_id = workspaces
+            .create_workspace(&project, Timestamp::from_unix_millis(1))
+            .unwrap();
+        let node = Node::new(
+            NodeId::new(1),
+            NodeTarget::Agent(AgentId::new(1)),
+            CanvasPoint::new(0.0, 0.0).unwrap(),
+            CanvasSize::new(400.0, 300.0).unwrap(),
+        );
+        workspaces
+            .execute(
+                workspace_id,
+                DomainCommand::AddAgentNode {
+                    agent: Agent::new(AgentId::new(1), Name::new("Builder").unwrap(), None),
+                    node,
+                },
+                Timestamp::from_unix_millis(2),
+            )
+            .unwrap();
+        let thread_id = ChatThreadId::new(1);
+        workspaces
+            .execute(
+                workspace_id,
+                DomainCommand::AddChatThread(ChatThread::new(
+                    thread_id,
+                    AgentId::new(1),
+                    Name::new("General").unwrap(),
+                )),
+                Timestamp::from_unix_millis(3),
+            )
+            .unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+        state.canvas_selection = vec![NodeId::new(1)];
+        state
+            .chat_ui
+            .select_thread(workspace_id, AgentId::new(1), thread_id);
+        (state, workspace_id, thread_id)
     }
 }

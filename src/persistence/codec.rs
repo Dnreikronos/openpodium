@@ -1,18 +1,20 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize, CommandPreset,
-    CommandPresetId, Connection, ConnectionId, ConnectionKind, ContainerEnvironment, Content,
-    CustomEnvironment, DomainCommand, DomainEvent, EnvironmentKind, EnvironmentProfile,
-    EnvironmentProfileId, Handoff, HandoffId, HandoffPayload, Name, Node, NodeGroup, NodeGroupId,
-    NodeId, NodeTarget, Role, RoleColor, RoleIcon, RoleId, SshEnvironment, Task, TaskId, TaskState,
-    Workspace, WorkspaceDirectory, WorkspaceIcon, WorkspaceId, WorkspaceSettings,
+    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize,
+    ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft, ChatMessage, ChatMessageId,
+    ChatThread, ChatThreadId, CommandPreset, CommandPresetId, Connection, ConnectionId,
+    ConnectionKind, ContainerEnvironment, Content, CustomEnvironment, DomainCommand, DomainEvent,
+    EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffPayload,
+    Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleColor, RoleIcon, RoleId,
+    SshEnvironment, Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceDirectory,
+    WorkspaceIcon, WorkspaceId, WorkspaceSettings,
 };
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 5;
-pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 5;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 6;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 6;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
     serde_json::to_vec(&StoredEvent::from(event)).map_err(|source| {
@@ -61,6 +63,13 @@ pub(crate) fn decode_event(
             "domain event",
             sequence,
             "command presets, role appearance, and role changes require event format version 5",
+        ));
+    }
+    if format_version < 6 && stored.requires_version_six() {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "chat threads, messages, drafts, and attachments require event format version 6",
         ));
     }
 
@@ -149,6 +158,32 @@ enum StoredEvent {
     AgentAdded {
         agent: AgentV1,
     },
+    ChatThreadAdded {
+        thread: ChatThreadV1,
+    },
+    ChatThreadChanged {
+        thread_id: u64,
+        from_name: String,
+        to_name: String,
+        from_color: String,
+        to_color: String,
+    },
+    ChatAttachmentAdded {
+        attachment: ChatAttachmentV1,
+    },
+    ChatDraftChanged {
+        thread_id: u64,
+        from: ChatDraftV1,
+        to: ChatDraftV1,
+    },
+    ChatDraftSubmitted {
+        thread_id: u64,
+        from: ChatDraftV1,
+        message: ChatMessageV1,
+    },
+    AgentChatMessageAppended {
+        message: ChatMessageV1,
+    },
     TaskAdded {
         task: TaskV1,
     },
@@ -225,6 +260,46 @@ impl From<&DomainEvent> for StoredEvent {
             DomainEvent::AgentAdded(agent) => Self::AgentAdded {
                 agent: AgentV1::from(agent),
             },
+            DomainEvent::ChatThreadAdded(thread) => Self::ChatThreadAdded {
+                thread: ChatThreadV1::from(thread),
+            },
+            DomainEvent::ChatThreadChanged {
+                thread_id,
+                from_name,
+                to_name,
+                from_color,
+                to_color,
+            } => Self::ChatThreadChanged {
+                thread_id: thread_id.get(),
+                from_name: from_name.as_str().to_owned(),
+                to_name: to_name.as_str().to_owned(),
+                from_color: from_color.as_str().to_owned(),
+                to_color: to_color.as_str().to_owned(),
+            },
+            DomainEvent::ChatAttachmentAdded(attachment) => Self::ChatAttachmentAdded {
+                attachment: ChatAttachmentV1::from(attachment),
+            },
+            DomainEvent::ChatDraftChanged {
+                thread_id,
+                from,
+                to,
+            } => Self::ChatDraftChanged {
+                thread_id: thread_id.get(),
+                from: ChatDraftV1::from(from),
+                to: ChatDraftV1::from(to),
+            },
+            DomainEvent::ChatDraftSubmitted {
+                thread_id,
+                from,
+                message,
+            } => Self::ChatDraftSubmitted {
+                thread_id: thread_id.get(),
+                from: ChatDraftV1::from(from),
+                message: ChatMessageV1::from(message),
+            },
+            DomainEvent::AgentChatMessageAppended(message) => Self::AgentChatMessageAppended {
+                message: ChatMessageV1::from(message),
+            },
             DomainEvent::TaskAdded(task) => Self::TaskAdded {
                 task: TaskV1::from(task),
             },
@@ -297,6 +372,18 @@ impl StoredEvent {
         }
     }
 
+    fn requires_version_six(&self) -> bool {
+        matches!(
+            self,
+            Self::ChatThreadAdded { .. }
+                | Self::ChatThreadChanged { .. }
+                | Self::ChatAttachmentAdded { .. }
+                | Self::ChatDraftChanged { .. }
+                | Self::ChatDraftSubmitted { .. }
+                | Self::AgentChatMessageAppended { .. }
+        )
+    }
+
     fn into_domain(self) -> Result<DomainEvent, String> {
         match self {
             Self::WorkspaceSettingsChanged { from, to } => {
@@ -345,6 +432,46 @@ impl StoredEvent {
                 }
                 Ok(DomainEvent::AgentAdded(agent))
             }
+            Self::ChatThreadAdded { thread } => {
+                Ok(DomainEvent::ChatThreadAdded(thread.into_domain()?))
+            }
+            Self::ChatThreadChanged {
+                thread_id,
+                from_name,
+                to_name,
+                from_color,
+                to_color,
+            } => Ok(DomainEvent::ChatThreadChanged {
+                thread_id: ChatThreadId::new(thread_id),
+                from_name: Name::new(from_name).map_err(|error| error.to_string())?,
+                to_name: Name::new(to_name).map_err(|error| error.to_string())?,
+                from_color: ThreadColor::new(from_color).map_err(|error| error.to_string())?,
+                to_color: ThreadColor::new(to_color).map_err(|error| error.to_string())?,
+            }),
+            Self::ChatAttachmentAdded { attachment } => {
+                Ok(DomainEvent::ChatAttachmentAdded(attachment.into_domain()?))
+            }
+            Self::ChatDraftChanged {
+                thread_id,
+                from,
+                to,
+            } => Ok(DomainEvent::ChatDraftChanged {
+                thread_id: ChatThreadId::new(thread_id),
+                from: from.into_domain()?,
+                to: to.into_domain()?,
+            }),
+            Self::ChatDraftSubmitted {
+                thread_id,
+                from,
+                message,
+            } => Ok(DomainEvent::ChatDraftSubmitted {
+                thread_id: ChatThreadId::new(thread_id),
+                from: from.into_domain()?,
+                message: message.into_domain()?,
+            }),
+            Self::AgentChatMessageAppended { message } => Ok(
+                DomainEvent::AgentChatMessageAppended(message.into_domain()?),
+            ),
             Self::TaskAdded { task } => {
                 let (task, state) = task.into_domain()?;
                 if state != TaskState::Queued {
@@ -401,6 +528,10 @@ struct StoredWorkspace {
     command_presets: Vec<CommandPresetV1>,
     roles: Vec<RoleV1>,
     agents: Vec<AgentV1>,
+    #[serde(default)]
+    chat_threads: Vec<ChatThreadV1>,
+    #[serde(default)]
+    chat_attachments: Vec<ChatAttachmentV1>,
     tasks: Vec<TaskV1>,
     handoffs: Vec<HandoffV1>,
     nodes: Vec<NodeV1>,
@@ -437,6 +568,11 @@ impl From<&Workspace> for StoredWorkspace {
                 .collect(),
             roles: workspace.roles().map(RoleV1::from).collect(),
             agents: workspace.agents().map(AgentV1::from).collect(),
+            chat_threads: workspace.chat_threads().map(ChatThreadV1::from).collect(),
+            chat_attachments: workspace
+                .chat_attachments()
+                .map(ChatAttachmentV1::from)
+                .collect(),
             tasks: workspace.tasks().map(TaskV1::from).collect(),
             handoffs: workspace.handoffs().map(HandoffV1::from).collect(),
             nodes: workspace.nodes().map(NodeV1::from).collect(),
@@ -493,6 +629,13 @@ impl StoredWorkspace {
         {
             return Err(
                 "command presets and role appearance require snapshot format version 5".to_owned(),
+            );
+        }
+        if format_version < 6
+            && (!self.chat_threads.is_empty() || !self.chat_attachments.is_empty())
+        {
+            return Err(
+                "chat threads and attachments require snapshot format version 6".to_owned(),
             );
         }
 
@@ -575,6 +718,58 @@ impl StoredWorkspace {
                 &mut workspace,
                 DomainCommand::ReplaceCanvas { before, after },
             )?;
+        }
+
+        let mut chat_threads = Vec::with_capacity(self.chat_threads.len());
+        for stored in self.chat_threads {
+            let (thread, draft, messages) = stored.into_parts()?;
+            apply_snapshot_command(&mut workspace, DomainCommand::AddChatThread(thread.clone()))?;
+            chat_threads.push((thread.id(), draft, messages));
+        }
+        for attachment in self.chat_attachments {
+            apply_snapshot_command(
+                &mut workspace,
+                DomainCommand::AddChatAttachment(attachment.into_domain()?),
+            )?;
+        }
+        for (thread_id, draft, messages) in chat_threads {
+            for message in messages {
+                match message.author() {
+                    ChatAuthor::User => {
+                        let message_draft = ChatDraft::new(
+                            message.content().as_str(),
+                            message.attachments().to_vec(),
+                            message.mentions().to_vec(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        apply_snapshot_command(
+                            &mut workspace,
+                            DomainCommand::UpdateChatDraft {
+                                thread_id,
+                                draft: message_draft,
+                            },
+                        )?;
+                        apply_snapshot_command(
+                            &mut workspace,
+                            DomainCommand::SubmitChatDraft {
+                                thread_id,
+                                message_id: message.id(),
+                                sent_at: message.sent_at(),
+                            },
+                        )?;
+                    }
+                    ChatAuthor::Agent(_) => apply_snapshot_command(
+                        &mut workspace,
+                        DomainCommand::AppendAgentChatMessage(message),
+                    )?,
+                }
+            }
+            if !draft.is_empty() {
+                apply_snapshot_command(
+                    &mut workspace,
+                    DomainCommand::UpdateChatDraft { thread_id, draft },
+                )?;
+            }
         }
 
         Ok(workspace)
@@ -902,6 +1097,217 @@ impl AgentV1 {
             agent = agent.in_environment(EnvironmentProfileId::new(environment_id));
         }
         Ok((agent, self.state.into()))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatThreadV1 {
+    id: u64,
+    agent_id: u64,
+    name: String,
+    color: String,
+    draft: ChatDraftV1,
+    messages: Vec<ChatMessageV1>,
+}
+
+impl From<&ChatThread> for ChatThreadV1 {
+    fn from(thread: &ChatThread) -> Self {
+        Self {
+            id: thread.id().get(),
+            agent_id: thread.agent_id().get(),
+            name: thread.name().as_str().to_owned(),
+            color: thread.color().as_str().to_owned(),
+            draft: ChatDraftV1::from(thread.draft()),
+            messages: thread.messages().iter().map(ChatMessageV1::from).collect(),
+        }
+    }
+}
+
+impl ChatThreadV1 {
+    fn into_domain(self) -> Result<ChatThread, String> {
+        let (thread, draft, messages) = self.into_parts()?;
+        if !draft.is_empty() || !messages.is_empty() {
+            return Err("a chat_thread_added event must contain an empty thread".to_owned());
+        }
+        Ok(thread)
+    }
+
+    fn into_parts(self) -> Result<(ChatThread, ChatDraft, Vec<ChatMessage>), String> {
+        Ok((
+            ChatThread::with_color(
+                ChatThreadId::new(self.id),
+                AgentId::new(self.agent_id),
+                Name::new(self.name).map_err(|error| error.to_string())?,
+                ThreadColor::new(self.color).map_err(|error| error.to_string())?,
+            ),
+            self.draft.into_domain()?,
+            self.messages
+                .into_iter()
+                .map(ChatMessageV1::into_domain)
+                .collect::<Result<_, _>>()?,
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatDraftV1 {
+    text: String,
+    attachments: Vec<u64>,
+    mentions: Vec<NodeTargetV1>,
+}
+
+impl From<&ChatDraft> for ChatDraftV1 {
+    fn from(draft: &ChatDraft) -> Self {
+        Self {
+            text: draft.text().to_owned(),
+            attachments: draft
+                .attachments()
+                .iter()
+                .copied()
+                .map(ChatAttachmentId::get)
+                .collect(),
+            mentions: draft
+                .mentions()
+                .iter()
+                .copied()
+                .map(NodeTargetV1::from)
+                .collect(),
+        }
+    }
+}
+
+impl ChatDraftV1 {
+    fn into_domain(self) -> Result<ChatDraft, String> {
+        ChatDraft::new(
+            self.text,
+            self.attachments
+                .into_iter()
+                .map(ChatAttachmentId::new)
+                .collect(),
+            self.mentions.into_iter().map(NodeTarget::from).collect(),
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatAttachmentV1 {
+    id: u64,
+    thread_id: u64,
+    storage_key: String,
+    display_name: String,
+    media_type: String,
+    byte_len: u64,
+}
+
+impl From<&ChatAttachment> for ChatAttachmentV1 {
+    fn from(attachment: &ChatAttachment) -> Self {
+        Self {
+            id: attachment.id().get(),
+            thread_id: attachment.thread_id().get(),
+            storage_key: attachment.storage_key().to_owned(),
+            display_name: attachment.display_name().to_owned(),
+            media_type: attachment.media_type().to_owned(),
+            byte_len: attachment.byte_len(),
+        }
+    }
+}
+
+impl ChatAttachmentV1 {
+    fn into_domain(self) -> Result<ChatAttachment, String> {
+        ChatAttachment::new(
+            ChatAttachmentId::new(self.id),
+            ChatThreadId::new(self.thread_id),
+            self.storage_key,
+            self.display_name,
+            self.media_type,
+            self.byte_len,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatMessageV1 {
+    id: u64,
+    thread_id: u64,
+    author: ChatAuthorV1,
+    content: String,
+    attachments: Vec<u64>,
+    mentions: Vec<NodeTargetV1>,
+    sent_at: u64,
+}
+
+impl From<&ChatMessage> for ChatMessageV1 {
+    fn from(message: &ChatMessage) -> Self {
+        Self {
+            id: message.id().get(),
+            thread_id: message.thread_id().get(),
+            author: message.author().into(),
+            content: message.content().as_str().to_owned(),
+            attachments: message
+                .attachments()
+                .iter()
+                .copied()
+                .map(ChatAttachmentId::get)
+                .collect(),
+            mentions: message
+                .mentions()
+                .iter()
+                .copied()
+                .map(NodeTargetV1::from)
+                .collect(),
+            sent_at: message.sent_at().as_unix_millis(),
+        }
+    }
+}
+
+impl ChatMessageV1 {
+    fn into_domain(self) -> Result<ChatMessage, String> {
+        ChatMessage::new(
+            ChatMessageId::new(self.id),
+            ChatThreadId::new(self.thread_id),
+            self.author.into(),
+            Content::new(self.content).map_err(|error| error.to_string())?,
+            self.attachments
+                .into_iter()
+                .map(ChatAttachmentId::new)
+                .collect(),
+            self.mentions.into_iter().map(NodeTarget::from).collect(),
+            Timestamp::from_unix_millis(self.sent_at),
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ChatAuthorV1 {
+    User,
+    Agent { agent_id: u64 },
+}
+
+impl From<ChatAuthor> for ChatAuthorV1 {
+    fn from(author: ChatAuthor) -> Self {
+        match author {
+            ChatAuthor::User => Self::User,
+            ChatAuthor::Agent(agent_id) => Self::Agent {
+                agent_id: agent_id.get(),
+            },
+        }
+    }
+}
+
+impl From<ChatAuthorV1> for ChatAuthor {
+    fn from(author: ChatAuthorV1) -> Self {
+        match author {
+            ChatAuthorV1::User => Self::User,
+            ChatAuthorV1::Agent { agent_id } => Self::Agent(AgentId::new(agent_id)),
+        }
     }
 }
 
