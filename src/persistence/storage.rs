@@ -338,6 +338,29 @@ impl Journal {
         Ok(Some(workspace))
     }
 
+    pub fn timeline(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<TimelineEvent>, PersistenceError> {
+        self.timeline_after(workspace_id, None)
+    }
+
+    pub fn timeline_after(
+        &self,
+        workspace_id: WorkspaceId,
+        after: Option<TimelineEventId>,
+    ) -> Result<Vec<TimelineEvent>, PersistenceError> {
+        let workspace_key = workspace_id.get().to_string();
+        load_events_after(
+            &self.connection,
+            &workspace_key,
+            after.map_or(0, TimelineEventId::get),
+        )?
+        .into_iter()
+        .map(|event| event.decode(&workspace_key, workspace_id))
+        .collect()
+    }
+
     #[cfg(test)]
     pub(super) fn connection(&self) -> &Connection {
         &self.connection
