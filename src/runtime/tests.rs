@@ -12,12 +12,18 @@ use super::{
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKING_DIRECTORY_MARKER: &str = ".openpodium-runtime-cwd";
+const WORKING_DIRECTORY_CONTENT: &str = "__OPENPODIUM_CWD__";
 
 #[tokio::test(flavor = "current_thread")]
 async fn interactive_shell_uses_working_directory_and_accepts_input() {
     let _test = TEST_LOCK.lock().await;
     let directory = tempdir().expect("temporary working directory");
-    let expected_directory = directory.path().canonicalize().expect("canonical path");
+    std::fs::write(
+        directory.path().join(WORKING_DIRECTORY_MARKER),
+        WORKING_DIRECTORY_CONTENT,
+    )
+    .expect("working-directory marker is created");
     let mut process = LocalProcessRuntime
         .spawn(interactive_shell(directory.path()))
         .expect("interactive shell starts");
@@ -34,14 +40,9 @@ async fn interactive_shell_uses_working_directory_and_accepts_input() {
     output.extend(remaining_output);
 
     let output = String::from_utf8_lossy(&output);
-    let expected_directory = expected_directory.to_string_lossy();
-    let expected_directory = expected_directory
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&expected_directory);
     assert!(output.contains("__OPENPODIUM_READY__"), "output: {output}");
     assert!(
-        output.contains(&expected_directory.replace('\\', "/"))
-            || output.contains(expected_directory),
+        output.contains(WORKING_DIRECTORY_CONTENT),
         "output: {output}"
     );
     assert!(matches!(
@@ -229,12 +230,12 @@ fn interactive_shell(directory: &Path) -> ProcessSpec {
 
 #[cfg(unix)]
 fn shell_input_for_working_directory() -> &'static [u8] {
-    b"printf '__OPENPODIUM_READY__\\n'; pwd\n"
+    b"printf '__OPENPODIUM_READY__\\n'; cat .openpodium-runtime-cwd\n"
 }
 
 #[cfg(windows)]
 fn shell_input_for_working_directory() -> &'static [u8] {
-    b"echo __OPENPODIUM_READY__& cd\r"
+    b"echo __OPENPODIUM_READY__& type .openpodium-runtime-cwd\r"
 }
 
 #[cfg(unix)]
