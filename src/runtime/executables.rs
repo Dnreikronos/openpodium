@@ -1,6 +1,5 @@
 use std::env;
 use std::ffi::OsStr;
-use std::fs;
 use std::path::Path;
 
 pub(super) fn executable_exists(executable: &OsStr) -> bool {
@@ -34,7 +33,7 @@ fn executable_candidates(directory: &Path, executable: &OsStr) -> bool {
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::metadata(path)
+    std::fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
