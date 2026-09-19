@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use tempfile::tempdir;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 use super::local::active_workers;
 use super::{
@@ -142,46 +142,50 @@ async fn dropping_a_handle_cancels_its_child_and_workers() {
 }
 
 async fn collect_process(process: &mut super::RunningProcess) -> (Vec<u8>, ProcessTermination) {
-    timeout(TEST_TIMEOUT, async {
-        let mut output = Vec::new();
-        loop {
-            match process.next_event().await {
-                Some(ProcessEvent::Output(chunk)) => output.extend(chunk),
-                Some(ProcessEvent::Terminated(termination)) => return (output, termination),
-                None => panic!("process event stream ended without termination"),
-            }
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut output = Vec::new();
+    loop {
+        match timeout_at(deadline, process.next_event()).await {
+            Ok(Some(ProcessEvent::Output(chunk))) => output.extend(chunk),
+            Ok(Some(ProcessEvent::Terminated(termination))) => return (output, termination),
+            Ok(None) => panic!("process event stream ended without termination"),
+            Err(_) => panic!(
+                "process did not terminate; lifecycle: {}; output: {}",
+                process.lifecycle_state(),
+                String::from_utf8_lossy(&output)
+            ),
         }
-    })
-    .await
-    .expect("process terminates before timeout")
+    }
 }
 
 async fn collect_until_output(process: &mut super::RunningProcess, expected: &[u8]) -> Vec<u8> {
-    timeout(TEST_TIMEOUT, async {
-        let mut output = Vec::new();
-        loop {
-            match process.next_event().await {
-                Some(ProcessEvent::Output(chunk)) => {
-                    output.extend(chunk);
-                    if output
-                        .windows(expected.len())
-                        .any(|window| window == expected)
-                    {
-                        return output;
-                    }
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut output = Vec::new();
+    loop {
+        match timeout_at(deadline, process.next_event()).await {
+            Ok(Some(ProcessEvent::Output(chunk))) => {
+                output.extend(chunk);
+                if output
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+                {
+                    return output;
                 }
-                Some(ProcessEvent::Terminated(termination)) => {
-                    panic!(
-                        "process terminated before expected output: {termination:?}; output: {}",
-                        String::from_utf8_lossy(&output)
-                    );
-                }
-                None => panic!("process event stream ended before expected output"),
             }
+            Ok(Some(ProcessEvent::Terminated(termination))) => {
+                panic!(
+                    "process terminated before expected output: {termination:?}; output: {}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            Ok(None) => panic!("process event stream ended before expected output"),
+            Err(_) => panic!(
+                "process did not produce expected output; lifecycle: {}; output: {}",
+                process.lifecycle_state(),
+                String::from_utf8_lossy(&output)
+            ),
         }
-    })
-    .await
-    .expect("process produces expected output before timeout")
+    }
 }
 
 async fn wait_for_workers_to_stop() {

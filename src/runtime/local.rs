@@ -209,6 +209,11 @@ impl RunningProcess {
             },
         )))
     }
+
+    #[cfg(test)]
+    pub(super) fn lifecycle_state(&self) -> &'static str {
+        self.control.lifecycle_state()
+    }
 }
 
 impl Drop for RunningProcess {
@@ -234,6 +239,16 @@ struct ProcessControl {
 }
 
 impl ProcessControl {
+    #[cfg(test)]
+    fn lifecycle_state(&self) -> &'static str {
+        match self.state.load(Ordering::Acquire) {
+            RUNNING => "running",
+            CANCELLATION_REQUESTED => "cancellation requested",
+            FINISHED => "finished",
+            _ => "unknown",
+        }
+    }
+
     fn ensure_running(&self, operation: RuntimeOperation) -> Result<(), RuntimeError> {
         if self.state.load(Ordering::Acquire) == RUNNING {
             Ok(())
