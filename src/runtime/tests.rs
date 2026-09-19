@@ -22,10 +22,11 @@ async fn interactive_shell_uses_working_directory_and_accepts_input() {
         .spawn(interactive_shell(directory.path()))
         .expect("interactive shell starts");
 
+    let mut output = initialize_terminal_host(&mut process).await;
     process
         .write_input(shell_input_for_working_directory())
         .expect("input reaches shell");
-    let mut output = collect_until_output(&mut process, b"__OPENPODIUM_READY__").await;
+    output.extend(collect_until_output(&mut process, b"__OPENPODIUM_READY__").await);
     process
         .write_input(shell_exit_input())
         .expect("exit reaches shell");
@@ -61,6 +62,7 @@ async fn resize_is_visible_inside_the_child_terminal() {
         .spawn(interactive_shell(directory.path()))
         .expect("interactive shell starts");
 
+    let _ = initialize_terminal_host(&mut process).await;
     process.resize(size).expect("PTY resizes");
     process
         .write_input(shell_input_for_terminal_size())
@@ -98,6 +100,7 @@ async fn exit_and_startup_failure_are_each_observed_once() {
     let mut process = LocalProcessRuntime
         .spawn(exiting_process(directory.path(), 7))
         .expect("child starts");
+    let _ = initialize_terminal_host(&mut process).await;
     let (_, termination) = collect_process(&mut process).await;
     assert!(
         matches!(
@@ -196,6 +199,22 @@ async fn wait_for_workers_to_stop() {
     })
     .await
     .expect("runtime workers stop before timeout");
+}
+
+#[cfg(unix)]
+async fn initialize_terminal_host(_process: &mut super::RunningProcess) -> Vec<u8> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+async fn initialize_terminal_host(process: &mut super::RunningProcess) -> Vec<u8> {
+    // portable-pty requests cursor inheritance when it creates a ConPTY.
+    // A real terminal emulator answers this query before the child can run.
+    let output = collect_until_output(process, b"\x1b[6n").await;
+    process
+        .write_input(b"\x1b[1;1R")
+        .expect("cursor position response reaches ConPTY");
+    output
 }
 
 #[cfg(unix)]
