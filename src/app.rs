@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Task, Theme, clipboard};
@@ -18,8 +18,9 @@ use openpodium::domain::{
 };
 use openpodium::ipc::{
     AGENT_ID_ENV, AVAILABLE_ENV, AgentCapabilities, AgentRegistration, CLI_ENV, ENDPOINT_ENV,
-    IpcService, TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
+    IpcService, SUPPORTED_VERSIONS, TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
 };
+use openpodium::orchestration::{DeliveryRequest, Orchestrator};
 use openpodium::persistence::{export_role, import_role};
 use openpodium::runtime::{
     EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, ProcessSpec,
@@ -62,6 +63,7 @@ struct OpenPodium {
     chat_ui: chat::UiState,
     attachment_store: Option<AttachmentStore>,
     ipc: Option<IpcService>,
+    orchestrator: Orchestrator,
     workspaces: Option<WorkspaceManager>,
     create_directory: String,
     name: String,
@@ -92,7 +94,8 @@ struct OpenPodium {
 
 impl Default for OpenPodium {
     fn default() -> Self {
-        let (workspaces, attachment_store, ipc, notice) = match application_database_path() {
+        let (mut workspaces, attachment_store, ipc, mut notice) = match application_database_path()
+        {
             Ok(path) => {
                 let attachment_store = path
                     .parent()
@@ -113,6 +116,16 @@ impl Default for OpenPodium {
             }
             Err(error) => (None, None, None, Some(error.to_string())),
         };
+        let orchestrator = match workspaces.as_mut() {
+            Some(workspaces) => match Orchestrator::recover(workspaces, now()) {
+                Ok(orchestrator) => orchestrator,
+                Err(error) => {
+                    notice = Some(error.to_string());
+                    Orchestrator::default()
+                }
+            },
+            None => Orchestrator::default(),
+        };
         let mut state = Self {
             camera: Camera::default(),
             canvas_selection: Vec::new(),
@@ -125,6 +138,7 @@ impl Default for OpenPodium {
             chat_ui: chat::UiState::default(),
             attachment_store,
             ipc,
+            orchestrator,
             workspaces,
             create_directory: String::new(),
             name: String::new(),
@@ -160,6 +174,7 @@ impl Default for OpenPodium {
 
 #[derive(Clone)]
 enum Message {
+    OrchestrationTick,
     Canvas(canvas::Message),
     Chat(chat::Message),
     AddAgent(AgentProgram),
@@ -245,12 +260,16 @@ pub(crate) fn run() -> iced::Result {
     iced::application(OpenPodium::default, update, view)
         .title(APP_NAME)
         .theme(Theme::Dark)
+        .subscription(|_| {
+            iced::time::every(Duration::from_millis(100)).map(|_| Message::OrchestrationTick)
+        })
         .centered()
         .run()
 }
 
 fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
+        Message::OrchestrationTick => run_orchestration_tick(state),
         Message::Canvas(message) => return handle_canvas_message(state, message),
         Message::Chat(message) => return handle_chat_message(state, message),
         Message::AddAgent(program) => return add_agent(state, program),
@@ -892,7 +911,9 @@ impl OpenPodium {
                     name: agent.name().as_str().to_owned(),
                     program: agent.program().label().to_owned(),
                     state: agent.state().to_string(),
-                    capabilities: if agent.environment_id().is_none() {
+                    capabilities: if agent.environment_id().is_none()
+                        && supports_automatic_delivery(agent.program())
+                    {
                         AgentCapabilities::CONNECTED
                     } else {
                         AgentCapabilities::UNAVAILABLE
@@ -907,6 +928,122 @@ impl Drop for OpenPodium {
     fn drop(&mut self) {
         self.stop_all_terminals();
     }
+}
+
+fn run_orchestration_tick(state: &mut OpenPodium) {
+    const MAX_MESSAGES_PER_TICK: usize = 64;
+    const MAX_DELIVERIES_PER_TICK: usize = 64;
+
+    let current_time = now();
+    let Some(workspaces) = state.workspaces.as_mut() else {
+        return;
+    };
+    if let Err(error) = state.orchestrator.expire_due(workspaces, current_time) {
+        state.notice = Some(format!("Handoff deadline processing failed: {error}"));
+        return;
+    }
+
+    for _ in 0..MAX_MESSAGES_PER_TICK {
+        let accepted = match state.ipc.as_ref().map(IpcService::next_message) {
+            Some(Ok(Some(accepted))) => accepted,
+            Some(Ok(None)) | None => break,
+            Some(Err(error)) => {
+                state.notice = Some(format!("IPC queue read failed: {error}"));
+                break;
+            }
+        };
+        match state
+            .orchestrator
+            .accept(workspaces, &accepted, current_time)
+        {
+            Ok(()) => {
+                if let Some(ipc) = &state.ipc
+                    && let Err(error) = ipc.mark_processed(&accepted)
+                {
+                    ipc.release(&accepted);
+                    state.notice = Some(format!("IPC acknowledgement failed: {error}"));
+                    break;
+                }
+            }
+            Err(error) if error.is_retryable() => {
+                if let Some(ipc) = &state.ipc {
+                    ipc.release(&accepted);
+                }
+                state.notice = Some(format!("Handoff processing will retry: {error}"));
+                break;
+            }
+            Err(error) => {
+                if let Some(ipc) = &state.ipc
+                    && let Err(acknowledgement_error) = ipc.mark_processed(&accepted)
+                {
+                    ipc.release(&accepted);
+                    state.notice = Some(format!(
+                        "Handoff rejected ({error}); IPC acknowledgement failed: {acknowledgement_error}"
+                    ));
+                    break;
+                }
+                state.notice = Some(format!("Handoff rejected: {error}"));
+            }
+        }
+    }
+
+    for _ in 0..MAX_DELIVERIES_PER_TICK {
+        let request = match state.orchestrator.prepare_next(workspaces, current_time) {
+            Ok(Some(request)) => request,
+            Ok(None) => break,
+            Err(error) => {
+                state.notice = Some(format!("Handoff delivery preparation failed: {error}"));
+                break;
+            }
+        };
+        let result = deliver_handoff(&state.terminals, workspaces, &request);
+        if let Err(error) =
+            state
+                .orchestrator
+                .finish_delivery(workspaces, &request, result, current_time)
+        {
+            state.notice = Some(format!("Handoff delivery recording failed: {error}"));
+            break;
+        }
+    }
+}
+
+fn deliver_handoff(
+    terminals: &BTreeMap<TerminalKey, Session>,
+    workspaces: &WorkspaceManager,
+    request: &DeliveryRequest,
+) -> Result<(), String> {
+    let key = delivery_target(workspaces, request)?;
+    let session = terminals
+        .get(&key)
+        .ok_or_else(|| "recipient terminal is not running".to_owned())?;
+    session.paste(request.prompt())?;
+    session.write(b"\r")
+}
+
+fn delivery_target(
+    workspaces: &WorkspaceManager,
+    request: &DeliveryRequest,
+) -> Result<TerminalKey, String> {
+    let workspace = workspaces
+        .workspace(request.workspace_id())
+        .ok_or_else(|| format!("workspace {} is not loaded", request.workspace_id()))?;
+    let node_id = workspace
+        .canvas_layout()
+        .nodes()
+        .iter()
+        .find(|node| node.target() == NodeTarget::Agent(request.recipient_agent_id()))
+        .map(Node::id)
+        .ok_or_else(|| {
+            format!(
+                "agent {} has no terminal node",
+                request.recipient_agent_id()
+            )
+        })?;
+    Ok(TerminalKey {
+        workspace_id: request.workspace_id(),
+        node_id,
+    })
 }
 
 fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Task<Message> {
@@ -2091,7 +2228,7 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
             state.ipc.as_ref(),
             workspace_id,
             agent_id,
-            profile.is_none(),
+            profile.is_none() && supports_automatic_delivery(program),
         );
         prepare_environment_process(profile.as_ref(), spec).map_err(|error| error.to_string())
     }) {
@@ -2146,11 +2283,25 @@ fn apply_ipc_environment(
         .env(AVAILABLE_ENV, "1")
         .env(ENDPOINT_ENV, connection.endpoint().to_string())
         .env(TOKEN_ENV, connection.token())
-        .env(VERSIONS_ENV, openpodium::ipc::PROTOCOL_VERSION.to_string());
+        .env(
+            VERSIONS_ENV,
+            SUPPORTED_VERSIONS
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
     match env::current_exe() {
         Ok(executable) => spec.env(CLI_ENV, executable),
         Err(_) => spec,
     }
+}
+
+fn supports_automatic_delivery(program: AgentProgram) -> bool {
+    matches!(
+        program,
+        AgentProgram::Codex | AgentProgram::Claude | AgentProgram::OpenCode
+    )
 }
 
 fn handle_terminal_started(
@@ -2713,6 +2864,96 @@ mod tests {
     }
 
     #[test]
+    fn handoff_delivery_target_is_independent_of_the_active_workspace() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let first_id = workspaces
+            .create_workspace(&first, Timestamp::from_unix_millis(1))
+            .unwrap();
+        let second_id = workspaces
+            .create_workspace(&second, Timestamp::from_unix_millis(2))
+            .unwrap();
+        workspaces
+            .switch(first_id, Timestamp::from_unix_millis(3))
+            .unwrap();
+        workspaces
+            .execute(
+                first_id,
+                DomainCommand::AddAgent(Agent::with_program(
+                    AgentId::new(1),
+                    Name::new("Lead").unwrap(),
+                    None,
+                    AgentProgram::Codex,
+                )),
+                Timestamp::from_unix_millis(4),
+            )
+            .unwrap();
+        workspaces
+            .execute(
+                first_id,
+                DomainCommand::AddAgentNode {
+                    agent: Agent::with_program(
+                        AgentId::new(2),
+                        Name::new("Builder").unwrap(),
+                        None,
+                        AgentProgram::Claude,
+                    ),
+                    node: Node::new(
+                        NodeId::new(7),
+                        NodeTarget::Agent(AgentId::new(2)),
+                        CanvasPoint::new(0.0, 0.0).unwrap(),
+                        CanvasSize::new(400.0, 300.0).unwrap(),
+                    ),
+                },
+                Timestamp::from_unix_millis(5),
+            )
+            .unwrap();
+        workspaces
+            .switch(second_id, Timestamp::from_unix_millis(6))
+            .unwrap();
+        assert_eq!(workspaces.active_workspace_id(), Some(second_id));
+
+        let mut orchestrator =
+            Orchestrator::recover(&mut workspaces, Timestamp::from_unix_millis(7)).unwrap();
+        orchestrator
+            .accept(
+                &mut workspaces,
+                &openpodium::ipc::AcceptedMessage {
+                    workspace_id: first_id.get(),
+                    sender_agent_id: 1,
+                    recipient_agent_id: 2,
+                    command: openpodium::ipc::ProtocolCommand::SendHandoff {
+                        message_id: openpodium::ipc::MessageId::new("task-1").unwrap(),
+                        recipient_agent_id: 2,
+                        kind: openpodium::ipc::HandoffKind::Task,
+                        title: Some("Background delivery".to_owned()),
+                        body: "Keep the destination stable".to_owned(),
+                        parent_message_id: None,
+                        response_timeout_ms: None,
+                    },
+                },
+                Timestamp::from_unix_millis(8),
+            )
+            .unwrap();
+        let request = orchestrator
+            .prepare_next(&mut workspaces, Timestamp::from_unix_millis(9))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            delivery_target(&workspaces, &request).unwrap(),
+            TerminalKey {
+                workspace_id: first_id,
+                node_id: NodeId::new(7),
+            }
+        );
+    }
+
+    #[test]
     fn adding_an_agent_is_persisted_and_participates_in_undo_redo() {
         let temp = TempDir::new().unwrap();
         let project = temp.path().join("project");
@@ -2734,6 +2975,7 @@ mod tests {
             chat_ui: chat::UiState::default(),
             attachment_store: None,
             ipc: None,
+            orchestrator: Orchestrator::default(),
             workspaces: Some(workspaces),
             create_directory: String::new(),
             name: String::new(),
@@ -3034,6 +3276,7 @@ mod tests {
             chat_ui: chat::UiState::default(),
             attachment_store: None,
             ipc: None,
+            orchestrator: Orchestrator::default(),
             workspaces: Some(workspaces),
             create_directory: String::new(),
             name: String::new(),
