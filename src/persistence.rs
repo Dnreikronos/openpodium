@@ -2,9 +2,11 @@
 
 mod codec;
 mod error;
+mod roles;
 mod storage;
 
 pub use error::PersistenceError;
+pub use roles::{RoleTransferError, export_role, import_role};
 pub use storage::Journal;
 
 #[cfg(test)]

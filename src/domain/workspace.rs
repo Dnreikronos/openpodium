@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
 use super::{
-    Agent, AgentId, CanvasLayout, Connection, ConnectionId, ConnectionKind, Content, DomainCommand,
-    DomainError, DomainEvent, EntityRef, EnvironmentProfile, EnvironmentProfileId, Handoff,
-    HandoffId, HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId, Role, RoleId, Task,
-    TaskId, TaskState, TimelineEvent, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
+    Agent, AgentId, CanvasLayout, CommandPreset, CommandPresetId, Connection, ConnectionId,
+    ConnectionKind, Content, DomainCommand, DomainError, DomainEvent, EntityRef,
+    EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffPayload, Name, Node,
+    NodeGroup, NodeGroupId, NodeId, Role, RoleId, Task, TaskId, TaskState, TimelineEvent,
+    WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,7 @@ pub struct Workspace {
     id: WorkspaceId,
     settings: WorkspaceSettings,
     environment_profiles: BTreeMap<EnvironmentProfileId, EnvironmentProfile>,
+    command_presets: BTreeMap<CommandPresetId, CommandPreset>,
     roles: BTreeMap<RoleId, Role>,
     agents: BTreeMap<AgentId, Agent>,
     tasks: BTreeMap<TaskId, Task>,
@@ -67,6 +69,7 @@ impl Workspace {
             id,
             settings: WorkspaceSettings::new(name, None, None, None),
             environment_profiles: BTreeMap::new(),
+            command_presets: BTreeMap::new(),
             roles: BTreeMap::new(),
             agents: BTreeMap::new(),
             tasks: BTreeMap::new(),
@@ -101,7 +104,15 @@ impl Workspace {
         self.environment_profiles.get(&id)
     }
 
-    pub(crate) fn roles(&self) -> impl Iterator<Item = &Role> {
+    pub fn command_presets(&self) -> impl Iterator<Item = &CommandPreset> {
+        self.command_presets.values()
+    }
+
+    pub fn command_preset(&self, id: CommandPresetId) -> Option<&CommandPreset> {
+        self.command_presets.get(&id)
+    }
+
+    pub fn roles(&self) -> impl Iterator<Item = &Role> {
         self.roles.values()
     }
 
@@ -158,71 +169,128 @@ impl Workspace {
     }
 
     pub fn execute(&mut self, command: DomainCommand) -> Result<DomainEvent, DomainError> {
-        let event = match command {
-            DomainCommand::UpdateWorkspaceSettings(settings) => {
-                if settings == self.settings {
-                    return Err(DomainError::UnchangedWorkspaceSettings);
+        let event =
+            match command {
+                DomainCommand::UpdateWorkspaceSettings(settings) => {
+                    if settings == self.settings {
+                        return Err(DomainError::UnchangedWorkspaceSettings);
+                    }
+                    DomainEvent::WorkspaceSettingsChanged {
+                        from: self.settings.clone(),
+                        to: settings,
+                    }
                 }
-                DomainEvent::WorkspaceSettingsChanged {
-                    from: self.settings.clone(),
-                    to: settings,
+                DomainCommand::AddEnvironmentProfile(profile) => {
+                    DomainEvent::EnvironmentProfileAdded(profile)
                 }
-            }
-            DomainCommand::AddEnvironmentProfile(profile) => {
-                DomainEvent::EnvironmentProfileAdded(profile)
-            }
-            DomainCommand::UpdateEnvironmentProfile(profile) => {
-                let current = self.environment_profiles.get(&profile.id()).ok_or(
-                    DomainError::EntityNotFound(EntityRef::EnvironmentProfile(profile.id())),
-                )?;
-                if current == &profile {
-                    return Err(DomainError::UnchangedEnvironmentProfile);
+                DomainCommand::UpdateEnvironmentProfile(profile) => {
+                    let current = self.environment_profiles.get(&profile.id()).ok_or(
+                        DomainError::EntityNotFound(EntityRef::EnvironmentProfile(profile.id())),
+                    )?;
+                    if current == &profile {
+                        return Err(DomainError::UnchangedEnvironmentProfile);
+                    }
+                    DomainEvent::EnvironmentProfileChanged {
+                        from: current.clone(),
+                        to: profile,
+                    }
                 }
-                DomainEvent::EnvironmentProfileChanged {
-                    from: current.clone(),
-                    to: profile,
+                DomainCommand::RemoveEnvironmentProfile(profile_id) => {
+                    let profile = self.environment_profiles.get(&profile_id).ok_or(
+                        DomainError::EntityNotFound(EntityRef::EnvironmentProfile(profile_id)),
+                    )?;
+                    DomainEvent::EnvironmentProfileRemoved(profile.clone())
                 }
-            }
-            DomainCommand::RemoveEnvironmentProfile(profile_id) => {
-                let profile = self.environment_profiles.get(&profile_id).ok_or(
-                    DomainError::EntityNotFound(EntityRef::EnvironmentProfile(profile_id)),
-                )?;
-                DomainEvent::EnvironmentProfileRemoved(profile.clone())
-            }
-            DomainCommand::AddRole(role) => DomainEvent::RoleAdded(role),
-            DomainCommand::AddAgent(agent) => DomainEvent::AgentAdded(agent),
-            DomainCommand::AddTask(task) => DomainEvent::TaskAdded(task),
-            DomainCommand::AddHandoff(handoff) => DomainEvent::HandoffAdded(handoff),
-            DomainCommand::AddNode(node) => DomainEvent::NodeAdded(node),
-            DomainCommand::AddAgentNode { agent, node } => {
-                DomainEvent::AgentNodeAdded { agent, node }
-            }
-            DomainCommand::ReplaceCanvas { before, after } => {
-                DomainEvent::CanvasReplaced { before, after }
-            }
-            DomainCommand::TransitionAgent { agent_id, to } => {
-                let agent = self
-                    .agents
-                    .get(&agent_id)
-                    .ok_or(DomainError::EntityNotFound(EntityRef::Agent(agent_id)))?;
-                DomainEvent::AgentStateChanged {
-                    agent_id,
-                    from: agent.state(),
-                    to,
+                DomainCommand::AddCommandPreset(preset) => DomainEvent::CommandPresetAdded(preset),
+                DomainCommand::UpdateCommandPreset(preset) => {
+                    let current = self.command_presets.get(&preset.id()).ok_or(
+                        DomainError::EntityNotFound(EntityRef::CommandPreset(preset.id())),
+                    )?;
+                    if current == &preset {
+                        return Err(DomainError::UnchangedCommandPreset);
+                    }
+                    DomainEvent::CommandPresetChanged {
+                        from: current.clone(),
+                        to: preset,
+                    }
                 }
-            }
-            DomainCommand::TransitionTask { task_id, to } => {
-                let task = self
-                    .tasks
-                    .get(&task_id)
-                    .ok_or(DomainError::EntityNotFound(EntityRef::Task(task_id)))?;
-                DomainEvent::TaskStateChanged {
-                    task_id,
-                    from: task.state(),
-                    to,
+                DomainCommand::RemoveCommandPreset(preset_id) => {
+                    let preset =
+                        self.command_presets
+                            .get(&preset_id)
+                            .ok_or(DomainError::EntityNotFound(EntityRef::CommandPreset(
+                                preset_id,
+                            )))?;
+                    DomainEvent::CommandPresetRemoved(preset.clone())
                 }
-            }
-        };
+                DomainCommand::AddRole(role) => DomainEvent::RoleAdded(role),
+                DomainCommand::UpdateRole(role) => {
+                    let current = self
+                        .roles
+                        .get(&role.id())
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Role(role.id())))?;
+                    if current == &role {
+                        return Err(DomainError::UnchangedRole);
+                    }
+                    DomainEvent::RoleChanged {
+                        from: current.clone(),
+                        to: role,
+                    }
+                }
+                DomainCommand::RemoveRole(role_id) => {
+                    let role = self
+                        .roles
+                        .get(&role_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Role(role_id)))?;
+                    DomainEvent::RoleRemoved(role.clone())
+                }
+                DomainCommand::AssignAgentRole { agent_id, role_id } => {
+                    let agent = self
+                        .agents
+                        .get(&agent_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Agent(agent_id)))?;
+                    if agent.role_id() == role_id {
+                        return Err(DomainError::UnchangedAgentRole);
+                    }
+                    DomainEvent::AgentRoleChanged {
+                        agent_id,
+                        from: agent.role_id(),
+                        to: role_id,
+                    }
+                }
+                DomainCommand::AddAgent(agent) => DomainEvent::AgentAdded(agent),
+                DomainCommand::AddTask(task) => DomainEvent::TaskAdded(task),
+                DomainCommand::AddHandoff(handoff) => DomainEvent::HandoffAdded(handoff),
+                DomainCommand::AddNode(node) => DomainEvent::NodeAdded(node),
+                DomainCommand::AddAgentNode { agent, node } => {
+                    DomainEvent::AgentNodeAdded { agent, node }
+                }
+                DomainCommand::ReplaceCanvas { before, after } => {
+                    DomainEvent::CanvasReplaced { before, after }
+                }
+                DomainCommand::TransitionAgent { agent_id, to } => {
+                    let agent = self
+                        .agents
+                        .get(&agent_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Agent(agent_id)))?;
+                    DomainEvent::AgentStateChanged {
+                        agent_id,
+                        from: agent.state(),
+                        to,
+                    }
+                }
+                DomainCommand::TransitionTask { task_id, to } => {
+                    let task = self
+                        .tasks
+                        .get(&task_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Task(task_id)))?;
+                    DomainEvent::TaskStateChanged {
+                        task_id,
+                        from: task.state(),
+                        to,
+                    }
+                }
+            };
 
         self.apply(&event)?;
         Ok(event)
@@ -281,9 +349,101 @@ impl Workspace {
                 }
                 self.environment_profiles.remove(&profile.id());
             }
+            DomainEvent::CommandPresetAdded(preset) => {
+                self.ensure_absent(EntityRef::CommandPreset(preset.id()))?;
+                self.command_presets.insert(preset.id(), preset.clone());
+            }
+            DomainEvent::CommandPresetChanged { from, to } => {
+                let current =
+                    self.command_presets
+                        .get(&from.id())
+                        .ok_or(DomainError::EntityNotFound(EntityRef::CommandPreset(
+                            from.id(),
+                        )))?;
+                if current != from || to.id() != from.id() {
+                    return Err(DomainError::CommandPresetConflict(from.id()));
+                }
+                self.command_presets.insert(to.id(), to.clone());
+            }
+            DomainEvent::CommandPresetRemoved(preset) => {
+                let current =
+                    self.command_presets
+                        .get(&preset.id())
+                        .ok_or(DomainError::EntityNotFound(EntityRef::CommandPreset(
+                            preset.id(),
+                        )))?;
+                if current != preset {
+                    return Err(DomainError::CommandPresetConflict(preset.id()));
+                }
+                if let Some(agent) = self
+                    .agents
+                    .values()
+                    .find(|agent| agent.program() == super::AgentProgram::Custom(preset.id()))
+                {
+                    return Err(DomainError::CommandPresetInUse {
+                        preset_id: preset.id(),
+                        agent_id: agent.id(),
+                    });
+                }
+                self.command_presets.remove(&preset.id());
+            }
             DomainEvent::RoleAdded(role) => {
                 self.ensure_absent(EntityRef::Role(role.id()))?;
                 self.roles.insert(role.id(), role.clone());
+            }
+            DomainEvent::RoleChanged { from, to } => {
+                let current = self
+                    .roles
+                    .get(&from.id())
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Role(from.id())))?;
+                if current != from || to.id() != from.id() {
+                    return Err(DomainError::RoleConflict(from.id()));
+                }
+                self.roles.insert(to.id(), to.clone());
+            }
+            DomainEvent::RoleRemoved(role) => {
+                let current = self
+                    .roles
+                    .get(&role.id())
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Role(role.id())))?;
+                if current != role {
+                    return Err(DomainError::RoleConflict(role.id()));
+                }
+                if let Some(agent) = self
+                    .agents
+                    .values()
+                    .find(|agent| agent.role_id() == Some(role.id()))
+                {
+                    return Err(DomainError::RoleInUse {
+                        role_id: role.id(),
+                        agent_id: agent.id(),
+                    });
+                }
+                self.roles.remove(&role.id());
+            }
+            DomainEvent::AgentRoleChanged { agent_id, from, to } => {
+                let agent = self
+                    .agents
+                    .get(agent_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Agent(*agent_id)))?;
+                if agent.role_id() != *from {
+                    return Err(DomainError::AgentRoleConflict {
+                        agent_id: *agent_id,
+                        expected: *from,
+                        actual: agent.role_id(),
+                    });
+                }
+                if let Some(role_id) = to {
+                    self.ensure_reference(
+                        EntityRef::Agent(*agent_id),
+                        "role_id",
+                        EntityRef::Role(*role_id),
+                    )?;
+                }
+                self.agents
+                    .get_mut(agent_id)
+                    .expect("agent existence was checked before mutation")
+                    .set_role_id(*to);
             }
             DomainEvent::AgentAdded(agent) => {
                 self.ensure_absent(EntityRef::Agent(agent.id()))?;
@@ -299,6 +459,13 @@ impl Workspace {
                         EntityRef::Agent(agent.id()),
                         "environment_id",
                         EntityRef::EnvironmentProfile(environment_id),
+                    )?;
+                }
+                if let super::AgentProgram::Custom(preset_id) = agent.program() {
+                    self.ensure_reference(
+                        EntityRef::Agent(agent.id()),
+                        "program",
+                        EntityRef::CommandPreset(preset_id),
                     )?;
                 }
                 self.agents.insert(agent.id(), agent.clone());
@@ -378,6 +545,13 @@ impl Workspace {
                         EntityRef::Agent(agent.id()),
                         "environment_id",
                         EntityRef::EnvironmentProfile(environment_id),
+                    )?;
+                }
+                if let super::AgentProgram::Custom(preset_id) = agent.program() {
+                    self.ensure_reference(
+                        EntityRef::Agent(agent.id()),
+                        "program",
+                        EntityRef::CommandPreset(preset_id),
                     )?;
                 }
                 if node.target() != super::NodeTarget::Agent(agent.id()) {
@@ -506,6 +680,7 @@ impl Workspace {
         match entity {
             EntityRef::Workspace(id) => self.id == id,
             EntityRef::EnvironmentProfile(id) => self.environment_profiles.contains_key(&id),
+            EntityRef::CommandPreset(id) => self.command_presets.contains_key(&id),
             EntityRef::Role(id) => self.roles.contains_key(&id),
             EntityRef::Agent(id) => self.agents.contains_key(&id),
             EntityRef::Task(id) => self.tasks.contains_key(&id),

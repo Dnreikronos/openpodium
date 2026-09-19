@@ -2,9 +2,10 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use super::{
-    Agent, AgentId, AgentState, CanvasLayout, ConnectionId, EnvironmentProfile,
-    EnvironmentProfileId, Handoff, HandoffId, Node, NodeGroupId, NodeId, NodeTarget, Role, RoleId,
-    Task, TaskId, TaskState, TimelineEventId, Timestamp, WorkspaceId, WorkspaceSettings,
+    Agent, AgentId, AgentState, CanvasLayout, CommandPreset, CommandPresetId, ConnectionId,
+    EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, Node, NodeGroupId, NodeId,
+    NodeTarget, Role, RoleId, Task, TaskId, TaskState, TimelineEventId, Timestamp, WorkspaceId,
+    WorkspaceSettings,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,7 +14,16 @@ pub enum DomainCommand {
     AddEnvironmentProfile(EnvironmentProfile),
     UpdateEnvironmentProfile(EnvironmentProfile),
     RemoveEnvironmentProfile(EnvironmentProfileId),
+    AddCommandPreset(CommandPreset),
+    UpdateCommandPreset(CommandPreset),
+    RemoveCommandPreset(CommandPresetId),
     AddRole(Role),
+    UpdateRole(Role),
+    RemoveRole(RoleId),
+    AssignAgentRole {
+        agent_id: AgentId,
+        role_id: Option<RoleId>,
+    },
     AddAgent(Agent),
     AddTask(Task),
     AddHandoff(Handoff),
@@ -48,7 +58,23 @@ pub enum DomainEvent {
         to: EnvironmentProfile,
     },
     EnvironmentProfileRemoved(EnvironmentProfile),
+    CommandPresetAdded(CommandPreset),
+    CommandPresetChanged {
+        from: CommandPreset,
+        to: CommandPreset,
+    },
+    CommandPresetRemoved(CommandPreset),
     RoleAdded(Role),
+    RoleChanged {
+        from: Role,
+        to: Role,
+    },
+    RoleRemoved(Role),
+    AgentRoleChanged {
+        agent_id: AgentId,
+        from: Option<RoleId>,
+        to: Option<RoleId>,
+    },
     AgentAdded(Agent),
     TaskAdded(Task),
     HandoffAdded(Handoff),
@@ -117,6 +143,7 @@ impl TimelineEvent {
 pub enum EntityRef {
     Workspace(WorkspaceId),
     EnvironmentProfile(EnvironmentProfileId),
+    CommandPreset(CommandPresetId),
     Role(RoleId),
     Agent(AgentId),
     Task(TaskId),
@@ -132,6 +159,7 @@ impl Display for EntityRef {
         match self {
             Self::Workspace(id) => write!(formatter, "workspace {id}"),
             Self::EnvironmentProfile(id) => write!(formatter, "environment profile {id}"),
+            Self::CommandPreset(id) => write!(formatter, "command preset {id}"),
             Self::Role(id) => write!(formatter, "role {id}"),
             Self::Agent(id) => write!(formatter, "agent {id}"),
             Self::Task(id) => write!(formatter, "task {id}"),
@@ -163,6 +191,24 @@ pub enum DomainError {
     EnvironmentProfileInUse {
         profile_id: EnvironmentProfileId,
         agent_id: AgentId,
+    },
+    UnchangedCommandPreset,
+    CommandPresetConflict(CommandPresetId),
+    CommandPresetInUse {
+        preset_id: CommandPresetId,
+        agent_id: AgentId,
+    },
+    UnchangedRole,
+    RoleConflict(RoleId),
+    RoleInUse {
+        role_id: RoleId,
+        agent_id: AgentId,
+    },
+    UnchangedAgentRole,
+    AgentRoleConflict {
+        agent_id: AgentId,
+        expected: Option<RoleId>,
+        actual: Option<RoleId>,
     },
     CanvasConflict,
     DuplicateEntity(EntityRef),
@@ -245,6 +291,37 @@ impl Display for DomainError {
             } => write!(
                 formatter,
                 "environment profile {profile_id} is still used by agent {agent_id}"
+            ),
+            Self::UnchangedCommandPreset => formatter.write_str("command preset is unchanged"),
+            Self::CommandPresetConflict(id) => write!(
+                formatter,
+                "command preset {id} event does not match the current preset"
+            ),
+            Self::CommandPresetInUse {
+                preset_id,
+                agent_id,
+            } => write!(
+                formatter,
+                "command preset {preset_id} is still used by agent {agent_id}"
+            ),
+            Self::UnchangedRole => formatter.write_str("role is unchanged"),
+            Self::RoleConflict(id) => {
+                write!(formatter, "role {id} event does not match the current role")
+            }
+            Self::RoleInUse { role_id, agent_id } => {
+                write!(
+                    formatter,
+                    "role {role_id} is still used by agent {agent_id}"
+                )
+            }
+            Self::UnchangedAgentRole => formatter.write_str("agent role is unchanged"),
+            Self::AgentRoleConflict {
+                agent_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "agent {agent_id} role event expected {expected:?}, but current role is {actual:?}"
             ),
             Self::CanvasConflict => {
                 formatter.write_str("canvas edit does not match the current layout")

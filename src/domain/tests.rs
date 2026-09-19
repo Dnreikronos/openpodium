@@ -122,6 +122,173 @@ fn environment_profiles_validate_transport_fields() {
 }
 
 #[test]
+fn command_presets_and_role_appearance_validate_user_values() {
+    let preset = CommandPreset::new(
+        CommandPresetId::new(1),
+        name("Custom agent"),
+        "agent-cli",
+        vec!["--prompt".to_owned(), "$(touch /tmp/not-run)".to_owned()],
+    )
+    .unwrap();
+    assert_eq!(preset.arguments()[1], "$(touch /tmp/not-run)");
+    assert_eq!(
+        CommandPreset::new(
+            CommandPresetId::new(1),
+            name("Invalid"),
+            "bad\0program",
+            Vec::new(),
+        )
+        .unwrap_err()
+        .problem(),
+        AgentConfigurationProblem::ControlCharacter
+    );
+    assert_eq!(
+        RoleColor::new("purple").unwrap_err().problem(),
+        AgentConfigurationProblem::InvalidColor
+    );
+    assert_eq!(RoleColor::new("#a0bc9f").unwrap().as_str(), "#A0BC9F");
+    assert_eq!(
+        RoleIcon::new(" ").unwrap_err().problem(),
+        AgentConfigurationProblem::Empty
+    );
+}
+
+#[test]
+fn command_presets_are_added_updated_and_removed_explicitly() {
+    let mut workspace = test_workspace();
+    let id = CommandPresetId::new(1);
+    let original = CommandPreset::new(id, name("Agent"), "agent", vec!["run".to_owned()]).unwrap();
+    let changed =
+        CommandPreset::new(id, name("Agent"), "agent-v2", vec!["run".to_owned()]).unwrap();
+
+    assert_eq!(
+        workspace
+            .execute(DomainCommand::AddCommandPreset(original.clone()))
+            .unwrap(),
+        DomainEvent::CommandPresetAdded(original.clone())
+    );
+    assert_eq!(
+        workspace.execute(DomainCommand::UpdateCommandPreset(original.clone())),
+        Err(DomainError::UnchangedCommandPreset)
+    );
+    workspace
+        .execute(DomainCommand::UpdateCommandPreset(changed.clone()))
+        .unwrap();
+    assert_eq!(workspace.command_preset(id), Some(&changed));
+    workspace
+        .execute(DomainCommand::RemoveCommandPreset(id))
+        .unwrap();
+    assert!(workspace.command_preset(id).is_none());
+}
+
+#[test]
+fn custom_agent_programs_require_and_retain_their_command_preset() {
+    let mut workspace = test_workspace();
+    let preset_id = CommandPresetId::new(1);
+    let agent_id = AgentId::new(1);
+    let agent = Agent::with_program(
+        agent_id,
+        name("Custom builder"),
+        None,
+        AgentProgram::Custom(preset_id),
+    );
+
+    assert_eq!(
+        workspace.execute(DomainCommand::AddAgent(agent.clone())),
+        Err(DomainError::InvalidReference {
+            entity: EntityRef::Agent(agent_id),
+            field: "program",
+            target: EntityRef::CommandPreset(preset_id),
+        })
+    );
+
+    workspace
+        .execute(DomainCommand::AddCommandPreset(
+            CommandPreset::new(preset_id, name("Agent"), "agent-cli", Vec::new()).unwrap(),
+        ))
+        .unwrap();
+    workspace.execute(DomainCommand::AddAgent(agent)).unwrap();
+    assert_eq!(
+        workspace.execute(DomainCommand::RemoveCommandPreset(preset_id)),
+        Err(DomainError::CommandPresetInUse {
+            preset_id,
+            agent_id,
+        })
+    );
+}
+
+#[test]
+fn roles_can_change_and_agent_assignments_preserve_references() {
+    let mut workspace = test_workspace();
+    let role_id = RoleId::new(1);
+    let original = Role::with_appearance(
+        role_id,
+        name("Reviewer"),
+        RoleColor::new("#8B5CF6").unwrap(),
+        RoleIcon::new("review").unwrap(),
+        content("Review changes"),
+    );
+    workspace
+        .execute(DomainCommand::AddRole(original.clone()))
+        .unwrap();
+    workspace
+        .execute(DomainCommand::AddAgent(Agent::new(
+            AgentId::new(1),
+            name("Ada"),
+            None,
+        )))
+        .unwrap();
+
+    assert_eq!(
+        workspace
+            .execute(DomainCommand::AssignAgentRole {
+                agent_id: AgentId::new(1),
+                role_id: Some(role_id),
+            })
+            .unwrap(),
+        DomainEvent::AgentRoleChanged {
+            agent_id: AgentId::new(1),
+            from: None,
+            to: Some(role_id),
+        }
+    );
+    assert_eq!(
+        workspace.agent(AgentId::new(1)).unwrap().role_id(),
+        Some(role_id)
+    );
+    assert_eq!(
+        workspace.execute(DomainCommand::RemoveRole(role_id)),
+        Err(DomainError::RoleInUse {
+            role_id,
+            agent_id: AgentId::new(1),
+        })
+    );
+
+    let changed = Role::with_appearance(
+        role_id,
+        name("Senior reviewer"),
+        RoleColor::new("#2563EB").unwrap(),
+        RoleIcon::new("shield").unwrap(),
+        content("Review correctness and security"),
+    );
+    workspace
+        .execute(DomainCommand::UpdateRole(changed.clone()))
+        .unwrap();
+    assert_eq!(workspace.role(role_id), Some(&changed));
+
+    workspace
+        .execute(DomainCommand::AssignAgentRole {
+            agent_id: AgentId::new(1),
+            role_id: None,
+        })
+        .unwrap();
+    workspace
+        .execute(DomainCommand::RemoveRole(role_id))
+        .unwrap();
+    assert!(workspace.role(role_id).is_none());
+}
+
+#[test]
 fn environment_profiles_are_explicit_and_referenced_by_agents() {
     let mut workspace = test_workspace();
     let profile_id = EnvironmentProfileId::new(1);

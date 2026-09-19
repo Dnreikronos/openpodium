@@ -25,6 +25,7 @@ macro_rules! define_id {
 
 define_id!(WorkspaceId);
 define_id!(EnvironmentProfileId);
+define_id!(CommandPresetId);
 define_id!(RoleId);
 define_id!(AgentId);
 define_id!(TaskId);
