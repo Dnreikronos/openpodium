@@ -25,14 +25,22 @@ async fn interactive_shell_uses_working_directory_and_accepts_input() {
     process
         .write_input(shell_input_for_working_directory())
         .expect("input reaches shell");
-    process.close_input().expect("shell input closes");
-    let (output, termination) = collect_process(&mut process).await;
+    let mut output = collect_until_output(&mut process, b"__OPENPODIUM_READY__").await;
+    process
+        .write_input(shell_exit_input())
+        .expect("exit reaches shell");
+    let (remaining_output, termination) = collect_process(&mut process).await;
+    output.extend(remaining_output);
 
     let output = String::from_utf8_lossy(&output);
+    let expected_directory = expected_directory.to_string_lossy();
+    let expected_directory = expected_directory
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&expected_directory);
     assert!(output.contains("__OPENPODIUM_READY__"), "output: {output}");
     assert!(
-        output.contains(&expected_directory.to_string_lossy().replace('\\', "/"))
-            || output.contains(&expected_directory.to_string_lossy().to_string()),
+        output.contains(&expected_directory.replace('\\', "/"))
+            || output.contains(expected_directory),
         "output: {output}"
     );
     assert!(matches!(
@@ -57,8 +65,12 @@ async fn resize_is_visible_inside_the_child_terminal() {
     process
         .write_input(shell_input_for_terminal_size())
         .expect("terminal query reaches shell");
-    process.close_input().expect("shell input closes");
-    let (output, termination) = collect_process(&mut process).await;
+    let mut output = collect_until_output(&mut process, b"41 111").await;
+    process
+        .write_input(shell_exit_input())
+        .expect("exit reaches shell");
+    let (remaining_output, termination) = collect_process(&mut process).await;
+    output.extend(remaining_output);
 
     let output = String::from_utf8_lossy(&output);
     assert!(output.contains("41 111"), "output: {output}");
@@ -86,12 +98,14 @@ async fn exit_and_startup_failure_are_each_observed_once() {
     let mut process = LocalProcessRuntime
         .spawn(exiting_process(directory.path(), 7))
         .expect("child starts");
-    process.close_input().expect("child input closes");
     let (_, termination) = collect_process(&mut process).await;
-    assert!(matches!(
-        termination,
-        ProcessTermination::Exited(exit) if exit.code() == 7 && !exit.success()
-    ));
+    assert!(
+        matches!(
+            termination,
+            ProcessTermination::Exited(ref exit) if exit.code() == 7 && !exit.success()
+        ),
+        "termination: {termination:?}"
+    );
     assert_eq!(process.next_event().await, None);
     drop(process);
     wait_for_workers_to_stop().await;
@@ -142,6 +156,34 @@ async fn collect_process(process: &mut super::RunningProcess) -> (Vec<u8>, Proce
     .expect("process terminates before timeout")
 }
 
+async fn collect_until_output(process: &mut super::RunningProcess, expected: &[u8]) -> Vec<u8> {
+    timeout(TEST_TIMEOUT, async {
+        let mut output = Vec::new();
+        loop {
+            match process.next_event().await {
+                Some(ProcessEvent::Output(chunk)) => {
+                    output.extend(chunk);
+                    if output
+                        .windows(expected.len())
+                        .any(|window| window == expected)
+                    {
+                        return output;
+                    }
+                }
+                Some(ProcessEvent::Terminated(termination)) => {
+                    panic!(
+                        "process terminated before expected output: {termination:?}; output: {}",
+                        String::from_utf8_lossy(&output)
+                    );
+                }
+                None => panic!("process event stream ended before expected output"),
+            }
+        }
+    })
+    .await
+    .expect("process produces expected output before timeout")
+}
+
 async fn wait_for_workers_to_stop() {
     timeout(TEST_TIMEOUT, async {
         while active_workers() != 0 {
@@ -164,36 +206,56 @@ fn interactive_shell(directory: &Path) -> ProcessSpec {
 
 #[cfg(unix)]
 fn shell_input_for_working_directory() -> &'static [u8] {
-    b"printf '__OPENPODIUM_READY__\\n'; pwd; exit 0\n"
+    b"printf '__OPENPODIUM_READY__\\n'; pwd\n"
 }
 
 #[cfg(windows)]
 fn shell_input_for_working_directory() -> &'static [u8] {
-    b"echo __OPENPODIUM_READY__& cd & exit /b 0\r"
+    b"echo __OPENPODIUM_READY__& cd\r"
 }
 
 #[cfg(unix)]
 fn shell_input_for_terminal_size() -> &'static [u8] {
-    b"stty size; exit 0\n"
+    b"stty size\n"
 }
 
 #[cfg(windows)]
 fn shell_input_for_terminal_size() -> &'static [u8] {
-    b"powershell.exe -NoLogo -NoProfile -Command \"$s=$Host.UI.RawUI.WindowSize; Write-Output ('{0} {1}' -f $s.Height,$s.Width)\" & exit /b 0\r"
+    b"powershell.exe -NoLogo -NoProfile -Command \"$s=$Host.UI.RawUI.WindowSize; Write-Output ('{0} {1}' -f $s.Height,$s.Width)\"\r"
+}
+
+fn exiting_process(directory: &Path, code: u8) -> ProcessSpec {
+    ProcessSpec::new(
+        std::env::current_exe().expect("current test executable"),
+        directory,
+    )
+    .args([
+        "--exact",
+        "runtime::tests::pty_child_exits_with_requested_code",
+        "--ignored",
+        "--nocapture",
+    ])
+    .env("OPENPODIUM_TEST_EXIT_CODE", code.to_string())
+}
+
+#[test]
+#[ignore = "spawned as a PTY subprocess by the runtime tests"]
+fn pty_child_exits_with_requested_code() {
+    let code = std::env::var("OPENPODIUM_TEST_EXIT_CODE")
+        .expect("requested exit code")
+        .parse()
+        .expect("numeric exit code");
+    std::process::exit(code);
 }
 
 #[cfg(unix)]
-fn exiting_process(directory: &Path, code: u8) -> ProcessSpec {
-    ProcessSpec::new("/bin/sh", directory)
-        .arg("-c")
-        .arg(format!("exit {code}"))
+fn shell_exit_input() -> &'static [u8] {
+    b"exit 0\n"
 }
 
 #[cfg(windows)]
-fn exiting_process(directory: &Path, code: u8) -> ProcessSpec {
-    ProcessSpec::new("cmd.exe", directory)
-        .args(["/Q", "/C"])
-        .arg(format!("exit /b {code}"))
+fn shell_exit_input() -> &'static [u8] {
+    b"exit /b 0\r"
 }
 
 #[cfg(unix)]

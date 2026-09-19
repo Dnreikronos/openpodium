@@ -41,11 +41,10 @@ an already-finished process is avoided, and cancellation is idempotent.
 
 PTY input and output are opaque byte sequences. Input writes are serialized and
 write directly to the PTY, so operating-system flow control applies without an
-unbounded userspace input queue. Closing input explicitly drops the PTY writer
-and delivers end-of-file to the child. Output is read in fixed-size chunks and
-sent through a bounded Tokio channel. When the consumer falls behind, the
-reader blocks at the configured bound and the PTY applies backpressure; output
-is not silently dropped.
+unbounded userspace input queue. Output is read in fixed-size chunks and sent
+through a bounded Tokio channel. When the consumer falls behind, the reader
+blocks at the configured bound and the PTY applies backpressure; output is not
+silently dropped.
 
 Output and termination use separate channels. A full output queue therefore
 cannot hide or duplicate process termination. Cancellation closes the output
