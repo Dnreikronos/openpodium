@@ -9,14 +9,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Task, Theme, clipboard};
 use openpodium::domain::{
-    Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, ContainerEnvironment,
-    CustomEnvironment, DomainCommand, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId,
-    Name, Node, NodeId, NodeTarget, SshEnvironment, Timestamp, Workspace, WorkspaceDirectory,
+    Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, CommandPreset,
+    CommandPresetId, ContainerEnvironment, Content, CustomEnvironment, DomainCommand,
+    EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Name, Node, NodeId, NodeTarget,
+    Role, RoleColor, RoleIcon, RoleId, SshEnvironment, Timestamp, Workspace, WorkspaceDirectory,
     WorkspaceId,
 };
+use openpodium::persistence::{export_role, import_role};
 use openpodium::runtime::{
     EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, RuntimeError,
-    check_environment, prepare_environment_process,
+    check_agent_capability, check_environment, prepare_environment_process,
 };
 use openpodium::workspaces::{WorkspaceManager, WorkspaceSettingsInput};
 use tokio::sync::Mutex;
@@ -66,6 +68,16 @@ struct OpenPodium {
     environment_directory: String,
     environment_arguments: String,
     environment_health: BTreeMap<(WorkspaceId, EnvironmentProfileId), EnvironmentHealth>,
+    selected_role: Option<RoleId>,
+    editing_preset: Option<CommandPresetId>,
+    preset_name: String,
+    preset_executable: String,
+    preset_arguments: String,
+    editing_role: Option<RoleId>,
+    role_name: String,
+    role_color: String,
+    role_icon: String,
+    role_instructions: String,
     notice: Option<String>,
 }
 
@@ -102,6 +114,16 @@ impl Default for OpenPodium {
             environment_directory: String::new(),
             environment_arguments: String::new(),
             environment_health: BTreeMap::new(),
+            selected_role: None,
+            editing_preset: None,
+            preset_name: String::new(),
+            preset_executable: String::new(),
+            preset_arguments: String::new(),
+            editing_role: None,
+            role_name: String::new(),
+            role_color: RoleColor::DEFAULT.to_owned(),
+            role_icon: RoleIcon::DEFAULT.to_owned(),
+            role_instructions: String::new(),
             notice,
         };
         state.load_active_settings();
@@ -113,6 +135,7 @@ impl Default for OpenPodium {
 enum Message {
     Canvas(canvas::Message),
     AddAgent(AgentProgram),
+    PreviewAgent(AgentProgram),
     CanvasAction(CanvasAction),
     CreateDirectoryChanged(String),
     CreateWorkspace,
@@ -138,6 +161,24 @@ enum Message {
         profile_id: EnvironmentProfileId,
         health: EnvironmentHealth,
     },
+    PresetNameChanged(String),
+    PresetExecutableChanged(String),
+    PresetArgumentsChanged(String),
+    SavePreset,
+    EditPreset(CommandPresetId),
+    RemovePreset(CommandPresetId),
+    SelectRole(Option<RoleId>),
+    AssignRoleToSelected(Option<RoleId>),
+    RoleNameChanged(String),
+    RoleColorChanged(String),
+    RoleIconChanged(String),
+    RoleInstructionsChanged(String),
+    SaveRole,
+    EditRole(RoleId),
+    RemoveRole(RoleId),
+    ExportRole(RoleId),
+    ImportRole,
+    RoleImportRead(Option<String>),
     StartTerminal(NodeId),
     StopTerminal(NodeId),
     TerminalStarted {
@@ -184,6 +225,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
         Message::Canvas(message) => return handle_canvas_message(state, message),
         Message::AddAgent(program) => return add_agent(state, program),
+        Message::PreviewAgent(program) => preview_agent(state, program),
         Message::CanvasAction(action) => apply_canvas_action(state, action),
         Message::CreateDirectoryChanged(value) => state.create_directory = value,
         Message::NameChanged(value) => state.name = value,
@@ -200,6 +242,13 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::EnvironmentPortChanged(value) => state.environment_port = value,
         Message::EnvironmentDirectoryChanged(value) => state.environment_directory = value,
         Message::EnvironmentArgumentsChanged(value) => state.environment_arguments = value,
+        Message::PresetNameChanged(value) => state.preset_name = value,
+        Message::PresetExecutableChanged(value) => state.preset_executable = value,
+        Message::PresetArgumentsChanged(value) => state.preset_arguments = value,
+        Message::RoleNameChanged(value) => state.role_name = value,
+        Message::RoleColorChanged(value) => state.role_color = value,
+        Message::RoleIconChanged(value) => state.role_icon = value,
+        Message::RoleInstructionsChanged(value) => state.role_instructions = value,
         Message::CreateWorkspace => {
             let result = state
                 .workspaces
@@ -286,6 +335,17 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
                 state.notice = Some(format!("Environment health: {}", health.label()));
             }
         }
+        Message::SavePreset => save_preset(state),
+        Message::EditPreset(preset_id) => edit_preset(state, preset_id),
+        Message::RemovePreset(preset_id) => remove_preset(state, preset_id),
+        Message::SelectRole(role_id) => state.selected_role = role_id,
+        Message::AssignRoleToSelected(role_id) => assign_role_to_selected(state, role_id),
+        Message::SaveRole => save_role(state),
+        Message::EditRole(role_id) => edit_role(state, role_id),
+        Message::RemoveRole(role_id) => remove_role(state, role_id),
+        Message::ExportRole(role_id) => return export_role_to_clipboard(state, role_id),
+        Message::ImportRole => return clipboard::read().map(Message::RoleImportRead),
+        Message::RoleImportRead(payload) => import_role_from_clipboard(state, payload.as_deref()),
         Message::StartTerminal(node_id) => return start_terminal(state, node_id),
         Message::StopTerminal(node_id) => stop_terminal(state, node_id),
         Message::TerminalStarted {
@@ -374,9 +434,25 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         row![
             button("Codex").on_press(Message::AddAgent(AgentProgram::Codex)),
             button("Claude").on_press(Message::AddAgent(AgentProgram::Claude)),
+            button("OpenCode").on_press(Message::AddAgent(AgentProgram::OpenCode)),
             button("Shell").on_press(Message::AddAgent(AgentProgram::Shell)),
         ]
         .spacing(8),
+        row![
+            button("Preview Codex").on_press(Message::PreviewAgent(AgentProgram::Codex)),
+            button("Preview Claude").on_press(Message::PreviewAgent(AgentProgram::Claude)),
+            button("Preview OpenCode").on_press(Message::PreviewAgent(AgentProgram::OpenCode)),
+            button("Preview shell").on_press(Message::PreviewAgent(AgentProgram::Shell)),
+        ]
+        .spacing(8),
+        text(format!(
+            "Local tools: Codex {} · Claude {} · OpenCode {} · shell {}",
+            capability_label(AgentProgram::Codex, None),
+            capability_label(AgentProgram::Claude, None),
+            capability_label(AgentProgram::OpenCode, None),
+            capability_label(AgentProgram::Shell, None),
+        ))
+        .size(12),
         text("Runtime environment for new agents").size(18),
         button(if state.selected_environment.is_none() {
             "✓ Local workspace"
@@ -445,6 +521,94 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .as_ref()
         .and_then(WorkspaceManager::active_workspace)
     {
+        settings = settings.push(text("Reusable roles").size(18)).push(
+            row![
+                button(if state.selected_role.is_none() {
+                    "✓ No role"
+                } else {
+                    "No role"
+                })
+                .on_press(Message::SelectRole(None)),
+                button("Clear selected agent role").on_press(Message::AssignRoleToSelected(None)),
+                button("Import role from clipboard").on_press(Message::ImportRole),
+            ]
+            .spacing(8),
+        );
+        for role in workspace.roles() {
+            let selected = state.selected_role == Some(role.id());
+            let label = format!("{} {} ({})", role.icon(), role.name(), role.color());
+            settings = settings.push(
+                row![
+                    button(text(if selected {
+                        format!("✓ {label}")
+                    } else {
+                        label
+                    }))
+                    .on_press(Message::SelectRole(Some(role.id()))),
+                    button("Assign").on_press(Message::AssignRoleToSelected(Some(role.id()))),
+                    button("Edit").on_press(Message::EditRole(role.id())),
+                    button("Export").on_press(Message::ExportRole(role.id())),
+                    button("Delete").on_press(Message::RemoveRole(role.id())),
+                ]
+                .spacing(8),
+            );
+        }
+        settings = settings
+            .push(text_input("Role name", &state.role_name).on_input(Message::RoleNameChanged))
+            .push(
+                row![
+                    text_input("#RRGGBB", &state.role_color).on_input(Message::RoleColorChanged),
+                    text_input("Icon", &state.role_icon).on_input(Message::RoleIconChanged),
+                ]
+                .spacing(8),
+            )
+            .push(
+                text_input("Role instructions", &state.role_instructions)
+                    .on_input(Message::RoleInstructionsChanged),
+            )
+            .push(
+                button(if state.editing_role.is_some() {
+                    "Update role"
+                } else {
+                    "Create role"
+                })
+                .on_press(Message::SaveRole),
+            )
+            .push(text("Custom command presets").size(18));
+        for preset in workspace.command_presets() {
+            let program = AgentProgram::Custom(preset.id());
+            settings = settings.push(
+                row![
+                    button(text(format!("Add {}", preset.name())))
+                        .on_press(Message::AddAgent(program)),
+                    button("Preview").on_press(Message::PreviewAgent(program)),
+                    text(capability_label(program, Some(preset))).size(12),
+                    button("Edit").on_press(Message::EditPreset(preset.id())),
+                    button("Delete").on_press(Message::RemovePreset(preset.id())),
+                ]
+                .spacing(8),
+            );
+        }
+        settings = settings
+            .push(
+                text_input("Preset name", &state.preset_name).on_input(Message::PresetNameChanged),
+            )
+            .push(
+                text_input("Executable", &state.preset_executable)
+                    .on_input(Message::PresetExecutableChanged),
+            )
+            .push(
+                text_input("Arguments as a JSON array", &state.preset_arguments)
+                    .on_input(Message::PresetArgumentsChanged),
+            )
+            .push(
+                button(if state.editing_preset.is_some() {
+                    "Update preset"
+                } else {
+                    "Create preset"
+                })
+                .on_press(Message::SavePreset),
+            );
         for profile in workspace.environment_profiles() {
             let selected = state.selected_environment == Some(profile.id());
             let label = if selected {
@@ -644,6 +808,9 @@ impl OpenPodium {
             self.working_directory.clear();
             self.instructions.clear();
             self.selected_environment = None;
+            self.selected_role = None;
+            clear_preset_draft(self);
+            clear_role_draft(self);
             return;
         };
 
@@ -661,6 +828,9 @@ impl OpenPodium {
             .instructions()
             .map_or_else(String::new, |instructions| instructions.as_str().to_owned());
         self.selected_environment = None;
+        self.selected_role = None;
+        clear_preset_draft(self);
+        clear_role_draft(self);
     }
 }
 
@@ -941,8 +1111,379 @@ fn check_environment_task(
     )
 }
 
+fn preview_agent(state: &mut OpenPodium, program: AgentProgram) {
+    let Some((preset, role, profile, working_directory)) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| {
+            let preset = match program {
+                AgentProgram::Custom(preset_id) => workspace.command_preset(preset_id).cloned(),
+                _ => None,
+            };
+            let role = state
+                .selected_role
+                .and_then(|role_id| workspace.role(role_id))
+                .cloned();
+            let profile = state
+                .selected_environment
+                .and_then(|environment_id| workspace.environment_profile(environment_id))
+                .cloned();
+            Some((
+                preset,
+                role,
+                profile,
+                PathBuf::from(workspace.settings().working_directory()?.as_str()),
+            ))
+        })
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+
+    let capability = check_agent_capability(program, preset.as_ref())
+        .map(|capability| {
+            if capability.installed() {
+                "installed locally".to_owned()
+            } else {
+                capability
+                    .setup_guidance()
+                    .unwrap_or("missing locally")
+                    .to_owned()
+            }
+        })
+        .unwrap_or_else(|error| error.to_string());
+    let result = session::process_spec(
+        program,
+        preset.as_ref(),
+        role.as_ref(),
+        &working_directory,
+        terminal::GridSize::for_node(640.0, 480.0),
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|spec| {
+        prepare_environment_process(profile.as_ref(), spec).map_err(|error| error.to_string())
+    });
+    state.notice = Some(match result {
+        Ok(spec) => format!("{capability}\n{}", format_process_preview(&spec)),
+        Err(error) => error,
+    });
+}
+
+fn format_process_preview(spec: &openpodium::runtime::ProcessSpec) -> String {
+    let arguments = spec
+        .arguments()
+        .iter()
+        .map(|argument| format!("{argument:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let environment = spec
+        .environment()
+        .iter()
+        .map(|(name, value)| format!("{name:?}={value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "program: {:?}\narguments: [{arguments}]\nenvironment: [{environment}]",
+        spec.program()
+    )
+}
+
+fn capability_label(program: AgentProgram, preset: Option<&CommandPreset>) -> &'static str {
+    match check_agent_capability(program, preset) {
+        Ok(capability) if capability.installed() => "installed",
+        Ok(_) => "missing",
+        Err(_) => "invalid",
+    }
+}
+
+fn save_preset(state: &mut OpenPodium) {
+    let Some((workspace_id, preset_id)) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| {
+            Some((
+                workspace.id(),
+                state
+                    .editing_preset
+                    .or_else(|| next_command_preset_id(workspace))?,
+            ))
+        })
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+    let result = parse_argument_array(&state.preset_arguments, "preset arguments")
+        .and_then(|arguments| {
+            CommandPreset::new(
+                preset_id,
+                Name::new(state.preset_name.clone()).map_err(|error| error.to_string())?,
+                state.preset_executable.clone(),
+                arguments,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .and_then(|preset| {
+            state
+                .workspaces
+                .as_mut()
+                .expect("active workspace was checked")
+                .execute(
+                    workspace_id,
+                    if state.editing_preset.is_some() {
+                        DomainCommand::UpdateCommandPreset(preset)
+                    } else {
+                        DomainCommand::AddCommandPreset(preset)
+                    },
+                    now(),
+                )
+                .map_err(|error| error.to_string())
+        });
+    state.notice = Some(match result {
+        Ok(_) => {
+            clear_preset_draft(state);
+            "Command preset saved; reconnect custom agents to apply changes".to_owned()
+        }
+        Err(error) => error,
+    });
+}
+
+fn edit_preset(state: &mut OpenPodium, preset_id: CommandPresetId) {
+    let preset = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| workspace.command_preset(preset_id))
+        .cloned();
+    let Some(preset) = preset else {
+        state.notice = Some(format!("Command preset {preset_id} does not exist"));
+        return;
+    };
+    state.editing_preset = Some(preset_id);
+    state.preset_name = preset.name().as_str().to_owned();
+    state.preset_executable = preset.executable().to_owned();
+    state.preset_arguments = serde_json::to_string(preset.arguments())
+        .expect("serializing preset arguments cannot fail");
+}
+
+fn remove_preset(state: &mut OpenPodium, preset_id: CommandPresetId) {
+    let Some(workspace_id) = active_workspace_id(state) else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+    let result = state
+        .workspaces
+        .as_mut()
+        .expect("active workspace was checked")
+        .execute(
+            workspace_id,
+            DomainCommand::RemoveCommandPreset(preset_id),
+            now(),
+        );
+    state.notice = Some(match result {
+        Ok(_) => {
+            if state.editing_preset == Some(preset_id) {
+                clear_preset_draft(state);
+            }
+            "Command preset deleted".to_owned()
+        }
+        Err(error) => error.to_string(),
+    });
+}
+
+fn save_role(state: &mut OpenPodium) {
+    let Some((workspace_id, role_id)) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| {
+            Some((
+                workspace.id(),
+                state.editing_role.or_else(|| next_role_id(workspace))?,
+            ))
+        })
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+    let role = Name::new(state.role_name.clone())
+        .map_err(|error| error.to_string())
+        .and_then(|name| {
+            Ok(Role::with_appearance(
+                role_id,
+                name,
+                RoleColor::new(state.role_color.clone()).map_err(|error| error.to_string())?,
+                RoleIcon::new(state.role_icon.clone()).map_err(|error| error.to_string())?,
+                Content::new(state.role_instructions.clone()).map_err(|error| error.to_string())?,
+            ))
+        })
+        .and_then(|role| {
+            state
+                .workspaces
+                .as_mut()
+                .expect("active workspace was checked")
+                .execute(
+                    workspace_id,
+                    if state.editing_role.is_some() {
+                        DomainCommand::UpdateRole(role)
+                    } else {
+                        DomainCommand::AddRole(role)
+                    },
+                    now(),
+                )
+                .map_err(|error| error.to_string())
+        });
+    state.notice = Some(match role {
+        Ok(_) => {
+            state.selected_role = Some(role_id);
+            clear_role_draft(state);
+            "Role saved; reconnect assigned agents to apply changes".to_owned()
+        }
+        Err(error) => error,
+    });
+}
+
+fn edit_role(state: &mut OpenPodium, role_id: RoleId) {
+    let role = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| workspace.role(role_id))
+        .cloned();
+    let Some(role) = role else {
+        state.notice = Some(format!("Role {role_id} does not exist"));
+        return;
+    };
+    state.editing_role = Some(role_id);
+    state.role_name = role.name().as_str().to_owned();
+    state.role_color = role.color().as_str().to_owned();
+    state.role_icon = role.icon().as_str().to_owned();
+    state.role_instructions = role.instructions().as_str().to_owned();
+}
+
+fn remove_role(state: &mut OpenPodium, role_id: RoleId) {
+    let Some(workspace_id) = active_workspace_id(state) else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+    let result = state
+        .workspaces
+        .as_mut()
+        .expect("active workspace was checked")
+        .execute(workspace_id, DomainCommand::RemoveRole(role_id), now());
+    state.notice = Some(match result {
+        Ok(_) => {
+            if state.selected_role == Some(role_id) {
+                state.selected_role = None;
+            }
+            if state.editing_role == Some(role_id) {
+                clear_role_draft(state);
+            }
+            "Role deleted".to_owned()
+        }
+        Err(error) => error.to_string(),
+    });
+}
+
+fn assign_role_to_selected(state: &mut OpenPodium, role_id: Option<RoleId>) {
+    let Some((workspace_id, agent_id)) = selected_agent(state) else {
+        state.notice = Some("Select an agent node first".to_owned());
+        return;
+    };
+    let result = state
+        .workspaces
+        .as_mut()
+        .expect("selected agent belongs to a workspace")
+        .execute(
+            workspace_id,
+            DomainCommand::AssignAgentRole { agent_id, role_id },
+            now(),
+        );
+    state.notice = Some(match result {
+        Ok(_) => "Agent role updated; reconnect to apply it".to_owned(),
+        Err(error) => error.to_string(),
+    });
+}
+
+fn export_role_to_clipboard(state: &mut OpenPodium, role_id: RoleId) -> Task<Message> {
+    let result = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| workspace.role(role_id))
+        .ok_or_else(|| format!("Role {role_id} does not exist"))
+        .and_then(|role| export_role(role).map_err(|error| error.to_string()));
+    match result {
+        Ok(payload) => {
+            state.notice = Some("Role JSON copied to the clipboard".to_owned());
+            clipboard::write(payload)
+        }
+        Err(error) => {
+            state.notice = Some(error);
+            Task::none()
+        }
+    }
+}
+
+fn import_role_from_clipboard(state: &mut OpenPodium, payload: Option<&str>) {
+    let Some(payload) = payload else {
+        state.notice = Some("The clipboard does not contain text".to_owned());
+        return;
+    };
+    let Some((workspace_id, role_id)) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| Some((workspace.id(), next_role_id(workspace)?)))
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+    let result = import_role(payload, role_id)
+        .map_err(|error| error.to_string())
+        .and_then(|role| {
+            state
+                .workspaces
+                .as_mut()
+                .expect("active workspace was checked")
+                .execute(workspace_id, DomainCommand::AddRole(role), now())
+                .map_err(|error| error.to_string())
+        });
+    state.notice = Some(match result {
+        Ok(_) => {
+            state.selected_role = Some(role_id);
+            "Role imported".to_owned()
+        }
+        Err(error) => error,
+    });
+}
+
+fn parse_argument_array(value: &str, field: &str) -> Result<Vec<String>, String> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(value)
+        .map_err(|error| format!("{field} must be a JSON string array: {error}"))
+}
+
+fn clear_preset_draft(state: &mut OpenPodium) {
+    state.editing_preset = None;
+    state.preset_name.clear();
+    state.preset_executable.clear();
+    state.preset_arguments.clear();
+}
+
+fn clear_role_draft(state: &mut OpenPodium) {
+    state.editing_role = None;
+    state.role_name.clear();
+    state.role_color = RoleColor::DEFAULT.to_owned();
+    state.role_icon = RoleIcon::DEFAULT.to_owned();
+    state.role_instructions.clear();
+}
+
 fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
-    let Some((workspace_id, agent_id, node_id, before, node, environment_id)) = state
+    let Some((workspace_id, agent_id, node_id, before, node, environment_id, role_id)) = state
         .workspaces
         .as_ref()
         .and_then(WorkspaceManager::active_workspace)
@@ -972,6 +1513,9 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
             let environment_id = state
                 .selected_environment
                 .filter(|environment_id| workspace.environment_profile(*environment_id).is_some());
+            let role_id = state
+                .selected_role
+                .filter(|role_id| workspace.role(*role_id).is_some());
             Some((
                 workspace.id(),
                 agent_id,
@@ -979,17 +1523,18 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
                 before,
                 node,
                 environment_id,
+                role_id,
             ))
         })
     else {
         state.notice = Some("Create or select a workspace first".to_owned());
         return Task::none();
     };
-    let label = agent_program_name(program);
+    let label = program.label();
     let mut agent = Agent::with_program(
         agent_id,
         Name::new(format!("{label} {}", agent_id.get())).expect("generated agent name is valid"),
-        None,
+        role_id,
         program,
     );
     if let Some(environment_id) = environment_id {
@@ -1019,7 +1564,7 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
 }
 
 fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
-    let Some((workspace_id, program, profile, working_directory, size)) = state
+    let Some((workspace_id, program, preset, role, profile, working_directory, size)) = state
         .workspaces
         .as_ref()
         .and_then(WorkspaceManager::active_workspace)
@@ -1034,9 +1579,19 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
                 .environment_id()
                 .and_then(|environment_id| workspace.environment_profile(environment_id))
                 .cloned();
+            let preset = match agent.program() {
+                AgentProgram::Custom(preset_id) => workspace.command_preset(preset_id).cloned(),
+                _ => None,
+            };
+            let role = agent
+                .role_id()
+                .and_then(|role_id| workspace.role(role_id))
+                .cloned();
             Some((
                 workspace.id(),
                 agent.program(),
+                preset,
+                role,
                 profile,
                 PathBuf::from(working_directory),
                 terminal::GridSize::for_node(node.size().width(), node.size().height()),
@@ -1057,10 +1612,31 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
         return Task::none();
     }
 
-    let spec = match prepare_environment_process(
-        profile.as_ref(),
-        session::process_spec(program, &working_directory, size),
-    ) {
+    if profile.is_none() {
+        match check_agent_capability(program, preset.as_ref()) {
+            Ok(capability) if !capability.installed() => {
+                state.notice = capability.setup_guidance().map(str::to_owned);
+                return Task::none();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                state.notice = Some(error.to_string());
+                return Task::none();
+            }
+        }
+    }
+
+    let spec = match session::process_spec(
+        program,
+        preset.as_ref(),
+        role.as_ref(),
+        &working_directory,
+        size,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|spec| {
+        prepare_environment_process(profile.as_ref(), spec).map_err(|error| error.to_string())
+    }) {
         Ok(spec) => spec,
         Err(error) => {
             state.notice = Some(error.to_string());
@@ -1395,6 +1971,15 @@ fn selected_terminal_node(state: &OpenPodium) -> Option<NodeId> {
     })
 }
 
+fn selected_agent(state: &OpenPodium) -> Option<(WorkspaceId, AgentId)> {
+    let workspace = state.workspaces.as_ref()?.active_workspace()?;
+    let node = workspace.node(selected_terminal_node(state)?)?;
+    let NodeTarget::Agent(agent_id) = node.target() else {
+        return None;
+    };
+    Some((workspace.id(), agent_id))
+}
+
 fn active_workspace_id(state: &OpenPodium) -> Option<WorkspaceId> {
     state
         .workspaces
@@ -1456,16 +2041,30 @@ fn next_environment_profile_id(workspace: &Workspace) -> Option<EnvironmentProfi
     }
 }
 
-fn canvas_coordinate(value: f64) -> f32 {
-    value.clamp(-1_000_000_000.0, 1_000_000_000.0) as f32
+fn next_command_preset_id(workspace: &Workspace) -> Option<CommandPresetId> {
+    let mut value = 1_u64;
+    loop {
+        let id = CommandPresetId::new(value);
+        if workspace.command_preset(id).is_none() {
+            return Some(id);
+        }
+        value = value.checked_add(1)?;
+    }
 }
 
-fn agent_program_name(program: AgentProgram) -> &'static str {
-    match program {
-        AgentProgram::Codex => "Codex",
-        AgentProgram::Claude => "Claude",
-        AgentProgram::Shell => "Shell",
+fn next_role_id(workspace: &Workspace) -> Option<RoleId> {
+    let mut value = 1_u64;
+    loop {
+        let id = RoleId::new(value);
+        if workspace.role(id).is_none() {
+            return Some(id);
+        }
+        value = value.checked_add(1)?;
     }
+}
+
+fn canvas_coordinate(value: f64) -> f32 {
+    value.clamp(-1_000_000_000.0, 1_000_000_000.0) as f32
 }
 
 fn application_database_path() -> Result<PathBuf, std::io::Error> {
@@ -1557,6 +2156,16 @@ mod tests {
             environment_directory: String::new(),
             environment_arguments: String::new(),
             environment_health: BTreeMap::new(),
+            selected_role: None,
+            editing_preset: None,
+            preset_name: String::new(),
+            preset_executable: String::new(),
+            preset_arguments: String::new(),
+            editing_role: None,
+            role_name: String::new(),
+            role_color: RoleColor::DEFAULT.to_owned(),
+            role_icon: RoleIcon::DEFAULT.to_owned(),
+            role_instructions: String::new(),
             notice: None,
         };
 
@@ -1610,6 +2219,54 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn preset_and_role_controls_persist_safe_agent_configuration() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        workspaces
+            .create_workspace(&project, Timestamp::from_unix_millis(1))
+            .unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        state.preset_name = "Safe custom".to_owned();
+        state.preset_executable = "/openpodium/does/not/exist".to_owned();
+        state.preset_arguments = r#"["--prompt","$(touch /tmp/unsafe)"]"#.to_owned();
+        save_preset(&mut state);
+        state.role_name = "Reviewer".to_owned();
+        state.role_color = "#8B5CF6".to_owned();
+        state.role_icon = "review".to_owned();
+        state.role_instructions = "Review for regressions".to_owned();
+        save_role(&mut state);
+
+        let _task = add_agent(&mut state, AgentProgram::Custom(CommandPresetId::new(1)));
+        preview_agent(&mut state, AgentProgram::Custom(CommandPresetId::new(1)));
+
+        let workspace = state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .active_workspace()
+            .unwrap();
+        let agent = workspace.agent(AgentId::new(1)).unwrap();
+        assert_eq!(agent.role_id(), Some(RoleId::new(1)));
+        assert_eq!(
+            agent.program(),
+            AgentProgram::Custom(CommandPresetId::new(1))
+        );
+        assert_eq!(
+            workspace
+                .command_preset(CommandPresetId::new(1))
+                .unwrap()
+                .arguments(),
+            ["--prompt", "$(touch /tmp/unsafe)"]
+        );
+        let preview = state.notice.as_deref().unwrap();
+        assert!(preview.contains("arguments: [\"--prompt\", \"$(touch /tmp/unsafe)\"]"));
+        assert!(preview.contains("OPENPODIUM_ROLE_INSTRUCTIONS"));
     }
 
     #[test]
@@ -1705,6 +2362,16 @@ mod tests {
             environment_directory: String::new(),
             environment_arguments: String::new(),
             environment_health: BTreeMap::new(),
+            selected_role: None,
+            editing_preset: None,
+            preset_name: String::new(),
+            preset_executable: String::new(),
+            preset_arguments: String::new(),
+            editing_role: None,
+            role_name: String::new(),
+            role_color: RoleColor::DEFAULT.to_owned(),
+            role_icon: RoleIcon::DEFAULT.to_owned(),
+            role_instructions: String::new(),
             notice: None,
         }
     }

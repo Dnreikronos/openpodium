@@ -1,10 +1,10 @@
-use std::env;
 use std::path::Path;
 use std::sync::Arc;
 
-use openpodium::domain::AgentProgram;
+use openpodium::domain::{AgentProgram, CommandPreset, Role};
 use openpodium::runtime::{
-    ProcessController, ProcessEvent, ProcessSpec, ProcessTermination, RunningProcess, TerminalSize,
+    AgentAdapterError, ProcessController, ProcessEvent, ProcessSpec, ProcessTermination,
+    RunningProcess, TerminalSize, prepare_agent_process,
 };
 use tokio::sync::Mutex;
 
@@ -177,31 +177,17 @@ impl Drop for Session {
 
 pub(crate) fn process_spec(
     program: AgentProgram,
+    preset: Option<&CommandPreset>,
+    role: Option<&Role>,
     working_directory: &Path,
     size: GridSize,
-) -> ProcessSpec {
-    let spec = match program {
-        AgentProgram::Codex => ProcessSpec::new("codex", working_directory),
-        AgentProgram::Claude => ProcessSpec::new("claude", working_directory),
-        AgentProgram::Shell => shell_spec(working_directory),
-    };
-    spec.with_terminal_size(
+) -> Result<ProcessSpec, AgentAdapterError> {
+    prepare_agent_process(
+        program,
+        preset,
+        role,
+        working_directory,
         TerminalSize::new(size.rows, size.columns)
             .expect("terminal grid dimensions are always non-zero"),
     )
-    .env("TERM", "xterm-256color")
-    .env("COLORTERM", "truecolor")
-    .env("TERM_PROGRAM", "OpenPodium")
-}
-
-#[cfg(unix)]
-fn shell_spec(working_directory: &Path) -> ProcessSpec {
-    let shell = env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-    ProcessSpec::new(shell, working_directory).arg("-l")
-}
-
-#[cfg(windows)]
-fn shell_spec(working_directory: &Path) -> ProcessSpec {
-    let shell = env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-    ProcessSpec::new(shell, working_directory)
 }

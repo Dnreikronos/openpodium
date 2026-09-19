@@ -437,9 +437,30 @@ fn grid_step(zoom: f64) -> f64 {
 
 fn node_color(kind: NodeKind, palette: &palette::Extended) -> Color {
     match kind {
-        NodeKind::Agent(AgentProgram::Codex) => palette.primary.base.color,
-        NodeKind::Agent(AgentProgram::Claude) => palette.warning.base.color,
-        NodeKind::Agent(AgentProgram::Shell) => palette.success.base.color,
+        NodeKind::Agent {
+            role_color: Some(color),
+            ..
+        } => color,
+        NodeKind::Agent {
+            program: AgentProgram::Codex,
+            ..
+        } => palette.primary.base.color,
+        NodeKind::Agent {
+            program: AgentProgram::Claude,
+            ..
+        } => palette.warning.base.color,
+        NodeKind::Agent {
+            program: AgentProgram::OpenCode,
+            ..
+        } => palette.secondary.base.color,
+        NodeKind::Agent {
+            program: AgentProgram::Custom(_),
+            ..
+        } => palette.primary.weak.color,
+        NodeKind::Agent {
+            program: AgentProgram::Shell,
+            ..
+        } => palette.success.base.color,
         NodeKind::Task => palette.secondary.base.color,
         NodeKind::Handoff => palette.danger.base.color,
     }

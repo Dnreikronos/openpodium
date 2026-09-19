@@ -5,15 +5,16 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use crate::domain::{
-    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize,
-    Connection as DomainConnection, ConnectionId, ConnectionKind, Content, DomainCommand,
-    DomainEvent, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId,
-    HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId,
-    SshEnvironment, Task, TaskId, TaskState, Timestamp, Workspace, WorkspaceId,
+    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize, CommandPreset,
+    CommandPresetId, Connection as DomainConnection, ConnectionId, ConnectionKind, Content,
+    DomainCommand, DomainEvent, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Handoff,
+    HandoffId, HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role,
+    RoleColor, RoleIcon, RoleId, SshEnvironment, Task, TaskId, TaskState, Timestamp, Workspace,
+    WorkspaceId,
 };
 
 use super::codec::{decode_event, decode_workspace};
-use super::{Journal, PersistenceError};
+use super::{Journal, PersistenceError, RoleTransferError, export_role, import_role};
 
 #[test]
 fn new_database_enables_wal_foreign_keys_and_schema_version() {
@@ -313,6 +314,121 @@ fn environment_profiles_and_agent_references_survive_restart() {
 }
 
 #[test]
+fn command_presets_role_appearance_and_assignments_survive_restart() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    let role_id = RoleId::new(1);
+    let expected = {
+        let mut journal = Journal::open(&path).unwrap();
+        let mut workspace = test_workspace();
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddCommandPreset(
+                CommandPreset::new(
+                    CommandPresetId::new(1),
+                    name("Custom agent"),
+                    "agent-cli",
+                    vec!["--interactive".to_owned()],
+                )
+                .unwrap(),
+            ),
+            1,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddRole(Role::with_appearance(
+                role_id,
+                name("Reviewer"),
+                RoleColor::new("#8B5CF6").unwrap(),
+                RoleIcon::new("review").unwrap(),
+                content("Review for correctness"),
+            )),
+            2,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddAgent(Agent::with_program(
+                AgentId::new(1),
+                name("Ada"),
+                None,
+                AgentProgram::Custom(CommandPresetId::new(1)),
+            )),
+            3,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AssignAgentRole {
+                agent_id: AgentId::new(1),
+                role_id: Some(role_id),
+            },
+            4,
+        );
+        workspace
+    };
+
+    let recovered = Journal::open(&path)
+        .unwrap()
+        .recover(WorkspaceId::new(7))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(recovered, expected);
+    assert_eq!(recovered.role(role_id).unwrap().color().as_str(), "#8B5CF6");
+    assert_eq!(
+        recovered.agent(AgentId::new(1)).unwrap().program(),
+        AgentProgram::Custom(CommandPresetId::new(1))
+    );
+}
+
+#[test]
+fn portable_roles_round_trip_with_a_fresh_destination_id() {
+    let source = Role::with_appearance(
+        RoleId::new(1),
+        name("Reviewer"),
+        RoleColor::new("#8B5CF6").unwrap(),
+        RoleIcon::new("review").unwrap(),
+        content("Review changes for regressions"),
+    );
+
+    let payload = export_role(&source).unwrap();
+    let imported = import_role(&payload, RoleId::new(99)).unwrap();
+
+    assert!(!payload.contains("\"id\""));
+    assert_eq!(imported.id(), RoleId::new(99));
+    assert_eq!(imported.name(), source.name());
+    assert_eq!(imported.color(), source.color());
+    assert_eq!(imported.icon(), source.icon());
+    assert_eq!(imported.instructions(), source.instructions());
+}
+
+#[test]
+fn portable_roles_reject_unknown_versions_and_invalid_fields() {
+    let version_error = import_role(
+        r##"{"format":"openpodium-role","version":2,"role":{"name":"Reviewer","color":"#8B5CF6","icon":"review","instructions":"Review changes"}}"##,
+        RoleId::new(1),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        version_error,
+        RoleTransferError::UnsupportedVersion {
+            found: 2,
+            supported: 1
+        }
+    ));
+
+    let role_error = import_role(
+        r#"{"format":"openpodium-role","version":1,"role":{"name":"Reviewer","color":"violet","icon":"review","instructions":"Review changes"}}"#,
+        RoleId::new(1),
+    )
+    .unwrap_err();
+    assert!(matches!(role_error, RoleTransferError::InvalidRole(_)));
+}
+
+#[test]
 fn corrupt_newest_snapshot_is_skipped_and_its_event_is_replayed() {
     let temp = TempDir::new().unwrap();
     let mut journal = Journal::open(database_path(&temp)).unwrap();
@@ -429,7 +545,7 @@ fn unknown_event_format_fails_recovery_without_partial_state() {
             record_type: "domain event",
             sequence: 2,
             found: 99,
-            supported: 4,
+            supported: 5,
         }
     ));
 }

@@ -3,9 +3,15 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 
+mod adapters;
 mod environments;
+mod executables;
 mod local;
 
+pub use adapters::{
+    AgentAdapterError, AgentCapability, ROLE_INSTRUCTIONS_ENV, check_agent_capability,
+    prepare_agent_process,
+};
 pub use environments::{EnvironmentHealth, check_environment, prepare_environment_process};
 pub use local::{LocalProcessRuntime, ProcessController, RunningProcess};
 

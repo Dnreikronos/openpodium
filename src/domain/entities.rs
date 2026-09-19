@@ -1,22 +1,43 @@
 use std::collections::BTreeSet;
 
 use super::{
-    AgentId, AgentState, CanvasPoint, CanvasSize, ConnectionId, Content, EnvironmentProfileId,
-    HandoffId, Name, NodeGroupId, NodeId, RoleId, TaskId, TaskState,
+    AgentId, AgentState, CanvasPoint, CanvasSize, CommandPresetId, ConnectionId, Content,
+    EnvironmentProfileId, HandoffId, Name, NodeGroupId, NodeId, RoleColor, RoleIcon, RoleId,
+    TaskId, TaskState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Role {
     id: RoleId,
     name: Name,
+    color: RoleColor,
+    icon: RoleIcon,
     instructions: Content,
 }
 
 impl Role {
-    pub const fn new(id: RoleId, name: Name, instructions: Content) -> Self {
+    pub fn new(id: RoleId, name: Name, instructions: Content) -> Self {
         Self {
             id,
             name,
+            color: RoleColor::default(),
+            icon: RoleIcon::default(),
+            instructions,
+        }
+    }
+
+    pub const fn with_appearance(
+        id: RoleId,
+        name: Name,
+        color: RoleColor,
+        icon: RoleIcon,
+        instructions: Content,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            color,
+            icon,
             instructions,
         }
     }
@@ -27,6 +48,14 @@ impl Role {
 
     pub const fn name(&self) -> &Name {
         &self.name
+    }
+
+    pub const fn color(&self) -> &RoleColor {
+        &self.color
+    }
+
+    pub const fn icon(&self) -> &RoleIcon {
+        &self.icon
     }
 
     pub const fn instructions(&self) -> &Content {
@@ -48,8 +77,31 @@ pub struct Agent {
 pub enum AgentProgram {
     Codex,
     Claude,
+    OpenCode,
+    Custom(CommandPresetId),
     #[default]
     Shell,
+}
+
+impl AgentProgram {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+            Self::OpenCode => "OpenCode",
+            Self::Custom(_) => "Custom",
+            Self::Shell => "Shell",
+        }
+    }
+
+    pub const fn executable(self) -> Option<&'static str> {
+        match self {
+            Self::Codex => Some("codex"),
+            Self::Claude => Some("claude"),
+            Self::OpenCode => Some("opencode"),
+            Self::Custom(_) | Self::Shell => None,
+        }
+    }
 }
 
 impl Agent {
@@ -104,6 +156,10 @@ impl Agent {
 
     pub(super) const fn set_state(&mut self, state: AgentState) {
         self.state = state;
+    }
+
+    pub(super) const fn set_role_id(&mut self, role_id: Option<RoleId>) {
+        self.role_id = role_id;
     }
 }
 

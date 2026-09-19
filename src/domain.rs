@@ -22,6 +22,9 @@ pub use lifecycle::*;
 mod environments;
 pub use environments::*;
 
+mod agents;
+pub use agents::*;
+
 mod entities;
 pub use entities::*;
 

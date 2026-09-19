@@ -9,6 +9,7 @@ pub(crate) use surface::{Message, view};
 
 use std::collections::BTreeMap;
 
+use iced::Color;
 use openpodium::domain::{AgentProgram, CanvasLayout, NodeId, NodeTarget, Workspace};
 
 use crate::terminal;
@@ -31,7 +32,10 @@ pub(super) struct NodeLabel {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum NodeKind {
-    Agent(AgentProgram),
+    Agent {
+        program: AgentProgram,
+        role_color: Option<Color>,
+    },
     Task,
     Handoff,
 }
@@ -51,7 +55,10 @@ impl CanvasDocument {
                         || NodeLabel {
                             title: format!("Missing agent {agent_id}"),
                             subtitle: "Unavailable".to_owned(),
-                            kind: NodeKind::Agent(AgentProgram::Shell),
+                            kind: NodeKind::Agent {
+                                program: AgentProgram::Shell,
+                                role_color: None,
+                            },
                         },
                         |agent| {
                             let status = terminals.get(&node.id()).map_or_else(
@@ -65,10 +72,25 @@ impl CanvasDocument {
                                     || agent.name().as_str().to_owned(),
                                     |title| format!("{} — {title}", agent.name().as_str()),
                                 );
+                            let role = agent.role_id().and_then(|role_id| workspace.role(role_id));
                             NodeLabel {
-                                title,
-                                subtitle: format!("{} · {status}", program_name(agent.program())),
-                                kind: NodeKind::Agent(agent.program()),
+                                title: role.map_or(title.clone(), |role| {
+                                    format!("{} {title}", role.icon())
+                                }),
+                                subtitle: role.map_or_else(
+                                    || format!("{} · {status}", program_name(agent.program())),
+                                    |role| {
+                                        format!(
+                                            "{} · {} · {status}",
+                                            role.name(),
+                                            program_name(agent.program())
+                                        )
+                                    },
+                                ),
+                                kind: NodeKind::Agent {
+                                    program: agent.program(),
+                                    role_color: role.map(|role| role_color(role.color().as_str())),
+                                },
                             }
                         },
                     ),
@@ -125,9 +147,63 @@ impl CanvasDocument {
 }
 
 fn program_name(program: AgentProgram) -> &'static str {
-    match program {
-        AgentProgram::Codex => "Codex",
-        AgentProgram::Claude => "Claude",
-        AgentProgram::Shell => "Shell",
+    program.label()
+}
+
+fn role_color(value: &str) -> Color {
+    let red = u8::from_str_radix(&value[1..3], 16).expect("role colors are validated");
+    let green = u8::from_str_radix(&value[3..5], 16).expect("role colors are validated");
+    let blue = u8::from_str_radix(&value[5..7], 16).expect("role colors are validated");
+    Color::from_rgb8(red, green, blue)
+}
+
+#[cfg(test)]
+mod tests {
+    use openpodium::domain::{
+        Agent, AgentId, CanvasPoint, CanvasSize, Content, DomainCommand, Name, Node, Role,
+        RoleColor, RoleIcon, RoleId, WorkspaceId,
+    };
+
+    use super::*;
+
+    #[test]
+    fn assigned_role_controls_agent_icon_label_and_color() {
+        let mut workspace = Workspace::new(WorkspaceId::new(1), Name::new("Test").unwrap());
+        let role = Role::with_appearance(
+            RoleId::new(1),
+            Name::new("Reviewer").unwrap(),
+            RoleColor::new("#8B5CF6").unwrap(),
+            RoleIcon::new("review").unwrap(),
+            Content::new("Review changes").unwrap(),
+        );
+        workspace.execute(DomainCommand::AddRole(role)).unwrap();
+        workspace
+            .execute(DomainCommand::AddAgent(Agent::with_program(
+                AgentId::new(1),
+                Name::new("Ada").unwrap(),
+                Some(RoleId::new(1)),
+                AgentProgram::Codex,
+            )))
+            .unwrap();
+        let node = Node::new(
+            NodeId::new(1),
+            NodeTarget::Agent(AgentId::new(1)),
+            CanvasPoint::new(0.0, 0.0).unwrap(),
+            CanvasSize::new(320.0, 240.0).unwrap(),
+        );
+        workspace.execute(DomainCommand::AddNode(node)).unwrap();
+
+        let document = CanvasDocument::new(&workspace, workspace.canvas_layout(), BTreeMap::new());
+        let label = document.label(NodeId::new(1));
+
+        assert_eq!(label.title, "review Ada");
+        assert_eq!(label.subtitle, "Reviewer · Codex · terminal offline");
+        assert!(matches!(
+            label.kind,
+            NodeKind::Agent {
+                role_color: Some(color),
+                ..
+            } if color == Color::from_rgb8(0x8B, 0x5C, 0xF6)
+        ));
     }
 }

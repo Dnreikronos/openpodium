@@ -1,18 +1,18 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize, Connection,
-    ConnectionId, ConnectionKind, ContainerEnvironment, Content, CustomEnvironment, DomainCommand,
-    DomainEvent, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId,
-    HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId,
-    SshEnvironment, Task, TaskId, TaskState, Workspace, WorkspaceDirectory, WorkspaceIcon,
-    WorkspaceId, WorkspaceSettings,
+    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize, CommandPreset,
+    CommandPresetId, Connection, ConnectionId, ConnectionKind, ContainerEnvironment, Content,
+    CustomEnvironment, DomainCommand, DomainEvent, EnvironmentKind, EnvironmentProfile,
+    EnvironmentProfileId, Handoff, HandoffId, HandoffPayload, Name, Node, NodeGroup, NodeGroupId,
+    NodeId, NodeTarget, Role, RoleColor, RoleIcon, RoleId, SshEnvironment, Task, TaskId, TaskState,
+    Workspace, WorkspaceDirectory, WorkspaceIcon, WorkspaceId, WorkspaceSettings,
 };
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 4;
-pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 4;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 5;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 5;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
     serde_json::to_vec(&StoredEvent::from(event)).map_err(|source| {
@@ -54,6 +54,13 @@ pub(crate) fn decode_event(
             "domain event",
             sequence,
             "environment profiles and agent environment references require event format version 4",
+        ));
+    }
+    if format_version < 5 && stored.requires_version_five() {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "command presets, role appearance, and role changes require event format version 5",
         ));
     }
 
@@ -114,8 +121,30 @@ enum StoredEvent {
     EnvironmentProfileRemoved {
         profile: EnvironmentProfileV1,
     },
+    CommandPresetAdded {
+        preset: CommandPresetV1,
+    },
+    CommandPresetChanged {
+        from: CommandPresetV1,
+        to: CommandPresetV1,
+    },
+    CommandPresetRemoved {
+        preset: CommandPresetV1,
+    },
     RoleAdded {
         role: RoleV1,
+    },
+    RoleChanged {
+        from: RoleV1,
+        to: RoleV1,
+    },
+    RoleRemoved {
+        role: RoleV1,
+    },
+    AgentRoleChanged {
+        agent_id: u64,
+        from: Option<u64>,
+        to: Option<u64>,
     },
     AgentAdded {
         agent: AgentV1,
@@ -168,8 +197,30 @@ impl From<&DomainEvent> for StoredEvent {
             DomainEvent::EnvironmentProfileRemoved(profile) => Self::EnvironmentProfileRemoved {
                 profile: EnvironmentProfileV1::from(profile),
             },
+            DomainEvent::CommandPresetAdded(preset) => Self::CommandPresetAdded {
+                preset: CommandPresetV1::from(preset),
+            },
+            DomainEvent::CommandPresetChanged { from, to } => Self::CommandPresetChanged {
+                from: CommandPresetV1::from(from),
+                to: CommandPresetV1::from(to),
+            },
+            DomainEvent::CommandPresetRemoved(preset) => Self::CommandPresetRemoved {
+                preset: CommandPresetV1::from(preset),
+            },
             DomainEvent::RoleAdded(role) => Self::RoleAdded {
                 role: RoleV1::from(role),
+            },
+            DomainEvent::RoleChanged { from, to } => Self::RoleChanged {
+                from: RoleV1::from(from),
+                to: RoleV1::from(to),
+            },
+            DomainEvent::RoleRemoved(role) => Self::RoleRemoved {
+                role: RoleV1::from(role),
+            },
+            DomainEvent::AgentRoleChanged { agent_id, from, to } => Self::AgentRoleChanged {
+                agent_id: agent_id.get(),
+                from: from.map(RoleId::get),
+                to: to.map(RoleId::get),
             },
             DomainEvent::AgentAdded(agent) => Self::AgentAdded {
                 agent: AgentV1::from(agent),
@@ -227,6 +278,25 @@ impl StoredEvent {
         }
     }
 
+    fn requires_version_five(&self) -> bool {
+        match self {
+            Self::CommandPresetAdded { .. }
+            | Self::CommandPresetChanged { .. }
+            | Self::CommandPresetRemoved { .. }
+            | Self::RoleChanged { .. }
+            | Self::RoleRemoved { .. }
+            | Self::AgentRoleChanged { .. } => true,
+            Self::RoleAdded { role } => role.has_appearance_fields(),
+            Self::AgentAdded { agent } | Self::AgentNodeAdded { agent, .. } => {
+                matches!(
+                    agent.program,
+                    AgentProgramV1::OpenCode | AgentProgramV1::Custom { .. }
+                )
+            }
+            _ => false,
+        }
+    }
+
     fn into_domain(self) -> Result<DomainEvent, String> {
         match self {
             Self::WorkspaceSettingsChanged { from, to } => {
@@ -247,7 +317,27 @@ impl StoredEvent {
             Self::EnvironmentProfileRemoved { profile } => Ok(
                 DomainEvent::EnvironmentProfileRemoved(profile.into_domain()?),
             ),
+            Self::CommandPresetAdded { preset } => {
+                Ok(DomainEvent::CommandPresetAdded(preset.into_domain()?))
+            }
+            Self::CommandPresetChanged { from, to } => Ok(DomainEvent::CommandPresetChanged {
+                from: from.into_domain()?,
+                to: to.into_domain()?,
+            }),
+            Self::CommandPresetRemoved { preset } => {
+                Ok(DomainEvent::CommandPresetRemoved(preset.into_domain()?))
+            }
             Self::RoleAdded { role } => Ok(DomainEvent::RoleAdded(role.into_domain()?)),
+            Self::RoleChanged { from, to } => Ok(DomainEvent::RoleChanged {
+                from: from.into_domain()?,
+                to: to.into_domain()?,
+            }),
+            Self::RoleRemoved { role } => Ok(DomainEvent::RoleRemoved(role.into_domain()?)),
+            Self::AgentRoleChanged { agent_id, from, to } => Ok(DomainEvent::AgentRoleChanged {
+                agent_id: AgentId::new(agent_id),
+                from: from.map(RoleId::new),
+                to: to.map(RoleId::new),
+            }),
             Self::AgentAdded { agent } => {
                 let (agent, state) = agent.into_domain()?;
                 if state != AgentState::Starting {
@@ -307,6 +397,8 @@ struct StoredWorkspace {
     instructions: Option<String>,
     #[serde(default)]
     environment_profiles: Vec<EnvironmentProfileV1>,
+    #[serde(default)]
+    command_presets: Vec<CommandPresetV1>,
     roles: Vec<RoleV1>,
     agents: Vec<AgentV1>,
     tasks: Vec<TaskV1>,
@@ -338,6 +430,10 @@ impl From<&Workspace> for StoredWorkspace {
             environment_profiles: workspace
                 .environment_profiles()
                 .map(EnvironmentProfileV1::from)
+                .collect(),
+            command_presets: workspace
+                .command_presets()
+                .map(CommandPresetV1::from)
                 .collect(),
             roles: workspace.roles().map(RoleV1::from).collect(),
             agents: workspace.agents().map(AgentV1::from).collect(),
@@ -385,6 +481,20 @@ impl StoredWorkspace {
                     .to_owned(),
             );
         }
+        if format_version < 5
+            && (!self.command_presets.is_empty()
+                || self.roles.iter().any(RoleV1::has_appearance_fields))
+            || self.agents.iter().any(|agent| {
+                matches!(
+                    agent.program,
+                    AgentProgramV1::OpenCode | AgentProgramV1::Custom { .. }
+                )
+            })
+        {
+            return Err(
+                "command presets and role appearance require snapshot format version 5".to_owned(),
+            );
+        }
 
         let settings = StoredWorkspaceSettings {
             name: self.name,
@@ -405,6 +515,13 @@ impl StoredWorkspace {
             apply_snapshot_command(
                 &mut workspace,
                 DomainCommand::AddEnvironmentProfile(profile.into_domain()?),
+            )?;
+        }
+
+        for preset in self.command_presets {
+            apply_snapshot_command(
+                &mut workspace,
+                DomainCommand::AddCommandPreset(preset.into_domain()?),
             )?;
         }
 
@@ -671,9 +788,45 @@ fn apply_snapshot_command(workspace: &mut Workspace, command: DomainCommand) -> 
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CommandPresetV1 {
+    id: u64,
+    name: String,
+    executable: String,
+    arguments: Vec<String>,
+}
+
+impl From<&CommandPreset> for CommandPresetV1 {
+    fn from(preset: &CommandPreset) -> Self {
+        Self {
+            id: preset.id().get(),
+            name: preset.name().as_str().to_owned(),
+            executable: preset.executable().to_owned(),
+            arguments: preset.arguments().to_vec(),
+        }
+    }
+}
+
+impl CommandPresetV1 {
+    fn into_domain(self) -> Result<CommandPreset, String> {
+        CommandPreset::new(
+            CommandPresetId::new(self.id),
+            Name::new(self.name).map_err(|error| error.to_string())?,
+            self.executable,
+            self.arguments,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RoleV1 {
     id: u64,
     name: String,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    icon: Option<String>,
     instructions: String,
 }
 
@@ -682,16 +835,30 @@ impl From<&Role> for RoleV1 {
         Self {
             id: role.id().get(),
             name: role.name().as_str().to_owned(),
+            color: Some(role.color().as_str().to_owned()),
+            icon: Some(role.icon().as_str().to_owned()),
             instructions: role.instructions().as_str().to_owned(),
         }
     }
 }
 
 impl RoleV1 {
+    fn has_appearance_fields(&self) -> bool {
+        self.color.is_some() || self.icon.is_some()
+    }
+
     fn into_domain(self) -> Result<Role, String> {
-        Ok(Role::new(
+        Ok(Role::with_appearance(
             RoleId::new(self.id),
             Name::new(self.name).map_err(|error| error.to_string())?,
+            self.color
+                .map(RoleColor::new)
+                .unwrap_or_else(|| RoleColor::new(RoleColor::DEFAULT))
+                .map_err(|error| error.to_string())?,
+            self.icon
+                .map(RoleIcon::new)
+                .unwrap_or_else(|| RoleIcon::new(RoleIcon::DEFAULT))
+                .map_err(|error| error.to_string())?,
             Content::new(self.instructions).map_err(|error| error.to_string())?,
         ))
     }
@@ -1053,6 +1220,10 @@ enum AgentStateV1 {
 enum AgentProgramV1 {
     Codex,
     Claude,
+    OpenCode,
+    Custom {
+        preset_id: u64,
+    },
     #[default]
     Shell,
 }
@@ -1062,6 +1233,10 @@ impl From<AgentProgram> for AgentProgramV1 {
         match program {
             AgentProgram::Codex => Self::Codex,
             AgentProgram::Claude => Self::Claude,
+            AgentProgram::OpenCode => Self::OpenCode,
+            AgentProgram::Custom(preset_id) => Self::Custom {
+                preset_id: preset_id.get(),
+            },
             AgentProgram::Shell => Self::Shell,
         }
     }
@@ -1072,6 +1247,8 @@ impl From<AgentProgramV1> for AgentProgram {
         match program {
             AgentProgramV1::Codex => Self::Codex,
             AgentProgramV1::Claude => Self::Claude,
+            AgentProgramV1::OpenCode => Self::OpenCode,
+            AgentProgramV1::Custom { preset_id } => Self::Custom(CommandPresetId::new(preset_id)),
             AgentProgramV1::Shell => Self::Shell,
         }
     }
