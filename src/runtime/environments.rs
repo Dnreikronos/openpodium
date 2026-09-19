@@ -294,9 +294,9 @@ fn executable_candidates(directory: &Path, executable: &OsStr) -> bool {
     #[cfg(windows)]
     {
         let extensions = env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
-        return extensions.to_string_lossy().split(';').any(|extension| {
+        extensions.to_string_lossy().split(';').any(|extension| {
             is_executable(&candidate.with_extension(extension.trim_start_matches('.')))
-        });
+        })
     }
     #[cfg(not(windows))]
     false
