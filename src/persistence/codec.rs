@@ -1,15 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    Agent, AgentId, AgentState, CanvasPoint, CanvasSize, Content, DomainCommand, DomainEvent,
-    Handoff, HandoffId, HandoffPayload, Name, Node, NodeId, NodeTarget, Role, RoleId, Task, TaskId,
-    TaskState, Workspace, WorkspaceDirectory, WorkspaceIcon, WorkspaceId, WorkspaceSettings,
+    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize, Connection,
+    ConnectionId, ConnectionKind, Content, DomainCommand, DomainEvent, Handoff, HandoffId,
+    HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId, Task,
+    TaskId, TaskState, Workspace, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
+    WorkspaceSettings,
 };
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 2;
-pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 3;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
     serde_json::to_vec(&StoredEvent::from(event)).map_err(|source| {
@@ -37,6 +39,13 @@ pub(crate) fn decode_event(
             "domain event",
             sequence,
             "workspace settings changes require event format version 2",
+        ));
+    }
+    if format_version < 3 && stored.requires_version_three() {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "canvas graph edits and agent programs require event format version 3",
         ));
     }
 
@@ -102,6 +111,14 @@ enum StoredEvent {
     NodeAdded {
         node: NodeV1,
     },
+    AgentNodeAdded {
+        agent: AgentV1,
+        node: NodeV1,
+    },
+    CanvasReplaced {
+        before: CanvasLayoutV1,
+        after: CanvasLayoutV1,
+    },
     AgentStateChanged {
         agent_id: u64,
         from: AgentStateV1,
@@ -136,6 +153,14 @@ impl From<&DomainEvent> for StoredEvent {
             DomainEvent::NodeAdded(node) => Self::NodeAdded {
                 node: NodeV1::from(node),
             },
+            DomainEvent::AgentNodeAdded { agent, node } => Self::AgentNodeAdded {
+                agent: AgentV1::from(agent),
+                node: NodeV1::from(node),
+            },
+            DomainEvent::CanvasReplaced { before, after } => Self::CanvasReplaced {
+                before: CanvasLayoutV1::from(before),
+                after: CanvasLayoutV1::from(after),
+            },
             DomainEvent::AgentStateChanged { agent_id, from, to } => Self::AgentStateChanged {
                 agent_id: agent_id.get(),
                 from: (*from).into(),
@@ -151,6 +176,15 @@ impl From<&DomainEvent> for StoredEvent {
 }
 
 impl StoredEvent {
+    fn requires_version_three(&self) -> bool {
+        match self {
+            Self::AgentAdded { agent } => agent.program != AgentProgramV1::Shell,
+            Self::NodeAdded { node } => node.z_index != 0,
+            Self::AgentNodeAdded { .. } | Self::CanvasReplaced { .. } => true,
+            _ => false,
+        }
+    }
+
     fn into_domain(self) -> Result<DomainEvent, String> {
         match self {
             Self::WorkspaceSettingsChanged { from, to } => {
@@ -176,6 +210,22 @@ impl StoredEvent {
             }
             Self::HandoffAdded { handoff } => Ok(DomainEvent::HandoffAdded(handoff.into_domain()?)),
             Self::NodeAdded { node } => Ok(DomainEvent::NodeAdded(node.into_domain()?)),
+            Self::AgentNodeAdded { agent, node } => {
+                let (agent, state) = agent.into_domain()?;
+                if state != AgentState::Starting {
+                    return Err(
+                        "an agent_node_added event must contain a starting agent".to_owned()
+                    );
+                }
+                Ok(DomainEvent::AgentNodeAdded {
+                    agent,
+                    node: node.into_domain()?,
+                })
+            }
+            Self::CanvasReplaced { before, after } => Ok(DomainEvent::CanvasReplaced {
+                before: before.into_domain()?,
+                after: after.into_domain()?,
+            }),
             Self::AgentStateChanged { agent_id, from, to } => Ok(DomainEvent::AgentStateChanged {
                 agent_id: AgentId::new(agent_id),
                 from: from.into(),
@@ -206,6 +256,10 @@ struct StoredWorkspace {
     tasks: Vec<TaskV1>,
     handoffs: Vec<HandoffV1>,
     nodes: Vec<NodeV1>,
+    #[serde(default)]
+    groups: Vec<NodeGroupV1>,
+    #[serde(default)]
+    connections: Vec<ConnectionV1>,
 }
 
 impl From<&Workspace> for StoredWorkspace {
@@ -230,6 +284,8 @@ impl From<&Workspace> for StoredWorkspace {
             tasks: workspace.tasks().map(TaskV1::from).collect(),
             handoffs: workspace.handoffs().map(HandoffV1::from).collect(),
             nodes: workspace.nodes().map(NodeV1::from).collect(),
+            groups: workspace.groups().map(NodeGroupV1::from).collect(),
+            connections: workspace.connections().map(ConnectionV1::from).collect(),
         }
     }
 }
@@ -242,6 +298,20 @@ impl StoredWorkspace {
                 || self.instructions.is_some())
         {
             return Err("workspace settings require snapshot format version 2".to_owned());
+        }
+        if format_version < 3
+            && (self
+                .agents
+                .iter()
+                .any(|agent| agent.program != AgentProgramV1::Shell)
+                || self.nodes.iter().any(|node| node.z_index != 0)
+                || !self.groups.is_empty()
+                || !self.connections.is_empty())
+        {
+            return Err(
+                "canvas graph state and agent programs require snapshot format version 3"
+                    .to_owned(),
+            );
         }
 
         let settings = StoredWorkspaceSettings {
@@ -291,6 +361,24 @@ impl StoredWorkspace {
         }
         for node in self.nodes {
             apply_snapshot_command(&mut workspace, DomainCommand::AddNode(node.into_domain()?))?;
+        }
+        let before = workspace.canvas_layout();
+        let after = CanvasLayout::new(
+            before.nodes().to_vec(),
+            self.groups
+                .into_iter()
+                .map(NodeGroupV1::into_domain)
+                .collect::<Result<_, _>>()?,
+            self.connections
+                .into_iter()
+                .map(ConnectionV1::into_domain)
+                .collect(),
+        );
+        if before != after {
+            apply_snapshot_command(
+                &mut workspace,
+                DomainCommand::ReplaceCanvas { before, after },
+            )?;
         }
 
         Ok(workspace)
@@ -431,6 +519,8 @@ struct AgentV1 {
     id: u64,
     name: String,
     role_id: Option<u64>,
+    #[serde(default)]
+    program: AgentProgramV1,
     state: AgentStateV1,
 }
 
@@ -440,6 +530,7 @@ impl From<&Agent> for AgentV1 {
             id: agent.id().get(),
             name: agent.name().as_str().to_owned(),
             role_id: agent.role_id().map(RoleId::get),
+            program: agent.program().into(),
             state: agent.state().into(),
         }
     }
@@ -448,10 +539,11 @@ impl From<&Agent> for AgentV1 {
 impl AgentV1 {
     fn into_domain(self) -> Result<(Agent, AgentState), String> {
         Ok((
-            Agent::new(
+            Agent::with_program(
                 AgentId::new(self.id),
                 Name::new(self.name).map_err(|error| error.to_string())?,
                 self.role_id.map(RoleId::new),
+                self.program.into(),
             ),
             self.state.into(),
         ))
@@ -568,6 +660,8 @@ struct NodeV1 {
     y: f32,
     width: f32,
     height: f32,
+    #[serde(default)]
+    z_index: i32,
 }
 
 impl From<&Node> for NodeV1 {
@@ -579,17 +673,150 @@ impl From<&Node> for NodeV1 {
             y: node.position().y(),
             width: node.size().width(),
             height: node.size().height(),
+            z_index: node.z_index(),
         }
     }
 }
 
 impl NodeV1 {
     fn into_domain(self) -> Result<Node, String> {
-        Ok(Node::new(
+        Ok(Node::with_z_index(
             NodeId::new(self.id),
             self.target.into(),
             CanvasPoint::new(self.x, self.y).map_err(|error| error.to_string())?,
             CanvasSize::new(self.width, self.height).map_err(|error| error.to_string())?,
+            self.z_index,
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeGroupV1 {
+    id: u64,
+    members: Vec<u64>,
+}
+
+impl From<&NodeGroup> for NodeGroupV1 {
+    fn from(group: &NodeGroup) -> Self {
+        Self {
+            id: group.id().get(),
+            members: group.members().map(NodeId::get).collect(),
+        }
+    }
+}
+
+impl NodeGroupV1 {
+    fn into_domain(self) -> Result<NodeGroup, String> {
+        if self.members.len() < 2 {
+            return Err("a stored node group must contain at least two members".to_owned());
+        }
+        Ok(NodeGroup::new(
+            NodeGroupId::new(self.id),
+            self.members.into_iter().map(NodeId::new),
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionV1 {
+    id: u64,
+    source: u64,
+    target: u64,
+    kind: ConnectionKindV1,
+}
+
+impl From<&Connection> for ConnectionV1 {
+    fn from(connection: &Connection) -> Self {
+        Self {
+            id: connection.id().get(),
+            source: connection.source().get(),
+            target: connection.target().get(),
+            kind: connection.kind().into(),
+        }
+    }
+}
+
+impl ConnectionV1 {
+    fn into_domain(self) -> Connection {
+        Connection::new(
+            ConnectionId::new(self.id),
+            NodeId::new(self.source),
+            NodeId::new(self.target),
+            self.kind.into(),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConnectionKindV1 {
+    Coordination,
+    Assignment,
+    Dependency,
+    Handoff,
+}
+
+impl From<ConnectionKind> for ConnectionKindV1 {
+    fn from(kind: ConnectionKind) -> Self {
+        match kind {
+            ConnectionKind::Coordination => Self::Coordination,
+            ConnectionKind::Assignment => Self::Assignment,
+            ConnectionKind::Dependency => Self::Dependency,
+            ConnectionKind::Handoff => Self::Handoff,
+        }
+    }
+}
+
+impl From<ConnectionKindV1> for ConnectionKind {
+    fn from(kind: ConnectionKindV1) -> Self {
+        match kind {
+            ConnectionKindV1::Coordination => Self::Coordination,
+            ConnectionKindV1::Assignment => Self::Assignment,
+            ConnectionKindV1::Dependency => Self::Dependency,
+            ConnectionKindV1::Handoff => Self::Handoff,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanvasLayoutV1 {
+    nodes: Vec<NodeV1>,
+    groups: Vec<NodeGroupV1>,
+    connections: Vec<ConnectionV1>,
+}
+
+impl From<&CanvasLayout> for CanvasLayoutV1 {
+    fn from(layout: &CanvasLayout) -> Self {
+        Self {
+            nodes: layout.nodes().iter().map(NodeV1::from).collect(),
+            groups: layout.groups().iter().map(NodeGroupV1::from).collect(),
+            connections: layout
+                .connections()
+                .iter()
+                .map(ConnectionV1::from)
+                .collect(),
+        }
+    }
+}
+
+impl CanvasLayoutV1 {
+    fn into_domain(self) -> Result<CanvasLayout, String> {
+        Ok(CanvasLayout::new(
+            self.nodes
+                .into_iter()
+                .map(NodeV1::into_domain)
+                .collect::<Result<_, _>>()?,
+            self.groups
+                .into_iter()
+                .map(NodeGroupV1::into_domain)
+                .collect::<Result<_, _>>()?,
+            self.connections
+                .into_iter()
+                .map(ConnectionV1::into_domain)
+                .collect(),
         ))
     }
 }
@@ -631,6 +858,35 @@ enum AgentStateV1 {
     Completed,
     Failed,
     Stopped,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentProgramV1 {
+    Codex,
+    Claude,
+    #[default]
+    Shell,
+}
+
+impl From<AgentProgram> for AgentProgramV1 {
+    fn from(program: AgentProgram) -> Self {
+        match program {
+            AgentProgram::Codex => Self::Codex,
+            AgentProgram::Claude => Self::Claude,
+            AgentProgram::Shell => Self::Shell,
+        }
+    }
+}
+
+impl From<AgentProgramV1> for AgentProgram {
+    fn from(program: AgentProgramV1) -> Self {
+        match program {
+            AgentProgramV1::Codex => Self::Codex,
+            AgentProgramV1::Claude => Self::Claude,
+            AgentProgramV1::Shell => Self::Shell,
+        }
+    }
 }
 
 impl From<AgentState> for AgentStateV1 {

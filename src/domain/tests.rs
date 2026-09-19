@@ -360,6 +360,163 @@ fn replay_rejects_stale_state_without_mutating() {
     assert_eq!(workspace, before);
 }
 
+#[test]
+fn canvas_edits_restore_geometry_groups_and_connections() {
+    let mut workspace = test_workspace();
+    for (id, name) in [(1, "Codex"), (2, "Claude")] {
+        workspace
+            .execute(DomainCommand::AddAgent(Agent::with_program(
+                AgentId::new(id),
+                self::name(name),
+                None,
+                if id == 1 {
+                    AgentProgram::Codex
+                } else {
+                    AgentProgram::Claude
+                },
+            )))
+            .unwrap();
+    }
+    let original = CanvasLayout::new(
+        vec![
+            Node::with_z_index(
+                NodeId::new(1),
+                NodeTarget::Agent(AgentId::new(1)),
+                CanvasPoint::new(0.0, 0.0).unwrap(),
+                CanvasSize::new(320.0, 240.0).unwrap(),
+                1,
+            ),
+            Node::with_z_index(
+                NodeId::new(2),
+                NodeTarget::Agent(AgentId::new(2)),
+                CanvasPoint::new(400.0, 0.0).unwrap(),
+                CanvasSize::new(320.0, 240.0).unwrap(),
+                2,
+            ),
+        ],
+        vec![NodeGroup::new(
+            NodeGroupId::new(1),
+            [NodeId::new(1), NodeId::new(2)],
+        )],
+        vec![Connection::new(
+            ConnectionId::new(1),
+            NodeId::new(1),
+            NodeId::new(2),
+            ConnectionKind::Coordination,
+        )],
+    );
+
+    workspace
+        .execute(DomainCommand::ReplaceCanvas {
+            before: CanvasLayout::default(),
+            after: original.clone(),
+        })
+        .unwrap();
+    let moved = CanvasLayout::new(
+        original
+            .nodes()
+            .iter()
+            .map(|node| {
+                Node::with_z_index(
+                    node.id(),
+                    node.target(),
+                    CanvasPoint::new(node.position().x() + 40.0, 60.0).unwrap(),
+                    node.size(),
+                    node.z_index(),
+                )
+            })
+            .collect(),
+        original.groups().to_vec(),
+        original.connections().to_vec(),
+    );
+
+    workspace
+        .execute(DomainCommand::ReplaceCanvas {
+            before: original.clone(),
+            after: moved.clone(),
+        })
+        .unwrap();
+    workspace
+        .execute(DomainCommand::ReplaceCanvas {
+            before: moved,
+            after: original.clone(),
+        })
+        .unwrap();
+
+    assert_eq!(workspace.canvas_layout(), original);
+    assert_eq!(
+        workspace.agent(AgentId::new(1)).unwrap().program(),
+        AgentProgram::Codex
+    );
+}
+
+#[test]
+fn canvas_edits_reject_dangling_relationships_without_mutating() {
+    let mut workspace = test_workspace();
+    workspace
+        .execute(DomainCommand::AddAgent(Agent::new(
+            AgentId::new(1),
+            name("Shell"),
+            None,
+        )))
+        .unwrap();
+    let node = Node::new(
+        NodeId::new(1),
+        NodeTarget::Agent(AgentId::new(1)),
+        CanvasPoint::new(0.0, 0.0).unwrap(),
+        CanvasSize::new(320.0, 240.0).unwrap(),
+    );
+    workspace
+        .execute(DomainCommand::AddNode(node.clone()))
+        .unwrap();
+    let before = workspace.clone();
+    let invalid = CanvasLayout::new(
+        vec![node],
+        vec![NodeGroup::new(
+            NodeGroupId::new(1),
+            [NodeId::new(1), NodeId::new(99)],
+        )],
+        vec![],
+    );
+
+    let result = workspace.execute(DomainCommand::ReplaceCanvas {
+        before: workspace.canvas_layout(),
+        after: invalid,
+    });
+
+    assert!(matches!(
+        result,
+        Err(DomainError::InvalidGroup {
+            group_id,
+            detail: "a member node does not exist",
+        }) if group_id == NodeGroupId::new(1)
+    ));
+    assert_eq!(workspace, before);
+}
+
+#[test]
+fn adding_an_agent_and_its_node_is_atomic() {
+    let mut workspace = test_workspace();
+    let before = workspace.clone();
+    let agent = Agent::with_program(AgentId::new(1), name("Codex"), None, AgentProgram::Codex);
+    let mismatched_node = Node::new(
+        NodeId::new(1),
+        NodeTarget::Agent(AgentId::new(2)),
+        CanvasPoint::new(0.0, 0.0).unwrap(),
+        CanvasSize::new(320.0, 240.0).unwrap(),
+    );
+
+    assert!(
+        workspace
+            .execute(DomainCommand::AddAgentNode {
+                agent,
+                node: mismatched_node,
+            })
+            .is_err()
+    );
+    assert_eq!(workspace, before);
+}
+
 fn test_workspace() -> Workspace {
     Workspace::new(WorkspaceId::new(1), name("Test workspace"))
 }

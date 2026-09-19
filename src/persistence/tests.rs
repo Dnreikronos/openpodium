@@ -5,9 +5,10 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use crate::domain::{
-    Agent, AgentId, AgentState, CanvasPoint, CanvasSize, Content, DomainCommand, DomainEvent,
-    Handoff, HandoffId, HandoffPayload, Name, Node, NodeId, NodeTarget, Role, RoleId, Task, TaskId,
-    TaskState, Timestamp, Workspace, WorkspaceId,
+    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize,
+    Connection as DomainConnection, ConnectionId, ConnectionKind, Content, DomainCommand,
+    DomainEvent, Handoff, HandoffId, HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId,
+    NodeTarget, Role, RoleId, Task, TaskId, TaskState, Timestamp, Workspace, WorkspaceId,
 };
 
 use super::codec::{decode_event, decode_workspace};
@@ -184,6 +185,79 @@ fn restart_restores_the_same_domain_state() {
 }
 
 #[test]
+fn canvas_graph_and_agent_program_survive_restart() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    let expected = {
+        let mut journal = Journal::open(&path).unwrap();
+        let mut workspace = test_workspace();
+        for (id, program) in [(1, AgentProgram::Codex), (2, AgentProgram::Claude)] {
+            persist(
+                &mut journal,
+                &mut workspace,
+                DomainCommand::AddAgent(Agent::with_program(
+                    AgentId::new(id),
+                    name(if id == 1 { "Codex" } else { "Claude" }),
+                    None,
+                    program,
+                )),
+                id,
+            );
+        }
+        let after = CanvasLayout::new(
+            vec![
+                Node::with_z_index(
+                    NodeId::new(1),
+                    NodeTarget::Agent(AgentId::new(1)),
+                    CanvasPoint::new(-160.0, -120.0).unwrap(),
+                    CanvasSize::new(320.0, 240.0).unwrap(),
+                    3,
+                ),
+                Node::with_z_index(
+                    NodeId::new(2),
+                    NodeTarget::Agent(AgentId::new(2)),
+                    CanvasPoint::new(240.0, -120.0).unwrap(),
+                    CanvasSize::new(320.0, 240.0).unwrap(),
+                    4,
+                ),
+            ],
+            vec![NodeGroup::new(
+                NodeGroupId::new(1),
+                [NodeId::new(1), NodeId::new(2)],
+            )],
+            vec![DomainConnection::new(
+                ConnectionId::new(1),
+                NodeId::new(1),
+                NodeId::new(2),
+                ConnectionKind::Coordination,
+            )],
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::ReplaceCanvas {
+                before: CanvasLayout::default(),
+                after,
+            },
+            3,
+        );
+        workspace
+    };
+
+    let recovered = Journal::open(&path)
+        .unwrap()
+        .recover(WorkspaceId::new(7))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(recovered, expected);
+    assert_eq!(
+        recovered.agent(AgentId::new(1)).unwrap().program(),
+        AgentProgram::Codex
+    );
+}
+
+#[test]
 fn corrupt_newest_snapshot_is_skipped_and_its_event_is_replayed() {
     let temp = TempDir::new().unwrap();
     let mut journal = Journal::open(database_path(&temp)).unwrap();
@@ -300,7 +374,7 @@ fn unknown_event_format_fails_recovery_without_partial_state() {
             record_type: "domain event",
             sequence: 2,
             found: 99,
-            supported: 2,
+            supported: 3,
         }
     ));
 }

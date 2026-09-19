@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use super::{
-    Agent, AgentId, Content, DomainCommand, DomainError, DomainEvent, EntityRef, Handoff,
-    HandoffId, HandoffPayload, Name, Node, NodeId, Role, RoleId, Task, TaskId, TaskState,
-    TimelineEvent, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
+    Agent, AgentId, CanvasLayout, Connection, ConnectionId, ConnectionKind, Content, DomainCommand,
+    DomainError, DomainEvent, EntityRef, Handoff, HandoffId, HandoffPayload, Name, Node, NodeGroup,
+    NodeGroupId, NodeId, Role, RoleId, Task, TaskId, TaskState, TimelineEvent, WorkspaceDirectory,
+    WorkspaceIcon, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +56,8 @@ pub struct Workspace {
     tasks: BTreeMap<TaskId, Task>,
     handoffs: BTreeMap<HandoffId, Handoff>,
     nodes: BTreeMap<NodeId, Node>,
+    groups: BTreeMap<NodeGroupId, NodeGroup>,
+    connections: BTreeMap<ConnectionId, Connection>,
 }
 
 impl Workspace {
@@ -67,6 +70,8 @@ impl Workspace {
             tasks: BTreeMap::new(),
             handoffs: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            connections: BTreeMap::new(),
         }
     }
 
@@ -106,6 +111,22 @@ impl Workspace {
         self.nodes.values()
     }
 
+    pub(crate) fn groups(&self) -> impl Iterator<Item = &NodeGroup> {
+        self.groups.values()
+    }
+
+    pub(crate) fn connections(&self) -> impl Iterator<Item = &Connection> {
+        self.connections.values()
+    }
+
+    pub fn canvas_layout(&self) -> CanvasLayout {
+        CanvasLayout::new(
+            self.nodes.values().cloned().collect(),
+            self.groups.values().cloned().collect(),
+            self.connections.values().cloned().collect(),
+        )
+    }
+
     pub fn role(&self, id: RoleId) -> Option<&Role> {
         self.roles.get(&id)
     }
@@ -142,6 +163,12 @@ impl Workspace {
             DomainCommand::AddTask(task) => DomainEvent::TaskAdded(task),
             DomainCommand::AddHandoff(handoff) => DomainEvent::HandoffAdded(handoff),
             DomainCommand::AddNode(node) => DomainEvent::NodeAdded(node),
+            DomainCommand::AddAgentNode { agent, node } => {
+                DomainEvent::AgentNodeAdded { agent, node }
+            }
+            DomainCommand::ReplaceCanvas { before, after } => {
+                DomainEvent::CanvasReplaced { before, after }
+            }
             DomainCommand::TransitionAgent { agent_id, to } => {
                 let agent = self
                     .agents
@@ -265,6 +292,50 @@ impl Workspace {
                 self.ensure_reference(EntityRef::Node(node.id()), "target", node.target().into())?;
                 self.nodes.insert(node.id(), node.clone());
             }
+            DomainEvent::AgentNodeAdded { agent, node } => {
+                self.ensure_absent(EntityRef::Agent(agent.id()))?;
+                self.ensure_absent(EntityRef::Node(node.id()))?;
+                if let Some(role_id) = agent.role_id() {
+                    self.ensure_reference(
+                        EntityRef::Agent(agent.id()),
+                        "role_id",
+                        EntityRef::Role(role_id),
+                    )?;
+                }
+                if node.target() != super::NodeTarget::Agent(agent.id()) {
+                    return Err(DomainError::InvalidReference {
+                        entity: EntityRef::Node(node.id()),
+                        field: "target",
+                        target: node.target().into(),
+                    });
+                }
+                self.agents.insert(agent.id(), agent.clone());
+                self.nodes.insert(node.id(), node.clone());
+            }
+            DomainEvent::CanvasReplaced { before, after } => {
+                if &self.canvas_layout() != before {
+                    return Err(DomainError::CanvasConflict);
+                }
+                self.validate_canvas(after)?;
+                self.nodes = after
+                    .nodes()
+                    .iter()
+                    .cloned()
+                    .map(|node| (node.id(), node))
+                    .collect();
+                self.groups = after
+                    .groups()
+                    .iter()
+                    .cloned()
+                    .map(|group| (group.id(), group))
+                    .collect();
+                self.connections = after
+                    .connections()
+                    .iter()
+                    .cloned()
+                    .map(|connection| (connection.id(), connection))
+                    .collect();
+            }
             DomainEvent::AgentStateChanged { agent_id, from, to } => {
                 let agent = self
                     .agents
@@ -361,8 +432,95 @@ impl Workspace {
             EntityRef::Task(id) => self.tasks.contains_key(&id),
             EntityRef::Handoff(id) => self.handoffs.contains_key(&id),
             EntityRef::Node(id) => self.nodes.contains_key(&id),
+            EntityRef::NodeGroup(id) => self.groups.contains_key(&id),
+            EntityRef::Connection(id) => self.connections.contains_key(&id),
             EntityRef::TimelineEvent(_) => false,
         }
+    }
+
+    fn validate_canvas(&self, layout: &CanvasLayout) -> Result<(), DomainError> {
+        let mut node_ids = std::collections::BTreeSet::new();
+        for node in layout.nodes() {
+            if !node_ids.insert(node.id()) {
+                return Err(DomainError::DuplicateEntity(EntityRef::Node(node.id())));
+            }
+            self.ensure_reference(EntityRef::Node(node.id()), "target", node.target().into())?;
+        }
+
+        let mut grouped_nodes = std::collections::BTreeSet::new();
+        let mut group_ids = std::collections::BTreeSet::new();
+        for group in layout.groups() {
+            if !group_ids.insert(group.id()) {
+                return Err(DomainError::DuplicateEntity(EntityRef::NodeGroup(
+                    group.id(),
+                )));
+            }
+            if group.len() < 2 {
+                return Err(DomainError::InvalidGroup {
+                    group_id: group.id(),
+                    detail: "a group must contain at least two nodes",
+                });
+            }
+            for node_id in group.members() {
+                if !node_ids.contains(&node_id) {
+                    return Err(DomainError::InvalidGroup {
+                        group_id: group.id(),
+                        detail: "a member node does not exist",
+                    });
+                }
+                if !grouped_nodes.insert(node_id) {
+                    return Err(DomainError::NodeInMultipleGroups { node_id });
+                }
+            }
+        }
+
+        let nodes = layout
+            .nodes()
+            .iter()
+            .map(|node| (node.id(), node))
+            .collect::<BTreeMap<_, _>>();
+        let mut connection_ids = std::collections::BTreeSet::new();
+        let mut endpoints = std::collections::BTreeSet::new();
+        for connection in layout.connections() {
+            if !connection_ids.insert(connection.id()) {
+                return Err(DomainError::DuplicateEntity(EntityRef::Connection(
+                    connection.id(),
+                )));
+            }
+            if connection.source() == connection.target() {
+                return Err(DomainError::InvalidConnection {
+                    connection_id: connection.id(),
+                    detail: "source and target must differ",
+                });
+            }
+            let Some(source) = nodes.get(&connection.source()) else {
+                return Err(DomainError::InvalidConnection {
+                    connection_id: connection.id(),
+                    detail: "source node does not exist",
+                });
+            };
+            let Some(target) = nodes.get(&connection.target()) else {
+                return Err(DomainError::InvalidConnection {
+                    connection_id: connection.id(),
+                    detail: "target node does not exist",
+                });
+            };
+            if ConnectionKind::between(source.target(), target.target()) != Some(connection.kind())
+            {
+                return Err(DomainError::InvalidConnection {
+                    connection_id: connection.id(),
+                    detail: "kind is incompatible with its endpoint targets",
+                });
+            }
+            if !endpoints.insert((connection.source(), connection.target())) {
+                return Err(DomainError::DuplicateConnection {
+                    source: connection.source(),
+                    target: connection.target(),
+                });
+            }
+        }
+
+        Ok(())
     }
 }
 

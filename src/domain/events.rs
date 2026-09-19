@@ -2,8 +2,9 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use super::{
-    Agent, AgentId, AgentState, Handoff, HandoffId, Node, NodeId, NodeTarget, Role, RoleId, Task,
-    TaskId, TaskState, TimelineEventId, Timestamp, WorkspaceId, WorkspaceSettings,
+    Agent, AgentId, AgentState, CanvasLayout, ConnectionId, Handoff, HandoffId, Node, NodeGroupId,
+    NodeId, NodeTarget, Role, RoleId, Task, TaskId, TaskState, TimelineEventId, Timestamp,
+    WorkspaceId, WorkspaceSettings,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -14,8 +15,22 @@ pub enum DomainCommand {
     AddTask(Task),
     AddHandoff(Handoff),
     AddNode(Node),
-    TransitionAgent { agent_id: AgentId, to: AgentState },
-    TransitionTask { task_id: TaskId, to: TaskState },
+    AddAgentNode {
+        agent: Agent,
+        node: Node,
+    },
+    ReplaceCanvas {
+        before: CanvasLayout,
+        after: CanvasLayout,
+    },
+    TransitionAgent {
+        agent_id: AgentId,
+        to: AgentState,
+    },
+    TransitionTask {
+        task_id: TaskId,
+        to: TaskState,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +44,14 @@ pub enum DomainEvent {
     TaskAdded(Task),
     HandoffAdded(Handoff),
     NodeAdded(Node),
+    AgentNodeAdded {
+        agent: Agent,
+        node: Node,
+    },
+    CanvasReplaced {
+        before: CanvasLayout,
+        after: CanvasLayout,
+    },
     AgentStateChanged {
         agent_id: AgentId,
         from: AgentState,
@@ -89,6 +112,8 @@ pub enum EntityRef {
     Task(TaskId),
     Handoff(HandoffId),
     Node(NodeId),
+    NodeGroup(NodeGroupId),
+    Connection(ConnectionId),
     TimelineEvent(TimelineEventId),
 }
 
@@ -101,6 +126,8 @@ impl Display for EntityRef {
             Self::Task(id) => write!(formatter, "task {id}"),
             Self::Handoff(id) => write!(formatter, "handoff {id}"),
             Self::Node(id) => write!(formatter, "node {id}"),
+            Self::NodeGroup(id) => write!(formatter, "node group {id}"),
+            Self::Connection(id) => write!(formatter, "connection {id}"),
             Self::TimelineEvent(id) => write!(formatter, "timeline event {id}"),
         }
     }
@@ -120,12 +147,28 @@ impl From<NodeTarget> for EntityRef {
 pub enum DomainError {
     UnchangedWorkspaceSettings,
     WorkspaceSettingsConflict,
+    CanvasConflict,
     DuplicateEntity(EntityRef),
     EntityNotFound(EntityRef),
     InvalidReference {
         entity: EntityRef,
         field: &'static str,
         target: EntityRef,
+    },
+    InvalidGroup {
+        group_id: NodeGroupId,
+        detail: &'static str,
+    },
+    NodeInMultipleGroups {
+        node_id: NodeId,
+    },
+    InvalidConnection {
+        connection_id: ConnectionId,
+        detail: &'static str,
+    },
+    DuplicateConnection {
+        source: NodeId,
+        target: NodeId,
     },
     SameHandoffParticipant {
         handoff_id: HandoffId,
@@ -172,6 +215,9 @@ impl Display for DomainError {
             Self::WorkspaceSettingsConflict => formatter.write_str(
                 "workspace settings event does not match the current workspace settings",
             ),
+            Self::CanvasConflict => {
+                formatter.write_str("canvas edit does not match the current layout")
+            }
             Self::DuplicateEntity(entity) => write!(formatter, "{entity} already exists"),
             Self::EntityNotFound(entity) => write!(formatter, "{entity} does not exist"),
             Self::InvalidReference {
@@ -179,6 +225,20 @@ impl Display for DomainError {
                 field,
                 target,
             } => write!(formatter, "{entity} references missing {target} in {field}"),
+            Self::InvalidGroup { group_id, detail } => {
+                write!(formatter, "node group {group_id} is invalid: {detail}")
+            }
+            Self::NodeInMultipleGroups { node_id } => {
+                write!(formatter, "node {node_id} belongs to more than one group")
+            }
+            Self::InvalidConnection {
+                connection_id,
+                detail,
+            } => write!(formatter, "connection {connection_id} is invalid: {detail}"),
+            Self::DuplicateConnection { source, target } => write!(
+                formatter,
+                "a connection from node {source} to node {target} already exists"
+            ),
             Self::SameHandoffParticipant {
                 handoff_id,
                 agent_id,

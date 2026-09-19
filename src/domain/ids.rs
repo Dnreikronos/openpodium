@@ -29,4 +29,6 @@ define_id!(AgentId);
 define_id!(TaskId);
 define_id!(HandoffId);
 define_id!(NodeId);
+define_id!(NodeGroupId);
+define_id!(ConnectionId);
 define_id!(TimelineEventId);
