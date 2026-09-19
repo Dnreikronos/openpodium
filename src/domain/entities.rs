@@ -2,8 +2,9 @@ use std::collections::BTreeSet;
 
 use super::{
     AgentId, AgentState, CanvasPoint, CanvasSize, CommandPresetId, ConnectionId, Content,
-    EnvironmentProfileId, HandoffId, Name, NodeGroupId, NodeId, RoleColor, RoleIcon, RoleId,
-    TaskId, TaskState,
+    DeliveryAttempt, EnvironmentProfileId, HandoffId, HandoffMessageId, HandoffProgress,
+    HandoffResponse, HandoffTermination, Name, NodeGroupId, NodeId, RoleColor, RoleIcon, RoleId,
+    TaskId, TaskState, Timestamp,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,10 +229,18 @@ pub enum HandoffPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handoff {
-    id: HandoffId,
-    source: AgentId,
-    recipient: AgentId,
-    payload: HandoffPayload,
+    pub(super) id: HandoffId,
+    pub(super) source: AgentId,
+    pub(super) recipient: AgentId,
+    pub(super) payload: HandoffPayload,
+    pub(super) message_id: Option<HandoffMessageId>,
+    pub(super) parent: Option<HandoffId>,
+    pub(super) created_at: Option<Timestamp>,
+    pub(super) response_deadline: Option<Timestamp>,
+    pub(super) delivery_attempts: Vec<DeliveryAttempt>,
+    pub(super) progress: Vec<HandoffProgress>,
+    pub(super) response: Option<HandoffResponse>,
+    pub(super) termination: Option<HandoffTermination>,
 }
 
 impl Handoff {
@@ -246,6 +255,14 @@ impl Handoff {
             source,
             recipient,
             payload,
+            message_id: None,
+            parent: None,
+            created_at: None,
+            response_deadline: None,
+            delivery_attempts: Vec::new(),
+            progress: Vec::new(),
+            response: None,
+            termination: None,
         }
     }
 

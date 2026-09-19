@@ -59,19 +59,19 @@ impl TaskState {
     pub const fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
-            (Self::Queued, Self::Delivered | Self::Cancelled)
-                | (
-                    Self::Delivered,
-                    Self::Running | Self::Failed | Self::Cancelled
-                )
-                | (
-                    Self::Running,
-                    Self::Blocked | Self::Completed | Self::Failed | Self::Cancelled
-                )
-                | (
-                    Self::Blocked,
-                    Self::Running | Self::Failed | Self::Cancelled
-                )
+            (
+                Self::Queued,
+                Self::Delivered | Self::Failed | Self::Cancelled
+            ) | (
+                Self::Delivered,
+                Self::Running | Self::Failed | Self::Cancelled
+            ) | (
+                Self::Running,
+                Self::Blocked | Self::Completed | Self::Failed | Self::Cancelled
+            ) | (
+                Self::Blocked,
+                Self::Running | Self::Failed | Self::Cancelled
+            )
         )
     }
 

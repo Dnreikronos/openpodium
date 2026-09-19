@@ -8,10 +8,11 @@ use crate::domain::{
     Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize,
     ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft, ChatMessage, ChatMessageId,
     ChatThread, ChatThreadId, CommandPreset, CommandPresetId, Connection as DomainConnection,
-    ConnectionId, ConnectionKind, Content, DomainCommand, DomainEvent, EnvironmentKind,
-    EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffPayload, Name, Node,
-    NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleColor, RoleIcon, RoleId, SshEnvironment,
-    Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceId,
+    ConnectionId, ConnectionKind, Content, DeliveryMechanism, DomainCommand, DomainEvent,
+    EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId,
+    HandoffMessageId, HandoffPayload, HandoffProgress, HandoffResponse, HandoffResponseStatus,
+    Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleColor, RoleIcon, RoleId,
+    SshEnvironment, Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceId,
 };
 
 use super::codec::{EVENT_FORMAT_VERSION, decode_event, decode_workspace};
@@ -188,19 +189,144 @@ fn restart_restores_the_same_domain_state() {
 }
 
 #[test]
+fn typed_handoff_history_survives_restart() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    let expected = {
+        let mut journal = Journal::open(&path).unwrap();
+        let mut workspace = test_workspace();
+        for (id, agent_name) in [(1, "Lead"), (2, "Builder")] {
+            persist(
+                &mut journal,
+                &mut workspace,
+                DomainCommand::AddAgent(Agent::new(AgentId::new(id), name(agent_name), None)),
+                id,
+            );
+        }
+        let task = Task::new(
+            TaskId::new(1),
+            name("Persist handoffs"),
+            content("Keep every delivery fact"),
+            Some(AgentId::new(2)),
+            None,
+        );
+        let handoff = Handoff::tracked(
+            HandoffId::new(1),
+            HandoffMessageId::new("task-1").unwrap(),
+            AgentId::new(1),
+            AgentId::new(2),
+            HandoffPayload::Task(task.id()),
+            None,
+            timestamp(3),
+            Some(timestamp(100)),
+        )
+        .unwrap();
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddTaskHandoff { task, handoff },
+            3,
+        );
+
+        let before = workspace.handoff(HandoffId::new(1)).unwrap().clone();
+        let mut started = before.clone();
+        started
+            .begin_delivery(
+                HandoffMessageId::new("task-1").unwrap(),
+                DeliveryMechanism::CodexTerminal,
+                timestamp(4),
+            )
+            .unwrap();
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::UpdateHandoff {
+                before,
+                after: started.clone(),
+            },
+            4,
+        );
+        let mut delivered = started.clone();
+        delivered.complete_delivery(1, timestamp(5)).unwrap();
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::UpdateHandoff {
+                before: started,
+                after: delivered.clone(),
+            },
+            5,
+        );
+        let mut progressed = delivered.clone();
+        progressed
+            .report_progress(HandoffProgress::new(
+                HandoffMessageId::new("progress-1").unwrap(),
+                content("Halfway"),
+                timestamp(6),
+            ))
+            .unwrap();
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::UpdateHandoff {
+                before: delivered,
+                after: progressed.clone(),
+            },
+            6,
+        );
+        let mut responded = progressed.clone();
+        responded
+            .respond(HandoffResponse::new(
+                HandoffMessageId::new("response-1").unwrap(),
+                HandoffResponseStatus::Completed,
+                content("Done"),
+                timestamp(7),
+            ))
+            .unwrap();
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::UpdateHandoff {
+                before: progressed,
+                after: responded,
+            },
+            7,
+        );
+        workspace
+    };
+
+    let recovered = Journal::open(&path)
+        .unwrap()
+        .recover(WorkspaceId::new(7))
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered, expected);
+    assert_eq!(
+        recovered
+            .handoff(HandoffId::new(1))
+            .unwrap()
+            .response()
+            .unwrap()
+            .body()
+            .as_str(),
+        "Done"
+    );
+}
+
+#[test]
 fn canvas_graph_and_agent_program_survive_restart() {
     let temp = TempDir::new().unwrap();
     let path = database_path(&temp);
     let expected = {
         let mut journal = Journal::open(&path).unwrap();
         let mut workspace = test_workspace();
-        for (id, program) in [(1, AgentProgram::Codex), (2, AgentProgram::Claude)] {
+        for (id, program) in [(1, AgentProgram::Codex), (2, AgentProgram::OpenCode)] {
             persist(
                 &mut journal,
                 &mut workspace,
                 DomainCommand::AddAgent(Agent::with_program(
                     AgentId::new(id),
-                    name(if id == 1 { "Codex" } else { "Claude" }),
+                    name(if id == 1 { "Codex" } else { "OpenCode" }),
                     None,
                     program,
                 )),

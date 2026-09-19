@@ -5,8 +5,8 @@ use super::{
     Agent, AgentId, AgentState, CanvasLayout, ChatAttachment, ChatAttachmentId, ChatDraft,
     ChatMessage, ChatMessageId, ChatThread, ChatThreadId, ChatValidationError, CommandPreset,
     CommandPresetId, ConnectionId, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId,
-    Name, Node, NodeGroupId, NodeId, NodeTarget, Role, RoleId, Task, TaskId, TaskState,
-    ThreadColor, TimelineEventId, Timestamp, WorkspaceId, WorkspaceSettings,
+    HandoffMutationError, Name, Node, NodeGroupId, NodeId, NodeTarget, Role, RoleId, Task, TaskId,
+    TaskState, ThreadColor, TimelineEventId, Timestamp, WorkspaceId, WorkspaceSettings,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +45,14 @@ pub enum DomainCommand {
     AppendAgentChatMessage(ChatMessage),
     AddTask(Task),
     AddHandoff(Handoff),
+    AddTaskHandoff {
+        task: Task,
+        handoff: Handoff,
+    },
+    UpdateHandoff {
+        before: Handoff,
+        after: Handoff,
+    },
     AddNode(Node),
     AddAgentNode {
         agent: Agent,
@@ -116,6 +124,14 @@ pub enum DomainEvent {
     AgentChatMessageAppended(ChatMessage),
     TaskAdded(Task),
     HandoffAdded(Handoff),
+    TaskHandoffAdded {
+        task: Task,
+        handoff: Handoff,
+    },
+    HandoffChanged {
+        before: Handoff,
+        after: Handoff,
+    },
     NodeAdded(Node),
     AgentNodeAdded {
         agent: Agent,
@@ -305,6 +321,17 @@ pub enum DomainError {
         handoff_id: HandoffId,
         agent_id: AgentId,
     },
+    DuplicateHandoffMessageId,
+    HandoffChainTooDeep {
+        handoff_id: HandoffId,
+        max_depth: usize,
+    },
+    TaskHandoffMismatch {
+        handoff_id: HandoffId,
+        task_id: TaskId,
+    },
+    HandoffConflict(HandoffId),
+    InvalidHandoff(HandoffMutationError),
     InvalidRetrySource {
         task_id: TaskId,
         retry_of: TaskId,
@@ -464,6 +491,30 @@ impl Display for DomainError {
                 formatter,
                 "handoff {handoff_id} must use different source and recipient agents; both are {agent_id}"
             ),
+            Self::DuplicateHandoffMessageId => {
+                formatter.write_str("handoff message ID already exists in this workspace")
+            }
+            Self::HandoffChainTooDeep {
+                handoff_id,
+                max_depth,
+            } => write!(
+                formatter,
+                "handoff {handoff_id} exceeds the maximum parent depth of {max_depth}"
+            ),
+            Self::TaskHandoffMismatch {
+                handoff_id,
+                task_id,
+            } => write!(
+                formatter,
+                "handoff {handoff_id} does not reference its task {task_id} or recipient"
+            ),
+            Self::HandoffConflict(id) => {
+                write!(
+                    formatter,
+                    "handoff {id} event does not match the current handoff"
+                )
+            }
+            Self::InvalidHandoff(error) => error.fmt(formatter),
             Self::InvalidRetrySource {
                 task_id,
                 retry_of,
@@ -513,5 +564,11 @@ impl Error for DomainError {}
 impl From<ChatValidationError> for DomainError {
     fn from(error: ChatValidationError) -> Self {
         Self::InvalidChat(error)
+    }
+}
+
+impl From<HandoffMutationError> for DomainError {
+    fn from(error: HandoffMutationError) -> Self {
+        Self::InvalidHandoff(error)
     }
 }

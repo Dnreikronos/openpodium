@@ -28,6 +28,9 @@ pub use agents::*;
 mod chat;
 pub use chat::*;
 
+mod orchestration;
+pub use orchestration::*;
+
 mod entities;
 pub use entities::*;
 

@@ -4,17 +4,19 @@ use crate::domain::{
     Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize,
     ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft, ChatMessage, ChatMessageId,
     ChatThread, ChatThreadId, CommandPreset, CommandPresetId, Connection, ConnectionId,
-    ConnectionKind, ContainerEnvironment, Content, CustomEnvironment, DomainCommand, DomainEvent,
-    EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffPayload,
-    Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleColor, RoleIcon, RoleId,
-    SshEnvironment, Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceDirectory,
-    WorkspaceIcon, WorkspaceId, WorkspaceSettings,
+    ConnectionKind, ContainerEnvironment, Content, CustomEnvironment, DeliveryAttempt,
+    DeliveryMechanism, DeliveryOutcome, DomainCommand, DomainEvent, EnvironmentKind,
+    EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffMessageId, HandoffPayload,
+    HandoffProgress, HandoffResponse, HandoffResponseStatus, HandoffTermination, Name, Node,
+    NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleColor, RoleIcon, RoleId, SshEnvironment,
+    Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceDirectory, WorkspaceIcon,
+    WorkspaceId, WorkspaceSettings,
 };
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 6;
-pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 6;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 7;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 7;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
     serde_json::to_vec(&StoredEvent::from(event)).map_err(|source| {
@@ -70,6 +72,13 @@ pub(crate) fn decode_event(
             "domain event",
             sequence,
             "chat threads, messages, drafts, and attachments require event format version 6",
+        ));
+    }
+    if format_version < 7 && stored.requires_version_seven() {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "typed handoffs and orchestration history require event format version 7",
         ));
     }
 
@@ -190,6 +199,14 @@ enum StoredEvent {
     HandoffAdded {
         handoff: HandoffV1,
     },
+    TaskHandoffAdded {
+        task: TaskV1,
+        handoff: HandoffV1,
+    },
+    HandoffChanged {
+        before: HandoffV1,
+        after: HandoffV1,
+    },
     NodeAdded {
         node: NodeV1,
     },
@@ -306,6 +323,14 @@ impl From<&DomainEvent> for StoredEvent {
             DomainEvent::HandoffAdded(handoff) => Self::HandoffAdded {
                 handoff: HandoffV1::from(handoff),
             },
+            DomainEvent::TaskHandoffAdded { task, handoff } => Self::TaskHandoffAdded {
+                task: TaskV1::from(task),
+                handoff: HandoffV1::from(handoff),
+            },
+            DomainEvent::HandoffChanged { before, after } => Self::HandoffChanged {
+                before: HandoffV1::from(before),
+                after: HandoffV1::from(after),
+            },
             DomainEvent::NodeAdded(node) => Self::NodeAdded {
                 node: NodeV1::from(node),
             },
@@ -382,6 +407,14 @@ impl StoredEvent {
                 | Self::ChatDraftSubmitted { .. }
                 | Self::AgentChatMessageAppended { .. }
         )
+    }
+
+    fn requires_version_seven(&self) -> bool {
+        match self {
+            Self::TaskHandoffAdded { .. } | Self::HandoffChanged { .. } => true,
+            Self::HandoffAdded { handoff } => handoff.has_orchestration_fields(),
+            _ => false,
+        }
     }
 
     fn into_domain(self) -> Result<DomainEvent, String> {
@@ -480,6 +513,20 @@ impl StoredEvent {
                 Ok(DomainEvent::TaskAdded(task))
             }
             Self::HandoffAdded { handoff } => Ok(DomainEvent::HandoffAdded(handoff.into_domain()?)),
+            Self::TaskHandoffAdded { task, handoff } => {
+                let (task, state) = task.into_domain()?;
+                if state != TaskState::Queued {
+                    return Err("a task_handoff_added event must contain a queued task".to_owned());
+                }
+                Ok(DomainEvent::TaskHandoffAdded {
+                    task,
+                    handoff: handoff.into_domain()?,
+                })
+            }
+            Self::HandoffChanged { before, after } => Ok(DomainEvent::HandoffChanged {
+                before: before.into_domain()?,
+                after: after.into_domain()?,
+            }),
             Self::NodeAdded { node } => Ok(DomainEvent::NodeAdded(node.into_domain()?)),
             Self::AgentNodeAdded { agent, node } => {
                 let (agent, state) = agent.into_domain()?;
@@ -619,13 +666,13 @@ impl StoredWorkspace {
         }
         if format_version < 5
             && (!self.command_presets.is_empty()
-                || self.roles.iter().any(RoleV1::has_appearance_fields))
-            || self.agents.iter().any(|agent| {
-                matches!(
-                    agent.program,
-                    AgentProgramV1::OpenCode | AgentProgramV1::Custom { .. }
-                )
-            })
+                || self.roles.iter().any(RoleV1::has_appearance_fields)
+                || self.agents.iter().any(|agent| {
+                    matches!(
+                        agent.program,
+                        AgentProgramV1::OpenCode | AgentProgramV1::Custom { .. }
+                    )
+                }))
         {
             return Err(
                 "command presets and role appearance require snapshot format version 5".to_owned(),
@@ -636,6 +683,17 @@ impl StoredWorkspace {
         {
             return Err(
                 "chat threads and attachments require snapshot format version 6".to_owned(),
+            );
+        }
+        if format_version < 7
+            && self
+                .handoffs
+                .iter()
+                .any(HandoffV1::has_orchestration_fields)
+        {
+            return Err(
+                "typed handoffs and orchestration history require snapshot format version 7"
+                    .to_owned(),
             );
         }
 
@@ -692,10 +750,20 @@ impl StoredWorkspace {
             restore_task_state(&mut workspace, task_id, state)?;
         }
 
-        for handoff in self.handoffs {
+        let mut pending_handoffs = self.handoffs;
+        while !pending_handoffs.is_empty() {
+            let Some(index) = pending_handoffs.iter().position(|handoff| {
+                handoff
+                    .parent
+                    .is_none_or(|parent| workspace.handoff(HandoffId::new(parent)).is_some())
+            }) else {
+                return Err(
+                    "handoff parent references contain a cycle or missing handoff".to_owned(),
+                );
+            };
             apply_snapshot_command(
                 &mut workspace,
-                DomainCommand::AddHandoff(handoff.into_domain()?),
+                DomainCommand::AddHandoff(pending_handoffs.remove(index).into_domain()?),
             )?;
         }
         for node in self.nodes {
@@ -1357,6 +1425,22 @@ struct HandoffV1 {
     source: u64,
     recipient: u64,
     payload: HandoffPayloadV1,
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    parent: Option<u64>,
+    #[serde(default)]
+    created_at: Option<u64>,
+    #[serde(default)]
+    response_deadline: Option<u64>,
+    #[serde(default)]
+    delivery_attempts: Vec<DeliveryAttemptV1>,
+    #[serde(default)]
+    progress: Vec<HandoffProgressV1>,
+    #[serde(default)]
+    response: Option<HandoffResponseV1>,
+    #[serde(default)]
+    termination: Option<HandoffTerminationV1>,
 }
 
 impl From<&Handoff> for HandoffV1 {
@@ -1366,18 +1450,344 @@ impl From<&Handoff> for HandoffV1 {
             source: handoff.source().get(),
             recipient: handoff.recipient().get(),
             payload: HandoffPayloadV1::from(handoff.payload()),
+            message_id: handoff
+                .message_id()
+                .map(|message_id| message_id.as_str().to_owned()),
+            parent: handoff.parent().map(HandoffId::get),
+            created_at: handoff.created_at().map(Timestamp::as_unix_millis),
+            response_deadline: handoff.response_deadline().map(Timestamp::as_unix_millis),
+            delivery_attempts: handoff
+                .delivery_attempts()
+                .iter()
+                .map(DeliveryAttemptV1::from)
+                .collect(),
+            progress: handoff
+                .progress()
+                .iter()
+                .map(HandoffProgressV1::from)
+                .collect(),
+            response: handoff.response().map(HandoffResponseV1::from),
+            termination: handoff.termination().map(HandoffTerminationV1::from),
         }
     }
 }
 
 impl HandoffV1 {
     fn into_domain(self) -> Result<Handoff, String> {
-        Ok(Handoff::new(
-            HandoffId::new(self.id),
-            AgentId::new(self.source),
-            AgentId::new(self.recipient),
-            self.payload.into_domain()?,
+        let id = HandoffId::new(self.id);
+        let source = AgentId::new(self.source);
+        let recipient = AgentId::new(self.recipient);
+        let payload = self.payload.into_domain()?;
+        let Some(message_id) = self.message_id else {
+            if self.parent.is_some()
+                || self.created_at.is_some()
+                || self.response_deadline.is_some()
+                || !self.delivery_attempts.is_empty()
+                || !self.progress.is_empty()
+                || self.response.is_some()
+                || self.termination.is_some()
+            {
+                return Err("legacy handoff contains orchestration fields".to_owned());
+            }
+            return Ok(Handoff::new(id, source, recipient, payload));
+        };
+        let created_at = self
+            .created_at
+            .map(Timestamp::from_unix_millis)
+            .ok_or_else(|| "tracked handoff is missing created_at".to_owned())?;
+        let mut handoff = Handoff::tracked(
+            id,
+            HandoffMessageId::new(message_id).map_err(|error| error.to_string())?,
+            source,
+            recipient,
+            payload,
+            self.parent.map(HandoffId::new),
+            created_at,
+            self.response_deadline.map(Timestamp::from_unix_millis),
+        )
+        .map_err(|error| error.to_string())?;
+
+        for attempt in self.delivery_attempts {
+            let ordinal = handoff
+                .begin_delivery(
+                    HandoffMessageId::new(attempt.message_id).map_err(|error| error.to_string())?,
+                    attempt.mechanism.into(),
+                    Timestamp::from_unix_millis(attempt.started_at),
+                )
+                .map_err(|error| error.to_string())?;
+            if ordinal != attempt.ordinal {
+                return Err("delivery attempt ordinals are not contiguous".to_owned());
+            }
+            match attempt.outcome {
+                DeliveryOutcomeV1::Started => {}
+                DeliveryOutcomeV1::Delivered { finished_at } => handoff
+                    .complete_delivery(ordinal, Timestamp::from_unix_millis(finished_at))
+                    .map_err(|error| error.to_string())?,
+                DeliveryOutcomeV1::Failed {
+                    finished_at,
+                    error,
+                    retryable,
+                } => handoff
+                    .fail_delivery(
+                        ordinal,
+                        Timestamp::from_unix_millis(finished_at),
+                        Content::new(error).map_err(|error| error.to_string())?,
+                        retryable,
+                    )
+                    .map_err(|error| error.to_string())?,
+            }
+        }
+        for progress in self.progress {
+            handoff
+                .report_progress(progress.into_domain()?)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(response) = self.response {
+            handoff
+                .respond(response.into_domain()?)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(termination) = self.termination {
+            match termination {
+                HandoffTerminationV1::Cancelled {
+                    message_id,
+                    reason,
+                    cancelled_at,
+                } => handoff
+                    .cancel(
+                        HandoffMessageId::new(message_id).map_err(|error| error.to_string())?,
+                        Content::new(reason).map_err(|error| error.to_string())?,
+                        Timestamp::from_unix_millis(cancelled_at),
+                    )
+                    .map_err(|error| error.to_string())?,
+                HandoffTerminationV1::TimedOut { timed_out_at } => handoff
+                    .time_out(Timestamp::from_unix_millis(timed_out_at))
+                    .map_err(|error| error.to_string())?,
+            }
+        }
+        Ok(handoff)
+    }
+
+    fn has_orchestration_fields(&self) -> bool {
+        self.message_id.is_some()
+            || self.parent.is_some()
+            || self.created_at.is_some()
+            || self.response_deadline.is_some()
+            || !self.delivery_attempts.is_empty()
+            || !self.progress.is_empty()
+            || self.response.is_some()
+            || self.termination.is_some()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryAttemptV1 {
+    ordinal: u32,
+    message_id: String,
+    started_at: u64,
+    mechanism: DeliveryMechanismV1,
+    outcome: DeliveryOutcomeV1,
+}
+
+impl From<&DeliveryAttempt> for DeliveryAttemptV1 {
+    fn from(attempt: &DeliveryAttempt) -> Self {
+        Self {
+            ordinal: attempt.ordinal(),
+            message_id: attempt.message_id().as_str().to_owned(),
+            started_at: attempt.started_at().as_unix_millis(),
+            mechanism: attempt.mechanism().into(),
+            outcome: DeliveryOutcomeV1::from(attempt.outcome()),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeliveryMechanismV1 {
+    #[serde(rename = "codex_terminal")]
+    Codex,
+    #[serde(rename = "claude_terminal")]
+    Claude,
+    #[serde(rename = "open_code_terminal")]
+    OpenCode,
+}
+
+impl From<DeliveryMechanism> for DeliveryMechanismV1 {
+    fn from(mechanism: DeliveryMechanism) -> Self {
+        match mechanism {
+            DeliveryMechanism::CodexTerminal => Self::Codex,
+            DeliveryMechanism::ClaudeTerminal => Self::Claude,
+            DeliveryMechanism::OpenCodeTerminal => Self::OpenCode,
+        }
+    }
+}
+
+impl From<DeliveryMechanismV1> for DeliveryMechanism {
+    fn from(mechanism: DeliveryMechanismV1) -> Self {
+        match mechanism {
+            DeliveryMechanismV1::Codex => Self::CodexTerminal,
+            DeliveryMechanismV1::Claude => Self::ClaudeTerminal,
+            DeliveryMechanismV1::OpenCode => Self::OpenCodeTerminal,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum DeliveryOutcomeV1 {
+    Started,
+    Delivered {
+        finished_at: u64,
+    },
+    Failed {
+        finished_at: u64,
+        error: String,
+        #[serde(default = "default_true")]
+        retryable: bool,
+    },
+}
+
+impl From<&DeliveryOutcome> for DeliveryOutcomeV1 {
+    fn from(outcome: &DeliveryOutcome) -> Self {
+        match outcome {
+            DeliveryOutcome::Started => Self::Started,
+            DeliveryOutcome::Delivered { finished_at } => Self::Delivered {
+                finished_at: finished_at.as_unix_millis(),
+            },
+            DeliveryOutcome::Failed {
+                finished_at,
+                error,
+                retryable,
+            } => Self::Failed {
+                finished_at: finished_at.as_unix_millis(),
+                error: error.as_str().to_owned(),
+                retryable: *retryable,
+            },
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffProgressV1 {
+    message_id: String,
+    body: String,
+    reported_at: u64,
+}
+
+impl From<&HandoffProgress> for HandoffProgressV1 {
+    fn from(progress: &HandoffProgress) -> Self {
+        Self {
+            message_id: progress.message_id().as_str().to_owned(),
+            body: progress.body().as_str().to_owned(),
+            reported_at: progress.reported_at().as_unix_millis(),
+        }
+    }
+}
+
+impl HandoffProgressV1 {
+    fn into_domain(self) -> Result<HandoffProgress, String> {
+        Ok(HandoffProgress::new(
+            HandoffMessageId::new(self.message_id).map_err(|error| error.to_string())?,
+            Content::new(self.body).map_err(|error| error.to_string())?,
+            Timestamp::from_unix_millis(self.reported_at),
         ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffResponseV1 {
+    message_id: String,
+    status: HandoffResponseStatusV1,
+    body: String,
+    responded_at: u64,
+}
+
+impl From<&HandoffResponse> for HandoffResponseV1 {
+    fn from(response: &HandoffResponse) -> Self {
+        Self {
+            message_id: response.message_id().as_str().to_owned(),
+            status: response.status().into(),
+            body: response.body().as_str().to_owned(),
+            responded_at: response.responded_at().as_unix_millis(),
+        }
+    }
+}
+
+impl HandoffResponseV1 {
+    fn into_domain(self) -> Result<HandoffResponse, String> {
+        Ok(HandoffResponse::new(
+            HandoffMessageId::new(self.message_id).map_err(|error| error.to_string())?,
+            self.status.into(),
+            Content::new(self.body).map_err(|error| error.to_string())?,
+            Timestamp::from_unix_millis(self.responded_at),
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HandoffResponseStatusV1 {
+    Completed,
+    Failed,
+    Blocked,
+}
+
+impl From<HandoffResponseStatus> for HandoffResponseStatusV1 {
+    fn from(status: HandoffResponseStatus) -> Self {
+        match status {
+            HandoffResponseStatus::Completed => Self::Completed,
+            HandoffResponseStatus::Failed => Self::Failed,
+            HandoffResponseStatus::Blocked => Self::Blocked,
+        }
+    }
+}
+
+impl From<HandoffResponseStatusV1> for HandoffResponseStatus {
+    fn from(status: HandoffResponseStatusV1) -> Self {
+        match status {
+            HandoffResponseStatusV1::Completed => Self::Completed,
+            HandoffResponseStatusV1::Failed => Self::Failed,
+            HandoffResponseStatusV1::Blocked => Self::Blocked,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum HandoffTerminationV1 {
+    Cancelled {
+        message_id: String,
+        reason: String,
+        cancelled_at: u64,
+    },
+    TimedOut {
+        timed_out_at: u64,
+    },
+}
+
+impl From<&HandoffTermination> for HandoffTerminationV1 {
+    fn from(termination: &HandoffTermination) -> Self {
+        match termination {
+            HandoffTermination::Cancelled {
+                message_id,
+                reason,
+                cancelled_at,
+            } => Self::Cancelled {
+                message_id: message_id.as_str().to_owned(),
+                reason: reason.as_str().to_owned(),
+                cancelled_at: cancelled_at.as_unix_millis(),
+            },
+            HandoffTermination::TimedOut { timed_out_at } => Self::TimedOut {
+                timed_out_at: timed_out_at.as_unix_millis(),
+            },
+        }
     }
 }
 
