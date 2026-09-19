@@ -121,7 +121,7 @@ impl Workspace {
         self.roles.values()
     }
 
-    pub(crate) fn agents(&self) -> impl Iterator<Item = &Agent> {
+    pub fn agents(&self) -> impl Iterator<Item = &Agent> {
         self.agents.values()
     }
 
