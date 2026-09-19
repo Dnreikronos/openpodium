@@ -16,10 +16,14 @@ use openpodium::domain::{
     RoleIcon, RoleId, SshEnvironment, ThreadColor, Timestamp, Workspace, WorkspaceDirectory,
     WorkspaceId,
 };
+use openpodium::ipc::{
+    AGENT_ID_ENV, AVAILABLE_ENV, AgentCapabilities, AgentRegistration, CLI_ENV, ENDPOINT_ENV,
+    IpcService, TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
+};
 use openpodium::persistence::{export_role, import_role};
 use openpodium::runtime::{
-    EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, RuntimeError,
-    check_agent_capability, check_environment, prepare_environment_process,
+    EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, ProcessSpec,
+    RuntimeError, check_agent_capability, check_environment, prepare_environment_process,
 };
 use openpodium::workspaces::{WorkspaceManager, WorkspaceSettingsInput};
 use tokio::sync::Mutex;
@@ -57,6 +61,7 @@ struct OpenPodium {
     terminal_generation: u64,
     chat_ui: chat::UiState,
     attachment_store: Option<AttachmentStore>,
+    ipc: Option<IpcService>,
     workspaces: Option<WorkspaceManager>,
     create_directory: String,
     name: String,
@@ -87,17 +92,26 @@ struct OpenPodium {
 
 impl Default for OpenPodium {
     fn default() -> Self {
-        let (workspaces, attachment_store, notice) = match application_database_path() {
+        let (workspaces, attachment_store, ipc, notice) = match application_database_path() {
             Ok(path) => {
                 let attachment_store = path
                     .parent()
                     .map(|directory| AttachmentStore::new(directory.join("attachments")));
-                match WorkspaceManager::open(path) {
-                    Ok(workspaces) => (Some(workspaces), attachment_store, None),
-                    Err(error) => (None, attachment_store, Some(error.to_string())),
-                }
+                let workspaces = WorkspaceManager::open(&path).map_err(|error| error.to_string());
+                let ipc = path
+                    .parent()
+                    .ok_or_else(|| "application database has no parent directory".to_owned())
+                    .and_then(|directory| {
+                        IpcService::start(directory).map_err(|error| error.to_string())
+                    });
+                let notice = workspaces
+                    .as_ref()
+                    .err()
+                    .cloned()
+                    .or_else(|| ipc.as_ref().err().cloned());
+                (workspaces.ok(), attachment_store, ipc.ok(), notice)
             }
-            Err(error) => (None, None, Some(error.to_string())),
+            Err(error) => (None, None, None, Some(error.to_string())),
         };
         let mut state = Self {
             camera: Camera::default(),
@@ -110,6 +124,7 @@ impl Default for OpenPodium {
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),
             attachment_store,
+            ipc,
             workspaces,
             create_directory: String::new(),
             name: String::new(),
@@ -138,6 +153,7 @@ impl Default for OpenPodium {
             notice,
         };
         state.load_active_settings();
+        state.sync_ipc_directory();
         state
     }
 }
@@ -278,6 +294,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
                     state.notice = Some("Workspace created".to_owned());
                     state.reset_canvas_session();
                     state.load_active_settings();
+                    state.sync_ipc_directory();
                 }
                 Err(error) => state.notice = Some(error),
             }
@@ -861,6 +878,28 @@ impl OpenPodium {
         self.selected_role = None;
         clear_preset_draft(self);
         clear_role_draft(self);
+    }
+
+    fn sync_ipc_directory(&self) {
+        let (Some(ipc), Some(workspaces)) = (&self.ipc, &self.workspaces) else {
+            return;
+        };
+        for workspace in workspaces.recent_workspaces() {
+            ipc.replace_workspace_agents(
+                workspace.id().get(),
+                workspace.agents().map(|agent| AgentRegistration {
+                    id: agent.id().get(),
+                    name: agent.name().as_str().to_owned(),
+                    program: agent.program().label().to_owned(),
+                    state: agent.state().to_string(),
+                    capabilities: if agent.environment_id().is_none() {
+                        AgentCapabilities::CONNECTED
+                    } else {
+                        AgentCapabilities::UNAVAILABLE
+                    },
+                }),
+            );
+        }
     }
 }
 
@@ -1583,7 +1622,13 @@ fn format_process_preview(spec: &openpodium::runtime::ProcessSpec) -> String {
     let environment = spec
         .environment()
         .iter()
-        .map(|(name, value)| format!("{name:?}={value:?}"))
+        .map(|(name, value)| {
+            if name.to_string_lossy() == TOKEN_ENV {
+                format!("{name:?}=\"[redacted]\"")
+            } else {
+                format!("{name:?}={value:?}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -1954,6 +1999,7 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
         );
     match result {
         Ok(_) => {
+            state.sync_ipc_directory();
             state.canvas_history.record(before);
             state.canvas_selection = vec![node_id];
             state.canvas_preview = None;
@@ -1967,39 +2013,41 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
 }
 
 fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
-    let Some((workspace_id, program, preset, role, profile, working_directory, size)) = state
-        .workspaces
-        .as_ref()
-        .and_then(WorkspaceManager::active_workspace)
-        .and_then(|workspace| {
-            let node = workspace.node(node_id)?;
-            let NodeTarget::Agent(agent_id) = node.target() else {
-                return None;
-            };
-            let agent = workspace.agent(agent_id)?;
-            let working_directory = workspace.settings().working_directory()?.as_str();
-            let profile = agent
-                .environment_id()
-                .and_then(|environment_id| workspace.environment_profile(environment_id))
-                .cloned();
-            let preset = match agent.program() {
-                AgentProgram::Custom(preset_id) => workspace.command_preset(preset_id).cloned(),
-                _ => None,
-            };
-            let role = agent
-                .role_id()
-                .and_then(|role_id| workspace.role(role_id))
-                .cloned();
-            Some((
-                workspace.id(),
-                agent.program(),
-                preset,
-                role,
-                profile,
-                PathBuf::from(working_directory),
-                terminal::GridSize::for_node(node.size().width(), node.size().height()),
-            ))
-        })
+    let Some((workspace_id, agent_id, program, preset, role, profile, working_directory, size)) =
+        state
+            .workspaces
+            .as_ref()
+            .and_then(WorkspaceManager::active_workspace)
+            .and_then(|workspace| {
+                let node = workspace.node(node_id)?;
+                let NodeTarget::Agent(agent_id) = node.target() else {
+                    return None;
+                };
+                let agent = workspace.agent(agent_id)?;
+                let working_directory = workspace.settings().working_directory()?.as_str();
+                let profile = agent
+                    .environment_id()
+                    .and_then(|environment_id| workspace.environment_profile(environment_id))
+                    .cloned();
+                let preset = match agent.program() {
+                    AgentProgram::Custom(preset_id) => workspace.command_preset(preset_id).cloned(),
+                    _ => None,
+                };
+                let role = agent
+                    .role_id()
+                    .and_then(|role_id| workspace.role(role_id))
+                    .cloned();
+                Some((
+                    workspace.id(),
+                    agent.id(),
+                    agent.program(),
+                    preset,
+                    role,
+                    profile,
+                    PathBuf::from(working_directory),
+                    terminal::GridSize::for_node(node.size().width(), node.size().height()),
+                ))
+            })
     else {
         state.notice = Some("The selected agent has no workspace working directory".to_owned());
         return Task::none();
@@ -2038,6 +2086,13 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
     )
     .map_err(|error| error.to_string())
     .and_then(|spec| {
+        let spec = apply_ipc_environment(
+            spec,
+            state.ipc.as_ref(),
+            workspace_id,
+            agent_id,
+            profile.is_none(),
+        );
         prepare_environment_process(profile.as_ref(), spec).map_err(|error| error.to_string())
     }) {
         Ok(spec) => spec,
@@ -2069,6 +2124,33 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
             result,
         },
     )
+}
+
+fn apply_ipc_environment(
+    mut spec: ProcessSpec,
+    ipc: Option<&IpcService>,
+    workspace_id: WorkspaceId,
+    agent_id: AgentId,
+    is_local: bool,
+) -> ProcessSpec {
+    spec = spec
+        .env(WORKSPACE_ID_ENV, workspace_id.get().to_string())
+        .env(AGENT_ID_ENV, agent_id.get().to_string());
+    let Some(connection) = is_local
+        .then(|| ipc.and_then(|ipc| ipc.connection_info(workspace_id.get(), agent_id.get())))
+        .flatten()
+    else {
+        return spec.env(AVAILABLE_ENV, "0");
+    };
+    let spec = spec
+        .env(AVAILABLE_ENV, "1")
+        .env(ENDPOINT_ENV, connection.endpoint().to_string())
+        .env(TOKEN_ENV, connection.token())
+        .env(VERSIONS_ENV, openpodium::ipc::PROTOCOL_VERSION.to_string());
+    match env::current_exe() {
+        Ok(executable) => spec.env(CLI_ENV, executable),
+        Err(_) => spec,
+    }
 }
 
 fn handle_terminal_started(
@@ -2571,6 +2653,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ipc_launch_environment_is_scoped_and_secret_preview_is_redacted() {
+        let temp = TempDir::new().unwrap();
+        let service = IpcService::start(temp.path()).unwrap();
+        service.replace_workspace_agents(
+            4,
+            [AgentRegistration {
+                id: 7,
+                name: "Builder".to_owned(),
+                program: "Codex".to_owned(),
+                state: "running".to_owned(),
+                capabilities: AgentCapabilities::CONNECTED,
+            }],
+        );
+        let local = apply_ipc_environment(
+            ProcessSpec::new("agent", temp.path()),
+            Some(&service),
+            WorkspaceId::new(4),
+            AgentId::new(7),
+            true,
+        );
+        let token = local
+            .environment()
+            .iter()
+            .find(|(name, _)| name == TOKEN_ENV)
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(!token.is_empty());
+        assert!(
+            local
+                .environment()
+                .iter()
+                .any(|(name, value)| name == AVAILABLE_ENV && value == "1")
+        );
+        assert!(local.environment().iter().any(|(name, _)| name == CLI_ENV));
+        let preview = format_process_preview(&local);
+        assert!(preview.contains("[redacted]"));
+        assert!(!preview.contains(&token));
+
+        let remote = apply_ipc_environment(
+            ProcessSpec::new("agent", temp.path()),
+            Some(&service),
+            WorkspaceId::new(4),
+            AgentId::new(7),
+            false,
+        );
+        assert!(
+            remote
+                .environment()
+                .iter()
+                .any(|(name, value)| name == AVAILABLE_ENV && value == "0")
+        );
+        assert!(
+            remote
+                .environment()
+                .iter()
+                .all(|(name, _)| name != TOKEN_ENV && name != ENDPOINT_ENV && name != CLI_ENV)
+        );
+    }
+
+    #[test]
     fn adding_an_agent_is_persisted_and_participates_in_undo_redo() {
         let temp = TempDir::new().unwrap();
         let project = temp.path().join("project");
@@ -2591,6 +2733,7 @@ mod tests {
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),
             attachment_store: None,
+            ipc: None,
             workspaces: Some(workspaces),
             create_directory: String::new(),
             name: String::new(),
@@ -2890,6 +3033,7 @@ mod tests {
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),
             attachment_store: None,
+            ipc: None,
             workspaces: Some(workspaces),
             create_directory: String::new(),
             name: String::new(),
