@@ -25,6 +25,7 @@ async fn interactive_shell_uses_working_directory_and_accepts_input() {
     process
         .write_input(shell_input_for_working_directory())
         .expect("input reaches shell");
+    process.close_input().expect("shell input closes");
     let (output, termination) = collect_process(&mut process).await;
 
     let output = String::from_utf8_lossy(&output);
@@ -56,6 +57,7 @@ async fn resize_is_visible_inside_the_child_terminal() {
     process
         .write_input(shell_input_for_terminal_size())
         .expect("terminal query reaches shell");
+    process.close_input().expect("shell input closes");
     let (output, termination) = collect_process(&mut process).await;
 
     let output = String::from_utf8_lossy(&output);
@@ -84,6 +86,7 @@ async fn exit_and_startup_failure_are_each_observed_once() {
     let mut process = LocalProcessRuntime
         .spawn(exiting_process(directory.path(), 7))
         .expect("child starts");
+    process.close_input().expect("child input closes");
     let (_, termination) = collect_process(&mut process).await;
     assert!(matches!(
         termination,
@@ -166,7 +169,7 @@ fn shell_input_for_working_directory() -> &'static [u8] {
 
 #[cfg(windows)]
 fn shell_input_for_working_directory() -> &'static [u8] {
-    b"echo __OPENPODIUM_READY__& cd & exit /b 0\r\n"
+    b"echo __OPENPODIUM_READY__& cd & exit /b 0\r"
 }
 
 #[cfg(unix)]
@@ -176,7 +179,7 @@ fn shell_input_for_terminal_size() -> &'static [u8] {
 
 #[cfg(windows)]
 fn shell_input_for_terminal_size() -> &'static [u8] {
-    b"powershell.exe -NoLogo -NoProfile -Command \"$s=$Host.UI.RawUI.WindowSize; Write-Output ('{0} {1}' -f $s.Height,$s.Width)\" & exit /b 0\r\n"
+    b"powershell.exe -NoLogo -NoProfile -Command \"$s=$Host.UI.RawUI.WindowSize; Write-Output ('{0} {1}' -f $s.Height,$s.Width)\" & exit /b 0\r"
 }
 
 #[cfg(unix)]

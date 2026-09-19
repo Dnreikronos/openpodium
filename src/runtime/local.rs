@@ -179,6 +179,20 @@ impl RunningProcess {
             .map_err(|error| RuntimeError::new(RuntimeOperation::WriteInput, error.to_string()))
     }
 
+    pub fn close_input(&self) -> Result<(), RuntimeError> {
+        self.control.ensure_running(RuntimeOperation::CloseInput)?;
+        let writer = lock(&self.control.writer, RuntimeOperation::CloseInput)?
+            .take()
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeOperation::CloseInput,
+                    "process input is already closed",
+                )
+            })?;
+        drop(writer);
+        Ok(())
+    }
+
     pub fn resize(&self, size: TerminalSize) -> Result<(), RuntimeError> {
         self.control.ensure_running(RuntimeOperation::Resize)?;
         let master_handle = lock(&self.control.master, RuntimeOperation::Resize)?;
