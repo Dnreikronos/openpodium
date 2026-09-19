@@ -14,7 +14,7 @@ use crate::domain::{
     Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceId,
 };
 
-use super::codec::{decode_event, decode_workspace};
+use super::codec::{EVENT_FORMAT_VERSION, decode_event, decode_workspace};
 use super::{Journal, PersistenceError, RoleTransferError, export_role, import_role};
 
 #[test]
@@ -693,7 +693,7 @@ fn unknown_event_format_fails_recovery_without_partial_state() {
             record_type: "domain event",
             sequence: 2,
             found: 99,
-            supported: 5,
+            supported: EVENT_FORMAT_VERSION,
         }
     ));
 }
