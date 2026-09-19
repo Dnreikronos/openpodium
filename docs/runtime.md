@@ -31,7 +31,8 @@ terminal event:
 
 - `Exited` includes the portable exit code, optional signal, and success flag.
 - `Cancelled` reports that OpenPodium requested termination.
-- `Failed` reports that the runtime could not observe the child's exit.
+- `Failed` reports a runtime failure while observing the child's exit or
+  draining its PTY output.
 
 Dropping a live handle has the same cleanup semantics as cancellation. Killing
 an already-finished process is avoided, and cancellation is idempotent.
