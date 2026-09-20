@@ -242,8 +242,13 @@ impl Orchestrator {
                 reason,
                 accepted_at,
             ),
-            ProtocolCommand::ListAgents => Err(OrchestrationError::InvalidMessage(
-                "agent-list requests do not enter the orchestration queue".to_owned(),
+            ProtocolCommand::ListAgents
+            | ProtocolCommand::ListPortals
+            | ProtocolCommand::InspectPortal { .. }
+            | ProtocolCommand::ObservePortal { .. }
+            | ProtocolCommand::RequestPortalAction { .. }
+            | ProtocolCommand::GetPortalResult { .. } => Err(OrchestrationError::InvalidMessage(
+                "agent-list and portal requests do not enter the orchestration queue".to_owned(),
             )),
         }
     }

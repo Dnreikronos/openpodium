@@ -418,6 +418,9 @@ fn execute_command(
     command: ProtocolCommand,
     context: &ServerContext,
 ) -> Result<ProtocolResult, ProtocolError> {
+    if command.is_portal() {
+        return execute_portal_command(command);
+    }
     if matches!(command, ProtocolCommand::ListAgents) {
         let directory = read_lock(&context.directory);
         let agents = directory
@@ -519,6 +522,21 @@ fn execute_command(
     })
 }
 
+fn execute_portal_command(command: ProtocolCommand) -> Result<ProtocolResult, ProtocolError> {
+    let operation = match command {
+        ProtocolCommand::ListPortals => "list connected portals",
+        ProtocolCommand::InspectPortal { .. } => "inspect a portal",
+        ProtocolCommand::ObservePortal { .. } => "observe a portal",
+        ProtocolCommand::RequestPortalAction { .. } => "request a portal action",
+        ProtocolCommand::GetPortalResult { .. } => "retrieve a portal result",
+        _ => unreachable!("portal dispatcher received a non-portal command"),
+    };
+    Err(ProtocolError::new(
+        ErrorCode::PortalUnavailable,
+        format!("cannot {operation}; the portal dispatcher is not connected"),
+    ))
+}
+
 fn validate_capabilities(
     directory: &RwLock<Directory>,
     workspace_id: u64,
@@ -565,7 +583,14 @@ fn validate_capabilities(
             recipient.capabilities.supports_cancellation,
             "recipient agent does not support cancellation",
         ),
-        ProtocolCommand::ListAgents => unreachable!("list commands are handled before routing"),
+        ProtocolCommand::ListAgents
+        | ProtocolCommand::ListPortals
+        | ProtocolCommand::InspectPortal { .. }
+        | ProtocolCommand::ObservePortal { .. }
+        | ProtocolCommand::RequestPortalAction { .. }
+        | ProtocolCommand::GetPortalResult { .. } => {
+            unreachable!("read and portal commands are handled before routing")
+        }
     };
     if supported {
         Ok(())
@@ -655,7 +680,14 @@ fn route_message(
                 })?;
             Ok(handoff.recipient_agent_id)
         }
-        ProtocolCommand::ListAgents => unreachable!("list commands are handled before routing"),
+        ProtocolCommand::ListAgents
+        | ProtocolCommand::ListPortals
+        | ProtocolCommand::InspectPortal { .. }
+        | ProtocolCommand::ObservePortal { .. }
+        | ProtocolCommand::RequestPortalAction { .. }
+        | ProtocolCommand::GetPortalResult { .. } => {
+            unreachable!("read and portal commands are handled before routing")
+        }
     }
 }
 

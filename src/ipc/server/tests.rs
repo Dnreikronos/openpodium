@@ -66,6 +66,25 @@ fn agent_listing_is_scoped_to_the_authenticated_workspace() {
 }
 
 #[test]
+fn portal_commands_use_the_dedicated_dispatcher_boundary() {
+    let (_temp, service) = service();
+    let response = round_trip(
+        service.endpoint(),
+        &request(
+            &service,
+            1,
+            1,
+            "portal-list-1",
+            ProtocolCommand::ListPortals,
+        ),
+    );
+
+    assert_eq!(response.version, Some(PROTOCOL_VERSION));
+    assert_eq!(response.error.unwrap().code, ErrorCode::PortalUnavailable);
+    assert!(service.try_recv().is_none());
+}
+
+#[test]
 fn invalid_credentials_are_rejected_without_identity_details() {
     let (_temp, service) = service();
     let mut unauthorized = request(&service, 1, 1, "list-1", ProtocolCommand::ListAgents);
@@ -262,7 +281,7 @@ fn version_two_questions_progress_responses_and_cancellation_are_routed() {
         service.endpoint(),
         &request(&service, 1, 1, "request-1", question),
     );
-    assert_eq!(sent.version, Some(2));
+    assert_eq!(sent.version, Some(PROTOCOL_VERSION));
 
     for (request_id, command) in [
         (

@@ -282,6 +282,11 @@ const fn error_code(code: ErrorCode) -> &'static str {
         ErrorCode::AgentNotVisible => "agent_not_visible",
         ErrorCode::IdempotencyConflict => "idempotency_conflict",
         ErrorCode::ServiceUnavailable => "service_unavailable",
+        ErrorCode::PortalUnavailable => "portal_unavailable",
+        ErrorCode::PortalPolicyDenied => "portal_policy_denied",
+        ErrorCode::PortalApprovalRequired => "portal_approval_required",
+        ErrorCode::StalePortalObservation => "stale_portal_observation",
+        ErrorCode::UnknownPortalAction => "unknown_portal_action",
     }
 }
 
