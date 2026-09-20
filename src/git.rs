@@ -66,11 +66,8 @@ impl Repository {
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )?;
         Ok(Self {
-            root: PathBuf::from(root.trim_end_matches('\n'))
-                .canonicalize()
-                .map_err(|e| e.to_string())?,
-            common_directory: PathBuf::from(common.trim_end_matches('\n'))
-                .canonicalize()
+            root: dunce::canonicalize(root.trim_end_matches('\n')).map_err(|e| e.to_string())?,
+            common_directory: dunce::canonicalize(common.trim_end_matches('\n'))
                 .map_err(|e| e.to_string())?,
         })
     }
@@ -85,7 +82,7 @@ impl Repository {
                     checkouts.push(checkout);
                 }
                 current = Some(Checkout {
-                    path: PathBuf::from(path),
+                    path: dunce::simplified(Path::new(path)).to_owned(),
                     head: String::new(),
                     branch: None,
                     locked: false,
@@ -111,7 +108,7 @@ impl Repository {
     pub fn create(&self, name: &str, branch: &str, parent: &Path) -> Result<Checkout, String> {
         validate_floor_name(name)?;
         validate_name(branch)?;
-        let parent = parent.canonicalize().map_err(|e| e.to_string())?;
+        let parent = dunce::canonicalize(parent).map_err(|e| e.to_string())?;
         let path = parent.join(name);
         if path.exists() {
             return Err("The floor directory already exists".to_owned());
@@ -251,7 +248,7 @@ impl Repository {
 fn is_ancestor(root: &Path, head: &str, target: &str) -> Result<bool, String> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(root)
+        .arg(dunce::simplified(root))
         .args(["merge-base", "--is-ancestor", head, target])
         .output()
         .map_err(|e| e.to_string())?;
@@ -265,7 +262,7 @@ fn is_ancestor(root: &Path, head: &str, target: &str) -> Result<bool, String> {
 fn run(directory: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(directory)
+        .arg(dunce::simplified(directory))
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()

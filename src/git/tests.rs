@@ -129,3 +129,33 @@ fn floor_names_are_portable_path_components() {
     }
     assert!(validate_floor_name("task_15-login").is_ok());
 }
+
+#[test]
+fn canonicalized_paths_support_discovery_creation_and_cleanup() {
+    let (directory, expected) = repository();
+    let repo = Repository::discover(&directory.path().canonicalize().unwrap()).unwrap();
+    assert_eq!(repo, expected);
+    assert_eq!(repo.checkouts().unwrap()[0].path, repo.root);
+
+    let parent = tempfile::tempdir().unwrap();
+    let with_spaces = parent.path().join("worktree parent");
+    std::fs::create_dir(&with_spaces).unwrap();
+    let checkout = repo
+        .create("floor", "task", &with_spaces.canonicalize().unwrap())
+        .unwrap();
+    assert_eq!(
+        Repository::discover(&checkout.path).unwrap().root,
+        checkout.path
+    );
+    assert!(
+        repo.checkouts()
+            .unwrap()
+            .iter()
+            .any(|c| c.path == checkout.path)
+    );
+    let token = repo.claim(&checkout).unwrap();
+    assert!(repo.owns(&checkout, Some(&token)).unwrap());
+    assert!(!repo.dirty(&checkout).unwrap());
+    repo.remove(&checkout, true, "main", false).unwrap();
+    assert!(!checkout.path.exists());
+}
