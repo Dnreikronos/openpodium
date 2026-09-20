@@ -6,6 +6,9 @@ use openpodium::workspaces::{FloorOperation, FloorResult};
 
 use super::{Message as AppMessage, OpenPodium, WorkspaceManager, now};
 
+mod integration;
+mod status;
+
 #[derive(Default)]
 pub(super) struct UiState {
     busy: bool,
@@ -13,6 +16,8 @@ pub(super) struct UiState {
     branch: String,
     discard: Option<(openpodium::domain::WorkspaceId, u64)>,
     confirmation: String,
+    integration: integration::UiState,
+    status: status::UiState,
 }
 
 #[derive(Clone)]
@@ -28,13 +33,37 @@ pub(super) enum Message {
     Confirmation(String),
     ConfirmDiscard,
     Keep,
+    Integration(integration::Message),
+    Status(status::Message),
 }
 
 pub(super) fn is_busy(state: &OpenPodium) -> bool {
-    state.floor_ui.busy
+    state.floor_ui.busy || state.floor_ui.integration.busy
+}
+
+pub(super) fn tick(state: &mut OpenPodium) -> Task<AppMessage> {
+    status::scan(state, false)
+}
+
+pub(super) fn workspace_changed(state: &mut OpenPodium) {
+    state.floor_ui.status = status::UiState::default();
+    state.floor_ui.integration = integration::UiState::default();
+    state.floor_ui.discard = None;
+    state.floor_ui.confirmation.clear();
+}
+
+pub(super) fn node_severities(
+    state: &OpenPodium,
+) -> std::collections::BTreeMap<openpodium::domain::NodeId, openpodium::git::CollisionSeverity> {
+    status::node_severities(state)
 }
 
 pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessage> {
+    match message {
+        Message::Integration(message) => return integration::update(state, message),
+        Message::Status(message) => return status::update(state, message),
+        _ => {}
+    }
     match message {
         Message::Name(name) => {
             state.floor_ui.name = name;
@@ -69,6 +98,7 @@ pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessag
                     if visible && active != previous {
                         state.reset_canvas_session();
                     }
+                    return status::scan(state, true);
                 }
                 Err(error) => state.notice = Some(error),
             }
@@ -147,6 +177,7 @@ pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessag
                 discard: true,
             }
         }
+        Message::Integration(_) | Message::Status(_) => unreachable!("handled above"),
         _ => return Task::none(),
     };
     if let FloorOperation::Remove { floor, .. } = operation {
@@ -197,17 +228,36 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
         return content.into();
     };
     let selected = workspace.floors().active;
+    let main_severity = status::severity_for_main(&state.floor_ui.status);
     content = content.push(
-        button(if selected.is_none() {
-            "Main floor (selected)"
-        } else {
-            "Main floor"
-        })
+        button(text(format!(
+            "Main floor{}{}",
+            if selected.is_none() {
+                " (selected)"
+            } else {
+                ""
+            },
+            main_severity.map_or(String::new(), |severity| format!(" · Git {severity}"))
+        )))
         .on_press(AppMessage::Floor(Message::Switch(None))),
     );
+    for change in status::changes_for_main(&state.floor_ui.status) {
+        content = content.push(
+            text(format!(
+                "{} · {}",
+                status::change_label(&change.kind),
+                change.path
+            ))
+            .size(12),
+        );
+    }
     for (id, floor) in &workspace.floors().entries {
+        let severity = status::severity_for_path(
+            &state.floor_ui.status,
+            std::path::Path::new(floor.directory.as_str()),
+        );
         let label = format!(
-            "{}{} · {} · {} · {:?}",
+            "{}{} · {} · {} · {:?}{}",
             floor.name,
             if selected == Some(*id) {
                 " (selected)"
@@ -220,7 +270,8 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
                 "user-owned"
             },
             if floor.dirty { "dirty" } else { "clean" },
-            floor.lifecycle
+            floor.lifecycle,
+            severity.map_or(String::new(), |severity| format!(" · Git {severity}"))
         );
         content = content
             .push(button(text(label)).on_press(AppMessage::Floor(Message::Switch(Some(*id)))))
@@ -232,6 +283,24 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
                 ))
                 .size(12),
             );
+        for change in status::changes_for(
+            &state.floor_ui.status,
+            std::path::Path::new(floor.directory.as_str()),
+        ) {
+            content = content.push(
+                text(format!(
+                    "{} · {}",
+                    status::change_label(&change.kind),
+                    change.path
+                ))
+                .size(12),
+            );
+        }
+        if floor.lifecycle == FloorLifecycle::Available {
+            content = content.push(button("Preview integration into main").on_press(
+                AppMessage::Floor(Message::Integration(integration::Message::Preview(*id))),
+            ));
+        }
         if floor.managed && floor.lifecycle == FloorLifecycle::Available {
             content = content.push(
                 row![
@@ -262,5 +331,8 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
             .push(text_input("Exact floor name", &state.floor_ui.confirmation).on_input(|s| AppMessage::Floor(Message::Confirmation(s))))
             .push(row![button("Discard checkout").on_press(AppMessage::Floor(Message::ConfirmDiscard)), button("Keep floor").on_press(AppMessage::Floor(Message::Keep))].spacing(8));
     }
-    content.into()
+    content
+        .push(status::view(state))
+        .push(integration::view(state))
+        .into()
 }

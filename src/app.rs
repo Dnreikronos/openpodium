@@ -301,7 +301,9 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::Floor(message) => return floors::update(state, message),
         Message::OrchestrationTick => {
             run_orchestration_tick(state);
-            return refresh_timelines(state);
+            let timelines = refresh_timelines(state);
+            let floors = floors::tick(state);
+            return Task::batch([timelines, floors]);
         }
         Message::Canvas(message) => return handle_canvas_message(state, message),
         Message::Chat(message) => return handle_chat_message(state, message),
@@ -347,6 +349,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
                 Ok(_) => {
                     state.create_directory.clear();
                     state.notice = Some("Workspace created".to_owned());
+                    floors::workspace_changed(state);
                     state.reset_canvas_session();
                     state.load_active_settings();
                     state.sync_ipc_directory();
@@ -367,6 +370,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             match result {
                 Ok(()) => {
                     state.notice = None;
+                    floors::workspace_changed(state);
                     state.reset_canvas_session();
                     state.load_active_settings();
                 }
@@ -876,7 +880,8 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .clone()
             .unwrap_or_else(|| workspace.canvas_layout());
         let terminal_views = terminal_views(state, &layout);
-        let document = canvas::CanvasDocument::new(workspace, layout, terminal_views);
+        let document = canvas::CanvasDocument::new(workspace, layout, terminal_views)
+            .with_git_severity(floors::node_severities(state));
         row![
             canvas::view(
                 state.camera,

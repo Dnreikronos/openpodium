@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use iced::Color;
 use openpodium::domain::{AgentProgram, CanvasLayout, NodeId, NodeTarget, Workspace};
+use openpodium::git::CollisionSeverity;
 
 use crate::terminal;
 
@@ -135,6 +136,18 @@ impl CanvasDocument {
         &self.layout
     }
 
+    pub(crate) fn with_git_severity(
+        mut self,
+        severities: BTreeMap<NodeId, CollisionSeverity>,
+    ) -> Self {
+        for (node_id, severity) in severities {
+            if let Some(label) = self.labels.get_mut(&node_id) {
+                label.subtitle = format!("{} · Git {severity}", label.subtitle);
+            }
+        }
+        self
+    }
+
     pub(super) fn label(&self, node_id: NodeId) -> &NodeLabel {
         self.labels
             .get(&node_id)
@@ -193,11 +206,18 @@ mod tests {
         );
         workspace.execute(DomainCommand::AddNode(node)).unwrap();
 
-        let document = CanvasDocument::new(&workspace, workspace.canvas_layout(), BTreeMap::new());
+        let document = CanvasDocument::new(&workspace, workspace.canvas_layout(), BTreeMap::new())
+            .with_git_severity(BTreeMap::from([(
+                NodeId::new(1),
+                CollisionSeverity::Critical,
+            )]));
         let label = document.label(NodeId::new(1));
 
         assert_eq!(label.title, "review Ada");
-        assert_eq!(label.subtitle, "Reviewer · Codex · terminal offline");
+        assert_eq!(
+            label.subtitle,
+            "Reviewer · Codex · terminal offline · Git critical"
+        );
         assert!(matches!(
             label.kind,
             NodeKind::Agent {
