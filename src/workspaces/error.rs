@@ -4,12 +4,13 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::domain::{ValidationError, WorkspaceId};
-use crate::persistence::PersistenceError;
+use crate::persistence::{PersistenceError, PortableError};
 
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum WorkspaceError {
     Persistence(PersistenceError),
+    Portable(PortableError),
     Validation(ValidationError),
     DirectoryAccess {
         operation: &'static str,
@@ -28,6 +29,9 @@ pub enum WorkspaceError {
     MissingPersistedWorkspace {
         workspace_id: WorkspaceId,
     },
+    InvalidImportDestination {
+        floor: Option<u64>,
+    },
     WorkspaceIdExhausted,
 }
 
@@ -35,6 +39,7 @@ impl Display for WorkspaceError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Persistence(source) => source.fmt(formatter),
+            Self::Portable(source) => source.fmt(formatter),
             Self::Validation(source) => source.fmt(formatter),
             Self::DirectoryAccess {
                 operation,
@@ -67,6 +72,13 @@ impl Display for WorkspaceError {
             Self::WorkspaceIdExhausted => {
                 formatter.write_str("cannot allocate another workspace identifier")
             }
+            Self::InvalidImportDestination { floor: Some(floor) } => write!(
+                formatter,
+                "floor {floor} is not the active import destination"
+            ),
+            Self::InvalidImportDestination { floor: None } => {
+                formatter.write_str("the main canvas is not the active import destination")
+            }
         }
     }
 }
@@ -75,12 +87,14 @@ impl Error for WorkspaceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Persistence(source) => Some(source),
+            Self::Portable(source) => Some(source),
             Self::Validation(source) => Some(source),
             Self::DirectoryAccess { source, .. } => Some(source),
             Self::NotDirectory { .. }
             | Self::NonUnicodeDirectory { .. }
             | Self::UnknownWorkspace { .. }
             | Self::MissingPersistedWorkspace { .. }
+            | Self::InvalidImportDestination { .. }
             | Self::WorkspaceIdExhausted => None,
         }
     }
@@ -89,6 +103,12 @@ impl Error for WorkspaceError {
 impl From<PersistenceError> for WorkspaceError {
     fn from(source: PersistenceError) -> Self {
         Self::Persistence(source)
+    }
+}
+
+impl From<PortableError> for WorkspaceError {
+    fn from(source: PortableError) -> Self {
+        Self::Portable(source)
     }
 }
 
