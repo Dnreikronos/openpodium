@@ -543,6 +543,26 @@ impl RoutineScheduler {
                         now,
                     )?;
                 }
+                Plan::Fail {
+                    run_id,
+                    step_id,
+                    reason,
+                } => {
+                    // The step never ran, so there is no attempt to finish. It
+                    // is cancelled rather than failed-with-retries, because
+                    // retrying would hit the same mismatch every tick.
+                    advance(
+                        workspaces,
+                        workspace_id,
+                        run_id,
+                        RoutineTransition::CancelStep {
+                            step_id,
+                            reason: Some(reason),
+                            finished_at: now,
+                        },
+                        now,
+                    )?;
+                }
                 Plan::Dispatch(dispatch) => {
                     // The journal batch records the attempt, its task, its
                     // handoff, and the reservations together. Nothing is sent
@@ -626,6 +646,26 @@ impl RoutineScheduler {
                     .checkout(step_id)
                     .ok_or(RoutineError::UnpinnedStepCheckout { step_id })?
                     .clone();
+                // The agent may have been moved to another floor since the run
+                // pinned it. Dispatching anyway would reserve one checkout and
+                // write to another, so the step fails with the mismatch named
+                // rather than running somewhere it never claimed.
+                let running_in = agent_checkout(workspace, agent_id)
+                    .map(|directory| RoutineCheckout::new(canonical_directory(&directory)));
+                if running_in.as_ref() != Some(&checkout) {
+                    return Ok(Some(Plan::Fail {
+                        run_id: current.id(),
+                        step_id,
+                        reason: content(&format!(
+                            "the step reserved checkout {checkout}, but agent {agent_id} now runs in {}",
+                            running_in.map_or_else(
+                                || "no checkout".to_owned(),
+                                |checkout| checkout.to_string()
+                            )
+                        ))?,
+                    }));
+                }
+
                 // All declared claims are taken together. A step that cannot
                 // take every one waits rather than starting half-isolated.
                 let mut required = vec![
@@ -743,6 +783,11 @@ enum Plan {
         run_id: RoutineRunId,
         step_id: RoutineStepId,
     },
+    Fail {
+        run_id: RoutineRunId,
+        step_id: RoutineStepId,
+        reason: Content,
+    },
     Dispatch(Box<PlannedDispatch>),
 }
 
@@ -813,29 +858,32 @@ fn resolve_checkout(
     step: &RoutineStep,
     agent_id: AgentId,
 ) -> Result<RoutineCheckout, RoutineSchedulerError> {
-    let directory = match step.claims().checkout() {
-        RoutineCheckoutClaim::Floor(floor) => workspace
-            .floors()
-            .entries
-            .get(&floor)
-            .filter(|entry| entry.lifecycle == crate::domain::FloorLifecycle::Available)
-            .map(|entry| entry.directory.clone())
-            .ok_or(RoutineSchedulerError::UnavailableCheckout { floor: Some(floor) })?,
-        RoutineCheckoutClaim::AgentDefault => {
-            let node = workspace
-                .all_canvas_layout()
-                .nodes()
-                .iter()
-                .find(|node| node.reference() == Some(crate::domain::NodeTarget::Agent(agent_id)))
-                .map(crate::domain::Node::id);
-            let directory = match node {
-                Some(node) => workspace.node_directory(node).cloned(),
-                None => workspace.settings().working_directory().cloned(),
-            };
-            directory.ok_or(RoutineSchedulerError::UnavailableCheckout { floor: None })?
-        }
+    let actual = agent_checkout(workspace, agent_id)
+        .ok_or(RoutineSchedulerError::UnavailableCheckout { floor: None })?;
+    let actual = RoutineCheckout::new(canonical_directory(&actual));
+    let RoutineCheckoutClaim::Floor(floor) = step.claims().checkout() else {
+        return Ok(actual);
     };
-    Ok(RoutineCheckout::new(canonical_directory(&directory)))
+
+    // Delivery addresses the agent's own terminal, so claiming a floor the
+    // agent does not sit on would reserve a checkout nothing writes to while
+    // the work modified an unreserved one.
+    let claimed = workspace
+        .floors()
+        .entries
+        .get(&floor)
+        .filter(|entry| entry.lifecycle == crate::domain::FloorLifecycle::Available)
+        .map(|entry| entry.directory.clone())
+        .ok_or(RoutineSchedulerError::UnavailableCheckout { floor: Some(floor) })?;
+    let claimed = RoutineCheckout::new(canonical_directory(&claimed));
+    if claimed != actual {
+        return Err(RoutineSchedulerError::CheckoutMismatch {
+            agent_id,
+            claimed: claimed.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+    Ok(claimed)
 }
 
 /// Normalizes a checkout path so equal checkouts compare equal. Falls back to
@@ -879,6 +927,24 @@ fn advance(
         at,
     )?;
     Ok(())
+}
+
+/// The checkout an agent's terminal actually runs in.
+///
+/// This is what a step's work touches, so it is the only thing worth
+/// reserving. A claim that named some other directory would reserve one
+/// checkout while writing to another.
+fn agent_checkout(workspace: &Workspace, agent_id: AgentId) -> Option<WorkspaceDirectory> {
+    let node = workspace
+        .all_canvas_layout()
+        .nodes()
+        .iter()
+        .find(|node| node.reference() == Some(crate::domain::NodeTarget::Agent(agent_id)))
+        .map(crate::domain::Node::id);
+    match node {
+        Some(node) => workspace.node_directory(node).cloned(),
+        None => workspace.settings().working_directory().cloned(),
+    }
 }
 
 fn workspace(
@@ -1037,6 +1103,11 @@ pub enum RoutineSchedulerError {
     UnavailableCheckout {
         floor: Option<u64>,
     },
+    CheckoutMismatch {
+        agent_id: AgentId,
+        claimed: String,
+        actual: String,
+    },
 }
 
 impl RoutineSchedulerError {
@@ -1083,6 +1154,14 @@ impl Display for RoutineSchedulerError {
             Self::UnavailableCheckout { floor: None } => {
                 formatter.write_str("the step's agent has no available checkout")
             }
+            Self::CheckoutMismatch {
+                agent_id,
+                claimed,
+                actual,
+            } => write!(
+                formatter,
+                "the step claims checkout {claimed}, but agent {agent_id} runs in {actual}"
+            ),
         }
     }
 }

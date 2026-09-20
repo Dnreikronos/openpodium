@@ -2142,6 +2142,7 @@ impl RoutineRun {
     pub fn cancel_step(
         &mut self,
         step_id: RoutineStepId,
+        reason: Option<Content>,
         finished_at: Timestamp,
     ) -> Result<(), RoutineError> {
         let step = self.step_mut(step_id)?;
@@ -2150,6 +2151,9 @@ impl RoutineRun {
         }
         if matches!(step.state, RoutineStepState::Dispatched) {
             finish_attempt(step, RoutineAttemptOutcome::Cancelled, finished_at)?;
+        }
+        if reason.is_some() {
+            step.failure = reason;
         }
         step.state = RoutineStepState::Cancelled;
         self.propagate_skips();
@@ -2340,6 +2344,9 @@ pub enum RoutineTransition {
     },
     CancelStep {
         step_id: RoutineStepId,
+        /// Why the step was stopped, when the scheduler stopped it rather than
+        /// the user. Kept durable so the panel can explain it after a restart.
+        reason: Option<Content>,
         finished_at: Timestamp,
     },
     RequestCancellation {
@@ -2382,8 +2389,9 @@ impl RoutineRun {
             } => self.resolve_interruption(*step_id, *finished_at),
             RoutineTransition::CancelStep {
                 step_id,
+                reason,
                 finished_at,
-            } => self.cancel_step(*step_id, *finished_at),
+            } => self.cancel_step(*step_id, reason.clone(), *finished_at),
             RoutineTransition::RequestCancellation { at } => self.request_cancellation(*at),
             RoutineTransition::Settle { at } => {
                 if self.settle(*at) {

@@ -4163,6 +4163,8 @@ enum RoutineTransitionV1 {
     },
     CancelStep {
         step_id: u64,
+        #[serde(default)]
+        reason: Option<String>,
         finished_at: u64,
     },
     RequestCancellation {
@@ -4232,9 +4234,11 @@ impl From<&RoutineTransition> for RoutineTransitionV1 {
             },
             RoutineTransition::CancelStep {
                 step_id,
+                reason,
                 finished_at,
             } => Self::CancelStep {
                 step_id: step_id.get(),
+                reason: reason.as_ref().map(|value| value.as_str().to_owned()),
                 finished_at: finished_at.as_unix_millis(),
             },
             RoutineTransition::RequestCancellation { at } => Self::RequestCancellation {
@@ -4309,9 +4313,14 @@ impl RoutineTransitionV1 {
             },
             Self::CancelStep {
                 step_id,
+                reason,
                 finished_at,
             } => RoutineTransition::CancelStep {
                 step_id: RoutineStepId::new(step_id),
+                reason: reason
+                    .map(Content::new)
+                    .transpose()
+                    .map_err(|error| error.to_string())?,
                 finished_at: Timestamp::from_unix_millis(finished_at),
             },
             Self::RequestCancellation { at } => RoutineTransition::RequestCancellation {

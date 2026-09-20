@@ -1999,3 +1999,105 @@ fn delivery_that_runs_out_of_retries_releases_the_step() {
         "its claims are released"
     );
 }
+
+#[test]
+fn a_step_whose_agent_left_its_claimed_checkout_does_not_run() {
+    let (temp, mut manager, workspace_id) = manager();
+    let routine_id = simple_routine(&mut manager, workspace_id);
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+
+    // Move the bound agent onto a different checkout after the run pinned it.
+    let elsewhere = temp.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let mut floors = manager.workspace(workspace_id).unwrap().floors().clone();
+    floors.entries.insert(
+        1,
+        crate::domain::Floor {
+            name: name("other"),
+            directory: crate::domain::WorkspaceDirectory::new(
+                elsewhere.to_str().unwrap().to_owned(),
+            )
+            .unwrap(),
+            repository: crate::domain::WorkspaceDirectory::new(
+                elsewhere.to_str().unwrap().to_owned(),
+            )
+            .unwrap(),
+            branch: None,
+            base_revision: "abc".to_owned(),
+            base_branch: None,
+            managed: false,
+            ownership_token: None,
+            owner: None,
+            dirty: false,
+            lifecycle: crate::domain::FloorLifecycle::Available,
+        },
+    );
+    let before = manager.workspace(workspace_id).unwrap().floors().clone();
+    manager
+        .execute(
+            workspace_id,
+            DomainCommand::ReplaceFloors {
+                before,
+                after: floors.clone(),
+            },
+            timestamp(21),
+        )
+        .unwrap();
+    // Put the agent's node on that floor.
+    manager
+        .execute(
+            workspace_id,
+            DomainCommand::AddNode(crate::domain::Node::new(
+                crate::domain::NodeId::new(9),
+                crate::domain::NodeTarget::Agent(AgentId::new(1)),
+                crate::domain::CanvasPoint::new(0.0, 0.0).unwrap(),
+                crate::domain::CanvasSize::new(320.0, 200.0).unwrap(),
+            )),
+            timestamp(22),
+        )
+        .unwrap();
+    let before = manager.workspace(workspace_id).unwrap().floors().clone();
+    let mut moved = before.clone();
+    moved.node_floors.insert(crate::domain::NodeId::new(9), 1);
+    manager
+        .execute(
+            workspace_id,
+            DomainCommand::ReplaceFloors {
+                before,
+                after: moved,
+            },
+            timestamp(23),
+        )
+        .unwrap();
+
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(24))
+        .unwrap();
+
+    let run = manager
+        .workspace(workspace_id)
+        .unwrap()
+        .routine_run(run_id)
+        .unwrap();
+    let step = run.step(RoutineStepId::new(1)).unwrap();
+    assert_eq!(
+        step.state(),
+        RoutineStepState::Cancelled,
+        "a step must not run in a checkout it never reserved"
+    );
+    assert!(step.attempts().is_empty(), "nothing was dispatched");
+    assert!(
+        step.failure().unwrap().as_str().contains("runs in"),
+        "the reason names the checkout the agent actually uses"
+    );
+}
