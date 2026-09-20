@@ -437,26 +437,34 @@ impl RoutineScheduler {
                     let transition = match response.status() {
                         HandoffResponseStatus::Completed => {
                             let outputs = response.outputs().clone();
+                            // The outputs must match the contract in both
+                            // directions. An undeclared key would be rejected
+                            // when the step completes, and because the response
+                            // is durable that rejection would repeat on every
+                            // tick and stall the whole scheduler.
                             let missing: Vec<_> = declared
                                 .iter()
                                 .filter(|key| !outputs.contains_key(*key))
                                 .map(|key| key.as_str().to_owned())
                                 .collect();
-                            if missing.is_empty() {
+                            let undeclared: Vec<_> = outputs
+                                .keys()
+                                .filter(|key| !declared.contains(*key))
+                                .map(|key| key.as_str().to_owned())
+                                .collect();
+                            if missing.is_empty() && undeclared.is_empty() {
                                 RoutineTransition::CompleteStep {
                                     step_id: step.step_id(),
                                     outputs,
                                     finished_at: response.responded_at(),
                                 }
                             } else {
-                                // Completion without the declared outputs is a
-                                // failure, not something to infer a value for.
+                                // Completion that does not match the contract
+                                // is a failure, not something to infer a value
+                                // for or quietly discard.
                                 RoutineTransition::FailStep {
                                     step_id: step.step_id(),
-                                    reason: content(&format!(
-                                        "the step completed without its declared output(s): {}",
-                                        missing.join(", ")
-                                    ))?,
+                                    reason: content(&output_mismatch(&missing, &undeclared))?,
                                     finished_at: response.responded_at(),
                                 }
                             }
@@ -876,6 +884,24 @@ fn run(
     workspace(workspaces, workspace_id)?
         .routine_run(run_id)
         .ok_or(RoutineSchedulerError::UnknownRun(run_id))
+}
+
+/// Names exactly how a completion failed its output contract.
+fn output_mismatch(missing: &[String], undeclared: &[String]) -> String {
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!(
+            "did not return its declared output(s): {}",
+            missing.join(", ")
+        ));
+    }
+    if !undeclared.is_empty() {
+        parts.push(format!(
+            "returned output(s) it does not declare: {}",
+            undeclared.join(", ")
+        ));
+    }
+    format!("the step completed but {}", parts.join("; and "))
 }
 
 fn handoff_start(handoff: &Handoff, fallback: Timestamp) -> Timestamp {

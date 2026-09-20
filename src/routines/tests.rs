@@ -1888,3 +1888,61 @@ fn cancelling_a_routine_task_from_the_timeline_does_not_start_a_retry() {
         "the claims stay held until shutdown is confirmed"
     );
 }
+
+#[test]
+fn an_undeclared_output_fails_the_step_instead_of_stalling_the_scheduler() {
+    let (_temp, mut manager, workspace_id) = manager();
+    let routine_id = install(
+        &mut manager,
+        workspace_id,
+        version(
+            vec![step(1, 1, "Investigate", vec![], vec![], vec!["finding"])],
+            Vec::new(),
+        ),
+    );
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+    complete_through_orchestrator(
+        &mut manager,
+        &mut orchestrator,
+        workspace_id,
+        run_id,
+        RoutineStepId::new(1),
+        &[("finding", "found"), ("surprise", "unasked for")],
+        30,
+    );
+
+    // The response is durable, so a rejected transition here would repeat on
+    // every tick and stop the scheduler doing anything else.
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(40))
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(41))
+        .unwrap();
+
+    let run = manager
+        .workspace(workspace_id)
+        .unwrap()
+        .routine_run(run_id)
+        .unwrap();
+    let step = run.step(RoutineStepId::new(1)).unwrap();
+    assert_eq!(step.state(), RoutineStepState::Failed);
+    assert!(
+        step.failure().unwrap().as_str().contains("surprise"),
+        "the reason names the undeclared output"
+    );
+    assert_eq!(run.state(), RoutineRunState::Failed);
+}
