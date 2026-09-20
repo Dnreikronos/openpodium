@@ -164,6 +164,20 @@ impl WorkspaceManager {
             .filter_map(|workspace_id| self.workspaces.get(workspace_id))
     }
 
+    pub fn shortcuts(&self) -> Result<Vec<(String, Option<String>)>, WorkspaceError> {
+        self.journal.shortcuts().map_err(WorkspaceError::from)
+    }
+
+    pub fn store_shortcut(
+        &mut self,
+        command_id: &str,
+        shortcut: Option<&str>,
+    ) -> Result<(), WorkspaceError> {
+        self.journal
+            .store_shortcut(command_id, shortcut)
+            .map_err(WorkspaceError::from)
+    }
+
     fn next_workspace_id(&self) -> Result<WorkspaceId, WorkspaceError> {
         let next = self
             .workspaces

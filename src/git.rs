@@ -11,7 +11,7 @@ pub use changes::{
     ChangeKind, ChangedPath, Collision, CollisionReport, CollisionSeverity, RepoPath,
     WorktreeInventory,
 };
-pub use context::{PathDiff, path_diff, path_is_ignored, path_is_tracked};
+pub use context::{PathDiff, path_diff, path_is_ignored, path_is_tracked, project_paths};
 pub use integration::{
     CommitPreview, IntegrationAction, IntegrationError, IntegrationOutcome, IntegrationPreview,
 };

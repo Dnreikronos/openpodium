@@ -1,5 +1,6 @@
 mod context_nodes;
 mod floors;
+mod navigation;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iced::widget::{button, column, container, row, scrollable, text, text_editor, text_input};
-use iced::{Element, Fill, Task, Theme, clipboard};
+use iced::{Element, Fill, Subscription, Task, Theme, clipboard, event};
 use openpodium::domain::{
     Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, ChatAttachmentId,
     ChatDraft, ChatMessageId, ChatThread, ChatThreadId, CommandPreset, CommandPresetId,
@@ -23,6 +24,7 @@ use openpodium::ipc::{
     AGENT_ID_ENV, AVAILABLE_ENV, AgentCapabilities, AgentRegistration, CLI_ENV, ENDPOINT_ENV,
     IpcService, SUPPORTED_VERSIONS, TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
 };
+use openpodium::navigation::{CommandRegistry, Shortcut};
 use openpodium::orchestration::{DeliveryRequest, Orchestrator};
 use openpodium::persistence::{
     export_canvas_fragment, export_role, import_canvas_fragment, import_role,
@@ -37,6 +39,7 @@ use tokio::sync::Mutex;
 
 use crate::canvas::{self, Alignment, Camera, History, ZOrder};
 use crate::chat::{self, AttachmentStore, LinkTarget};
+use crate::navigation_panel;
 use crate::notifications::NotificationRequest;
 use crate::terminal;
 use crate::terminal::session::{self, Action as TerminalAction, ProcessStream, Session};
@@ -78,6 +81,8 @@ struct OpenPodium {
     timeline_ui: timeline_panel::UiState,
     timeline_items: BTreeMap<WorkspaceId, Vec<TimelineItem>>,
     timeline_high_watermarks: BTreeMap<WorkspaceId, TimelineEventId>,
+    navigation_ui: navigation_panel::UiState,
+    command_registry: CommandRegistry,
     attachment_store: Option<AttachmentStore>,
     ipc: Option<IpcService>,
     orchestrator: Orchestrator,
@@ -153,6 +158,18 @@ impl Default for OpenPodium {
                 }
                 None => Default::default(),
             };
+        let mut command_registry = CommandRegistry::new();
+        if let Some(workspaces) = workspaces.as_ref() {
+            match workspaces.shortcuts() {
+                Ok(shortcuts) => {
+                    let warnings = command_registry.apply_stored(shortcuts);
+                    if !warnings.is_empty() {
+                        notice = Some(warnings.join("; "));
+                    }
+                }
+                Err(error) => notice = Some(error.to_string()),
+            }
+        }
         let mut state = Self {
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
@@ -168,6 +185,8 @@ impl Default for OpenPodium {
             timeline_ui: timeline_panel::UiState::default(),
             timeline_items,
             timeline_high_watermarks,
+            navigation_ui: navigation_panel::UiState::default(),
+            command_registry,
             attachment_store,
             ipc,
             orchestrator,
@@ -201,6 +220,7 @@ impl Default for OpenPodium {
         };
         state.load_active_settings();
         state.sync_ipc_directory();
+        navigation::mark_all_stale(&mut state);
         state
     }
 }
@@ -212,6 +232,12 @@ enum Message {
     Canvas(canvas::Message),
     Chat(chat::Message),
     Timeline(timeline_panel::Message),
+    Navigation(navigation_panel::Message),
+    NavigationKey {
+        navigation_key: navigation::NavigationKey,
+        shortcut: Option<Shortcut>,
+        status: event::Status,
+    },
     NotificationActivated(Option<NavigationTarget>),
     AddAgent(AgentProgram),
     PreviewAgent(AgentProgram),
@@ -305,7 +331,10 @@ pub(crate) fn run() -> iced::Result {
         .title(APP_NAME)
         .theme(Theme::Dark)
         .subscription(|_| {
-            iced::time::every(Duration::from_millis(100)).map(|_| Message::OrchestrationTick)
+            Subscription::batch([
+                iced::time::every(Duration::from_millis(100)).map(|_| Message::OrchestrationTick),
+                navigation::subscription(),
+            ])
         })
         .centered()
         .run()
@@ -319,11 +348,18 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             let contexts = context_nodes::tick(state);
             let timelines = refresh_timelines(state);
             let floors = floors::tick(state);
-            return Task::batch([timelines, floors, contexts]);
+            let navigation = navigation::tick(state);
+            return Task::batch([timelines, floors, contexts, navigation]);
         }
         Message::Canvas(message) => return handle_canvas_message(state, message),
         Message::Chat(message) => return handle_chat_message(state, message),
         Message::Timeline(message) => return handle_timeline_message(state, message),
+        Message::Navigation(message) => return navigation::update(state, message),
+        Message::NavigationKey {
+            navigation_key,
+            shortcut,
+            status,
+        } => return navigation::handle_key(state, navigation_key, shortcut, status),
         Message::NotificationActivated(Some(target)) => navigate_to_task(state, target),
         Message::NotificationActivated(None) => {}
         Message::AddAgent(program) => return add_agent(state, program),
@@ -369,9 +405,10 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
                         .map_err(|error| error.to_string())
                 });
             match result {
-                Ok(_) => {
+                Ok(workspace_id) => {
                     state.create_directory.clear();
                     state.notice = Some("Workspace created".to_owned());
+                    state.navigation_ui.mark_stale(workspace_id);
                     floors::workspace_changed(state);
                     state.reset_canvas_session();
                     state.load_active_settings();
@@ -502,8 +539,22 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .as_ref()
         .and_then(WorkspaceManager::active_workspace)
         .is_some();
-    let mut workspace_list =
-        column![text(APP_NAME).size(24), text("Workspaces").size(14)].spacing(12);
+    let mut workspace_list = column![
+        text(APP_NAME).size(24),
+        button(text(format!(
+            "Search / commands ({})",
+            state
+                .command_registry
+                .binding(openpodium::navigation::CommandId::OpenPalette)
+                .map_or_else(
+                    || "unbound".to_owned(),
+                    |shortcut| shortcut.display(openpodium::navigation::Platform::current())
+                )
+        )))
+        .on_press(Message::Navigation(navigation_panel::Message::Open)),
+        text("Workspaces").size(14)
+    ]
+    .spacing(12);
     if let Some(workspaces) = &state.workspaces {
         for workspace in workspaces.recent_workspaces() {
             let icon = workspace.settings().icon().map_or("", |icon| icon.as_str());
@@ -938,6 +989,13 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                 document,
                 state.canvas_selection.clone(),
                 state.focused_terminal,
+                [
+                    openpodium::navigation::CommandId::OpenPalette,
+                    openpodium::navigation::CommandId::FocusCanvas,
+                ]
+                .into_iter()
+                .filter_map(|command| state.command_registry.binding(command).cloned())
+                .collect(),
                 state.canvas_revision,
             )
             .map(Message::Canvas),
@@ -956,7 +1014,17 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .into()
     };
 
-    row![sidebar, stage].into()
+    let application = row![sidebar, stage];
+    if state.navigation_ui.open {
+        column![
+            navigation_panel::view(&state.navigation_ui, &state.command_registry)
+                .map(Message::Navigation),
+            application,
+        ]
+        .into()
+    } else {
+        application.into()
+    }
 }
 
 impl OpenPodium {
@@ -1364,12 +1432,6 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
                 state.canvas_history.record(before);
                 state.notice = None;
             }
-        }
-        canvas::Message::UndoRequested => apply_canvas_action(state, CanvasAction::Undo),
-        canvas::Message::RedoRequested => apply_canvas_action(state, CanvasAction::Redo),
-        canvas::Message::DeleteRequested => apply_canvas_action(state, CanvasAction::Remove),
-        canvas::Message::DuplicateRequested => {
-            apply_canvas_action(state, CanvasAction::Duplicate);
         }
         canvas::Message::CopyRequested => return copy_canvas_fragment(state),
         canvas::Message::PasteRequested => {
@@ -3442,6 +3504,8 @@ mod tests {
             timeline_ui: timeline_panel::UiState::default(),
             timeline_items: BTreeMap::new(),
             timeline_high_watermarks: BTreeMap::new(),
+            navigation_ui: navigation_panel::UiState::default(),
+            command_registry: CommandRegistry::new(),
             attachment_store: None,
             ipc: None,
             orchestrator: Orchestrator::default(),
@@ -3841,6 +3905,149 @@ mod tests {
         assert!(state.canvas_selection.is_empty());
     }
 
+    #[test]
+    fn search_navigation_restores_workspace_floor_node_and_chat_message() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let first_id = workspaces
+            .create_workspace(&first, Timestamp::from_unix_millis(1))
+            .unwrap();
+        let second_id = workspaces
+            .create_workspace(&second, Timestamp::from_unix_millis(2))
+            .unwrap();
+        let agent_id = AgentId::new(1);
+        let node_id = NodeId::new(7);
+        let thread_id = ChatThreadId::new(3);
+        let message_id = ChatMessageId::new(4);
+        workspaces
+            .execute(
+                first_id,
+                DomainCommand::AddAgentNode {
+                    agent: Agent::new(agent_id, Name::new("Builder").unwrap(), None),
+                    node: Node::new(
+                        node_id,
+                        NodeTarget::Agent(agent_id),
+                        CanvasPoint::new(100.0, 200.0).unwrap(),
+                        CanvasSize::new(400.0, 300.0).unwrap(),
+                    ),
+                },
+                Timestamp::from_unix_millis(3),
+            )
+            .unwrap();
+        workspaces
+            .execute(
+                first_id,
+                DomainCommand::AddChatThread(ChatThread::new(
+                    thread_id,
+                    agent_id,
+                    Name::new("Search results").unwrap(),
+                )),
+                Timestamp::from_unix_millis(4),
+            )
+            .unwrap();
+        workspaces
+            .execute(
+                first_id,
+                DomainCommand::AppendAgentChatMessage(
+                    openpodium::domain::ChatMessage::new(
+                        message_id,
+                        thread_id,
+                        openpodium::domain::ChatAuthor::Agent(agent_id),
+                        Content::new("The matching message").unwrap(),
+                        vec![],
+                        vec![],
+                        Timestamp::from_unix_millis(5),
+                    )
+                    .unwrap(),
+                ),
+                Timestamp::from_unix_millis(5),
+            )
+            .unwrap();
+        let before = workspaces.workspace(first_id).unwrap().floors().clone();
+        let mut after = before.clone();
+        after.entries.insert(
+            1,
+            openpodium::domain::Floor {
+                name: Name::new("Search floor").unwrap(),
+                directory: WorkspaceDirectory::new(first.to_str().unwrap()).unwrap(),
+                repository: WorkspaceDirectory::new(first.to_str().unwrap()).unwrap(),
+                branch: Some("search-floor".to_owned()),
+                base_revision: "base".to_owned(),
+                base_branch: Some("main".to_owned()),
+                managed: false,
+                ownership_token: None,
+                owner: None,
+                dirty: false,
+                lifecycle: openpodium::domain::FloorLifecycle::Available,
+            },
+        );
+        after.node_floors.insert(node_id, 1);
+        workspaces
+            .execute(
+                first_id,
+                DomainCommand::ReplaceFloors { before, after },
+                Timestamp::from_unix_millis(6),
+            )
+            .unwrap();
+        assert_eq!(workspaces.active_workspace_id(), Some(second_id));
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        let _task = navigation::navigate_to_search_target(
+            &mut state,
+            openpodium::navigation::SearchTarget {
+                workspace_id: first_id,
+                floor_id: Some(1),
+                node_id: Some(node_id),
+                content: Some(openpodium::navigation::ContentTarget::Chat {
+                    agent_id,
+                    thread_id,
+                    message_id,
+                    character_offset: 4,
+                }),
+            },
+        );
+
+        assert_eq!(active_workspace_id(&state), Some(first_id));
+        assert_eq!(
+            state
+                .workspaces
+                .as_ref()
+                .unwrap()
+                .active_workspace()
+                .unwrap()
+                .floors()
+                .active,
+            Some(1)
+        );
+        assert_eq!(state.canvas_selection, vec![node_id]);
+        assert_eq!(state.camera.position().x, 300.0);
+        assert_eq!(state.camera.position().y, 350.0);
+        assert_eq!(
+            state.chat_ui.surface(first_id, agent_id),
+            chat::Surface::Chat
+        );
+        assert_eq!(
+            state.chat_ui.selected_thread(
+                state
+                    .workspaces
+                    .as_ref()
+                    .unwrap()
+                    .active_workspace()
+                    .unwrap(),
+                agent_id,
+            ),
+            Some(thread_id)
+        );
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Opened matching message near character 4")
+        );
+    }
+
     fn test_state(
         workspaces: WorkspaceManager,
         terminals: BTreeMap<TerminalKey, Session>,
@@ -3860,6 +4067,8 @@ mod tests {
             timeline_ui: timeline_panel::UiState::default(),
             timeline_items: BTreeMap::new(),
             timeline_high_watermarks: BTreeMap::new(),
+            navigation_ui: navigation_panel::UiState::default(),
+            command_registry: CommandRegistry::new(),
             attachment_store: None,
             ipc: None,
             orchestrator: Orchestrator::default(),

@@ -2,6 +2,7 @@ pub mod context;
 pub mod domain;
 pub mod git;
 pub mod ipc;
+pub mod navigation;
 pub mod orchestration;
 pub mod persistence;
 pub mod runtime;

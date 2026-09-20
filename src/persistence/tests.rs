@@ -38,7 +38,7 @@ fn new_database_enables_wal_foreign_keys_and_schema_version() {
         .pragma_query_value(None, "foreign_keys", |row| row.get(0))
         .unwrap();
 
-    assert_eq!(schema_version, 2);
+    assert_eq!(schema_version, 3);
     assert_eq!(journal_mode, "wal");
     assert_eq!(foreign_keys, 1);
 }
@@ -1043,7 +1043,7 @@ fn unknown_schema_version_does_not_modify_the_database() {
         error,
         PersistenceError::UnsupportedSchemaVersion {
             found: 99,
-            supported: 2,
+            supported: 3,
         }
     ));
     assert_eq!(fs::read(&path).unwrap(), before);
@@ -1099,7 +1099,8 @@ fn version_one_migration_backfills_workspace_registry_and_active_selection() {
         journal
             .connection()
             .execute_batch(
-                "DROP TABLE application_state;
+                "DROP TABLE application_shortcuts;
+                 DROP TABLE application_state;
                  DROP TABLE workspace_registry;
                  PRAGMA user_version = 1;",
             )
@@ -1112,8 +1113,38 @@ fn version_one_migration_backfills_workspace_registry_and_active_selection() {
     assert_eq!(journal.active_workspace_id().unwrap(), Some(workspace_id));
     assert!(journal.recover(workspace_id).unwrap().is_some());
     assert!(
-        path.with_file_name("journal.sqlite.backup-v1-before-v2")
+        path.with_file_name("journal.sqlite.backup-v1-before-v3")
             .exists()
+    );
+}
+
+#[test]
+fn version_two_migration_adds_persistent_shortcuts() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    {
+        let journal = Journal::open(&path).unwrap();
+        journal
+            .connection()
+            .execute_batch(
+                "DROP TABLE application_shortcuts;
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+    }
+
+    let mut journal = Journal::open(&path).unwrap();
+    journal
+        .store_shortcut("open_palette", Some("Primary+p"))
+        .unwrap();
+    journal.store_shortcut("future_command", None).unwrap();
+
+    assert_eq!(
+        journal.shortcuts().unwrap(),
+        vec![
+            ("future_command".to_owned(), None),
+            ("open_palette".to_owned(), Some("Primary+p".to_owned())),
+        ]
     );
 }
 
@@ -1135,7 +1166,7 @@ fn migration_failure_reports_versions_and_preserves_a_backup() {
     let backup_path = match error {
         PersistenceError::Migration {
             from: 0,
-            to: 2,
+            to: 3,
             backup_path: Some(path),
             ..
         } => path,
@@ -1205,5 +1236,5 @@ fn database_path(temp: &TempDir) -> PathBuf {
 }
 
 fn migration_backup_path(database: &Path) -> PathBuf {
-    database.with_file_name("journal.sqlite.backup-v0-before-v2")
+    database.with_file_name("journal.sqlite.backup-v0-before-v3")
 }

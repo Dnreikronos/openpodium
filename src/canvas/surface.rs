@@ -4,18 +4,19 @@ use iced::advanced::widget::{self, Tree};
 use iced::advanced::{
     Clipboard, InputMethod, Layout, Shell, Widget, input_method, layout, renderer,
 };
-use iced::keyboard::{self, Key, Modifiers, key::Named};
+#[cfg(test)]
+use iced::keyboard::key::Named;
+use iced::keyboard::{self, Key, Modifiers};
 use iced::mouse;
 use iced::widget::canvas::{self, Action};
 use iced::{Element, Fill, Length, Point, Rectangle, Renderer, Size, Theme};
 use openpodium::domain::{CanvasLayout, Node, NodeId};
+use openpodium::navigation::Shortcut;
 
 use crate::terminal::{self, BODY_PADDING, CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT};
 
 use super::{Camera, CanvasDocument, ScreenPoint, ViewportSize, editor, scene};
 
-const KEYBOARD_PAN_PIXELS: f64 = 80.0;
-const KEYBOARD_ZOOM_FACTOR: f64 = 1.2;
 const LINE_SCROLL_PIXELS: f64 = 48.0;
 const LINE_ZOOM_SENSITIVITY: f64 = 0.18 / LINE_SCROLL_PIXELS;
 const PIXEL_ZOOM_SENSITIVITY: f64 = 0.003;
@@ -30,10 +31,6 @@ pub(crate) enum Message {
         before: CanvasLayout,
         after: CanvasLayout,
     },
-    UndoRequested,
-    RedoRequested,
-    DeleteRequested,
-    DuplicateRequested,
     CopyRequested,
     PasteRequested,
     TerminalFocused(Option<NodeId>),
@@ -66,6 +63,7 @@ pub(crate) fn view(
     document: CanvasDocument,
     selection: Vec<NodeId>,
     focused_terminal: Option<NodeId>,
+    application_shortcuts: Vec<Shortcut>,
     revision: u64,
 ) -> Element<'static, Message> {
     TerminalCanvas::element(Surface {
@@ -73,6 +71,7 @@ pub(crate) fn view(
         document,
         selection,
         focused_terminal,
+        application_shortcuts,
         revision,
     })
 }
@@ -180,6 +179,7 @@ struct Surface {
     document: CanvasDocument,
     selection: Vec<NodeId>,
     focused_terminal: Option<NodeId>,
+    application_shortcuts: Vec<Shortcut>,
     revision: u64,
 }
 
@@ -256,7 +256,7 @@ impl canvas::Program<Message> for Surface {
                 if let Some(node_id) = self.focused_terminal {
                     self.handle_terminal_key(state, node_id, key, text.as_deref(), *modifiers)
                 } else {
-                    self.handle_key(state, key, *modifiers, bounds)
+                    None
                 }
             }
             canvas::Event::InputMethod(input_method::Event::Preedit(text, _))
@@ -593,59 +593,6 @@ impl Surface {
         Some(Action::publish(message).and_capture())
     }
 
-    fn handle_key(
-        &self,
-        state: &State,
-        key: &Key,
-        modifiers: Modifiers,
-        bounds: Rectangle,
-    ) -> Option<Action<Message>> {
-        let command = modifiers.command() || modifiers.control();
-        match key.as_ref() {
-            Key::Character("z") if command && modifiers.shift() => {
-                return Some(Action::publish(Message::RedoRequested).and_capture());
-            }
-            Key::Character("z") if command => {
-                return Some(Action::publish(Message::UndoRequested).and_capture());
-            }
-            Key::Character("y") if command => {
-                return Some(Action::publish(Message::RedoRequested).and_capture());
-            }
-            Key::Character("d") if command => {
-                return Some(Action::publish(Message::DuplicateRequested).and_capture());
-            }
-            Key::Character("c") if command && !self.selection.is_empty() => {
-                return Some(Action::publish(Message::CopyRequested).and_capture());
-            }
-            Key::Character("v") if command => {
-                return Some(Action::publish(Message::PasteRequested).and_capture());
-            }
-            Key::Named(Named::Delete | Named::Backspace) if !self.selection.is_empty() => {
-                return Some(Action::publish(Message::DeleteRequested).and_capture());
-            }
-            _ => {}
-        }
-
-        let viewport = viewport(bounds);
-        let center = ScreenPoint::new(viewport.width / 2.0, viewport.height / 2.0);
-        let camera = match key.as_ref() {
-            Key::Named(Named::ArrowLeft) => self.camera.pan_by_screen(KEYBOARD_PAN_PIXELS, 0.0),
-            Key::Named(Named::ArrowRight) => self.camera.pan_by_screen(-KEYBOARD_PAN_PIXELS, 0.0),
-            Key::Named(Named::ArrowUp) => self.camera.pan_by_screen(0.0, KEYBOARD_PAN_PIXELS),
-            Key::Named(Named::ArrowDown) => self.camera.pan_by_screen(0.0, -KEYBOARD_PAN_PIXELS),
-            Key::Character("+" | "=") => {
-                self.camera.zoom_at(KEYBOARD_ZOOM_FACTOR, center, viewport)
-            }
-            Key::Character("-" | "_") => {
-                self.camera
-                    .zoom_at(1.0 / KEYBOARD_ZOOM_FACTOR, center, viewport)
-            }
-            Key::Character("0") => Camera::default(),
-            _ => return None,
-        };
-        self.publish_camera(state, camera)
-    }
-
     fn handle_terminal_key(
         &self,
         state: &State,
@@ -654,8 +601,11 @@ impl Surface {
         text: Option<&str>,
         modifiers: Modifiers,
     ) -> Option<Action<Message>> {
-        if is_release_focus_shortcut(key, modifiers) {
-            return Some(Action::publish(Message::TerminalFocused(None)).and_capture());
+        if crate::navigation_panel::shortcut_from_key(key, modifiers)
+            .as_ref()
+            .is_some_and(|shortcut| self.application_shortcuts.contains(shortcut))
+        {
+            return Some(Action::capture());
         }
         if is_copy_shortcut(key, modifiers) {
             return Some(Action::publish(Message::TerminalCopyRequested(node_id)).and_capture());
@@ -766,12 +716,6 @@ impl Surface {
     }
 }
 
-fn is_release_focus_shortcut(key: &Key, modifiers: Modifiers) -> bool {
-    matches!(key.as_ref(), Key::Named(Named::Escape))
-        && modifiers.shift()
-        && (modifiers.command() || modifiers.control())
-}
-
 #[cfg(target_os = "macos")]
 fn is_copy_shortcut(key: &Key, modifiers: Modifiers) -> bool {
     matches!(key.as_ref(), Key::Character("c")) && modifiers.command()
@@ -818,10 +762,14 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         let (canvas_command, encoded_undo) = (Modifiers::CTRL, vec![0x1a]);
 
-        assert!(!is_release_focus_shortcut(
-            &Key::Named(Named::Escape),
-            Modifiers::empty()
-        ));
+        let release = Shortcut::parse("Primary+Shift+Escape").unwrap();
+        assert_ne!(
+            crate::navigation_panel::shortcut_from_key(
+                &Key::Named(Named::Escape),
+                Modifiers::empty()
+            ),
+            Some(release.clone())
+        );
         assert_eq!(
             terminal::encode_key(
                 &Key::Named(Named::Escape),
@@ -840,9 +788,12 @@ mod tests {
             ),
             Some(encoded_undo)
         );
-        assert!(is_release_focus_shortcut(
-            &Key::Named(Named::Escape),
-            canvas_command | Modifiers::SHIFT
-        ));
+        assert_eq!(
+            crate::navigation_panel::shortcut_from_key(
+                &Key::Named(Named::Escape),
+                canvas_command | Modifiers::SHIFT
+            ),
+            Some(release)
+        );
     }
 }

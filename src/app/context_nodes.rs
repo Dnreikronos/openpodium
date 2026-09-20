@@ -14,6 +14,8 @@ use openpodium::domain::{
 
 use super::{Message, OpenPodium, WorkspaceManager, canvas_coordinate, next_node_id, now};
 
+pub(super) const EDITOR_ID: &str = "context-editor";
+
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Kind {
     Note,
@@ -35,6 +37,7 @@ pub(super) struct UiState {
     refresh_ticks: u8,
     bodies: BTreeMap<NodeId, String>,
     refresh_busy: bool,
+    search_match: Option<usize>,
 }
 
 impl Default for UiState {
@@ -47,6 +50,7 @@ impl Default for UiState {
             refresh_ticks: 0,
             bodies: BTreeMap::new(),
             refresh_busy: false,
+            search_match: None,
         }
     }
 }
@@ -74,6 +78,7 @@ pub(super) fn selection_changed(state: &mut OpenPodium) {
         state.context_ui.text_key = None;
         state.context_ui.note = None;
         state.context_ui.editor = text_editor::Content::new();
+        state.context_ui.search_match = None;
         return;
     };
     match target {
@@ -206,6 +211,7 @@ pub(super) fn scan_completed(state: &mut OpenPodium, result: Result<ScanResult, 
 }
 
 pub(super) fn edit_note(state: &mut OpenPodium, action: text_editor::Action) {
+    state.context_ui.search_match = None;
     state.context_ui.editor.perform(action);
     if let Some(note) = state.context_ui.note.as_mut() {
         note.edit(state.context_ui.editor.text());
@@ -327,7 +333,11 @@ pub(super) fn note_panel(state: &UiState) -> Option<Element<'_, Message>> {
         return state.text_key.map(|_| {
             column![
                 text("Editing text node").size(18),
+                state
+                    .search_match
+                    .map(|offset| text(format!("Search match near character {offset}")).size(12)),
                 text_editor(&state.editor)
+                    .id(EDITOR_ID)
                     .placeholder("Write Markdown…")
                     .on_action(Message::EditNote)
                     .height(180),
@@ -340,7 +350,11 @@ pub(super) fn note_panel(state: &UiState) -> Option<Element<'_, Message>> {
     };
     let mut panel = column![
         text(format!("Editing {}", note.path())).size(18),
+        state
+            .search_match
+            .map(|offset| text(format!("Search match near character {offset}")).size(12)),
         text_editor(&state.editor)
+            .id(EDITOR_ID)
             .placeholder("Write Markdown…")
             .on_action(Message::EditNote)
             .height(180),
@@ -365,6 +379,27 @@ pub(super) fn note_panel(state: &UiState) -> Option<Element<'_, Message>> {
         );
     }
     Some(panel.into())
+}
+
+pub(super) fn reveal_offset(state: &mut OpenPodium, character_offset: usize) -> Task<Message> {
+    let text = state.context_ui.editor.text();
+    let byte_offset = text
+        .char_indices()
+        .nth(character_offset)
+        .map_or(text.len(), |(offset, _)| offset);
+    let prefix = &text[..byte_offset];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, line)| line)
+        .chars()
+        .count();
+    state.context_ui.editor.move_to(text_editor::Cursor {
+        position: text_editor::Position { line, column },
+        selection: None,
+    });
+    state.context_ui.search_match = Some(character_offset);
+    iced::widget::operation::focus(EDITOR_ID)
 }
 
 pub(super) fn connected_note_paths(
