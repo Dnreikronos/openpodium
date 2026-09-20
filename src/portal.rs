@@ -7,9 +7,11 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+mod appium;
 mod browser;
 mod device;
 mod policy;
+pub use appium::{AppiumBackend, AppiumError};
 pub use browser::{BrowserBackend, BrowserError};
 pub use device::{
     DeviceAvailability, DeviceDiscovery, DeviceDiscoveryReport, DeviceKind, DiscoveredDevice,
@@ -184,6 +186,29 @@ impl PortalCapabilities {
             },
             sensitive_permission: CapabilityStatus::PermissionRequired {
                 reason: "the target may request a sensitive browser permission".to_owned(),
+            },
+        }
+    }
+
+    pub fn appium_defaults() -> Self {
+        let unavailable = |reason: &str| CapabilityStatus::Unavailable {
+            reason: reason.to_owned(),
+        };
+        Self {
+            observe: CapabilityStatus::Supported,
+            screenshot: CapabilityStatus::Supported,
+            navigate: unavailable("device navigation is not exposed by the Appium adapter"),
+            input: CapabilityStatus::PermissionRequired {
+                reason: "device input can trigger an external side effect".to_owned(),
+            },
+            coordinate_fallback: CapabilityStatus::PermissionRequired {
+                reason: "coordinates are less stable than semantic element references".to_owned(),
+            },
+            upload: unavailable("device file upload is not implemented"),
+            download: unavailable("device file download is not implemented"),
+            clipboard: unavailable("device clipboard access is not implemented"),
+            sensitive_permission: CapabilityStatus::PermissionRequired {
+                reason: "device permissions can expose sensitive data".to_owned(),
             },
         }
     }
@@ -714,6 +739,10 @@ impl PortalSession {
 
 pub trait PortalBackend {
     type Error: Error + Send + Sync + 'static;
+
+    fn capabilities(&self) -> PortalCapabilities {
+        PortalCapabilities::browser_defaults()
+    }
 
     fn connect(
         &mut self,

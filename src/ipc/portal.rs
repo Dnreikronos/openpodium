@@ -187,7 +187,7 @@ impl PortalDispatcher {
         if self.portals.contains_key(&portal_id) {
             return Err(PortalServiceError::DuplicatePortal(portal_id));
         }
-        let capabilities = capabilities_for(config.target().kind());
+        let capabilities = backend.capabilities();
         self.portals.insert(
             portal_id,
             PortalEntry {
@@ -695,31 +695,6 @@ fn observe_entry(
         frame_available: core.frame().is_some(),
     };
     Ok(PortalObservationResult { observation, core })
-}
-
-fn capabilities_for(kind: PortalTargetKind) -> PortalCapabilities {
-    let mut capabilities = PortalCapabilities::browser_defaults();
-    if kind != PortalTargetKind::Browser {
-        for operation in [
-            PortalOperation::Observe,
-            PortalOperation::Screenshot,
-            PortalOperation::Navigate,
-            PortalOperation::Input,
-            PortalOperation::CoordinateFallback,
-            PortalOperation::Upload,
-            PortalOperation::Download,
-            PortalOperation::Clipboard,
-            PortalOperation::SensitivePermission,
-        ] {
-            capabilities.set_status(
-                operation,
-                CapabilityStatus::Unavailable {
-                    reason: "device adapter is not registered".to_owned(),
-                },
-            );
-        }
-    }
-    capabilities
 }
 
 fn capability_report(capabilities: &PortalCapabilities) -> Vec<PortalCapability> {
