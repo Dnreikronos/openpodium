@@ -239,22 +239,30 @@ impl PortalPolicy {
     ) -> Result<PortalGrant, PortalPolicyError> {
         let pending = self
             .pending
-            .remove(&approval_id)
+            .get(&approval_id)
             .ok_or(PortalPolicyError::UnknownApproval(approval_id))?;
         if pending.request != *request
             || now_ms.saturating_sub(pending.requested_at_ms) > PENDING_APPROVAL_LIFETIME_MS
         {
+            self.pending.remove(&approval_id);
             return Err(PortalPolicyError::StaleApproval);
         }
         if let Some(CapabilityStatus::Unavailable { reason }) = capability_status(request) {
-            return Err(PortalPolicyError::Unavailable(reason.clone()));
+            let reason = reason.clone();
+            self.pending.remove(&approval_id);
+            return Err(PortalPolicyError::Unavailable(reason));
         }
         if let Some(PolicyRule::Deny { reason }) = self.rules.get(&request.operation) {
-            return Err(PortalPolicyError::Denied(reason.clone()));
+            let reason = reason.clone();
+            self.pending.remove(&approval_id);
+            return Err(PortalPolicyError::Denied(reason));
         }
+        // A bad lifetime is the caller's mistake, so the approval stays
+        // usable rather than making the desktop prompt unanswerable.
         if lifetime_ms == 0 {
             return Err(PortalPolicyError::InvalidLifetime);
         }
+        self.pending.remove(&approval_id);
 
         let grant = PortalGrant {
             id: self.allocate_id(),
@@ -313,16 +321,8 @@ impl PortalPolicy {
         now_ms: u64,
         reason: String,
     ) -> PolicyDecision {
-        if let Some(approval) = self
-            .pending
-            .values()
-            .find(|approval| approval.request == *request)
-        {
-            return PolicyDecision::ApprovalRequired {
-                approval_id: approval.id,
-                reason,
-            };
-        }
+        // Every request gets its own approval. Sharing one across identical
+        // requests let the first resolution consume it and strand the rest.
         let id = self.allocate_id();
         self.pending.insert(
             id,
@@ -458,6 +458,41 @@ mod tests {
             policy.evaluate(&original, 1_014),
             PolicyDecision::ApprovalRequired { .. }
         ));
+    }
+
+    #[test]
+    fn identical_requests_get_their_own_approvals() {
+        let mut policy = PortalPolicy::new();
+        let request = request(PortalOperation::Input, "https://example.test");
+        let first = match policy.evaluate(&request, 10) {
+            PolicyDecision::ApprovalRequired { approval_id, .. } => approval_id,
+            decision => panic!("unexpected decision: {decision:?}"),
+        };
+        let second = match policy.evaluate(&request, 10) {
+            PolicyDecision::ApprovalRequired { approval_id, .. } => approval_id,
+            decision => panic!("unexpected decision: {decision:?}"),
+        };
+
+        assert_ne!(first, second);
+        assert!(policy.approve(first, &request, 11, 1_000).is_ok());
+        // Resolving one must not consume the other.
+        assert!(policy.reject(second).is_ok());
+    }
+
+    #[test]
+    fn a_rejected_lifetime_leaves_the_approval_answerable() {
+        let mut policy = PortalPolicy::new();
+        let request = request(PortalOperation::Input, "https://example.test");
+        let approval_id = match policy.evaluate(&request, 10) {
+            PolicyDecision::ApprovalRequired { approval_id, .. } => approval_id,
+            decision => panic!("unexpected decision: {decision:?}"),
+        };
+
+        assert_eq!(
+            policy.approve(approval_id, &request, 11, 0),
+            Err(PortalPolicyError::InvalidLifetime)
+        );
+        assert!(policy.approve(approval_id, &request, 12, 1_000).is_ok());
     }
 
     #[test]

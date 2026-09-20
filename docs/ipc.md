@@ -142,7 +142,12 @@ immediately before execution. Action intent is journaled before dispatch;
 in-flight work recovered after a crash is reported as `unknown` and is never
 replayed automatically. Approval state is not durable, so a request still
 awaiting approval at restart is recovered as `failed` rather than left for an
-approval that can no longer arrive.
+approval that can no longer arrive. An approval that expires before the desktop
+user answers finalizes its action the same way.
+
+`get_portal_result` reads the journal, so an outcome stays retrievable after the
+portal it ran against is closed or unregistered. The journalled sender is what
+authorizes retrieval; to any other agent the action does not exist.
 
 `observe_portal` returns accessibility data and reports whether a frame exists.
 `get_portal_frame` retrieves that frame in authenticated, revision-bound chunks

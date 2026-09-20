@@ -323,14 +323,10 @@ impl PortalDispatcher {
             })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
-        for (workspace_id, action_id) in pending {
-            self.pending_actions
-                .remove(&(workspace_id, action_id.clone()));
-            self.journal.finish(
-                workspace_id,
-                &action_id,
-                "failed",
-                Some("agent disconnected from portal before approval".to_owned()),
+        for key in pending {
+            self.fail_pending_action(
+                &key,
+                "agent disconnected from portal before approval",
                 now_ms(),
             )?;
         }
@@ -364,16 +360,8 @@ impl PortalDispatcher {
             .filter(|(_, action)| action.portal_id == portal_id)
             .map(|(key, _)| key.clone())
             .collect();
-        for (workspace_id, action_id) in pending {
-            self.pending_actions
-                .remove(&(workspace_id, action_id.clone()));
-            self.journal.finish(
-                workspace_id,
-                &action_id,
-                "failed",
-                Some("portal closed before approval".to_owned()),
-                now_ms(),
-            )?;
+        for key in pending {
+            self.fail_pending_action(&key, "portal closed before approval", now_ms())?;
         }
         self.policy.revoke_portal(portal_id);
         Ok(())
@@ -676,9 +664,12 @@ impl PortalDispatcher {
                 found: approval_id,
             });
         }
-        self.policy
-            .reject(approval_id)
-            .map_err(PortalServiceError::Policy)?;
+        // An approval the policy has already dropped, by expiry or otherwise,
+        // must still let the user clear the request.
+        match self.policy.reject(approval_id) {
+            Ok(()) | Err(PortalPolicyError::UnknownApproval(_)) => {}
+            Err(error) => return Err(PortalServiceError::Policy(error)),
+        }
         self.pending_actions.remove(&key);
         self.journal
             .mark_rejected(workspace_id, action_id, reason, now_ms())?;
@@ -719,11 +710,22 @@ impl PortalDispatcher {
         )
         .map_err(PortalServiceError::Policy)?;
         if current_request != pending.request {
+            let _ = self.policy.reject(approval_id);
+            self.fail_pending_action(&key, "portal target changed before approval", now_ms)?;
             return Err(PortalServiceError::Policy(PortalPolicyError::StaleApproval));
         }
-        self.policy
+        if let Err(error) = self
+            .policy
             .approve(approval_id, &current_request, now_ms, lifetime_ms)
-            .map_err(PortalServiceError::Policy)?;
+        {
+            // An expired or refused approval can never be granted, so the
+            // request is finalized instead of waiting on a prompt that no
+            // longer resolves. A rejected lifetime is the caller's to retry.
+            if !matches!(error, PortalPolicyError::InvalidLifetime) {
+                self.fail_pending_action(&key, &error.to_string(), now_ms)?;
+            }
+            return Err(PortalServiceError::Policy(error));
+        }
         self.journal.mark_approved(workspace_id, action_id)?;
         self.pending_actions.remove(&key);
         self.dispatch_action(
@@ -739,6 +741,9 @@ impl PortalDispatcher {
         )
     }
 
+    /// Receipts outlive the portal they were produced against, so retrieval is
+    /// authorized against the sender recorded in the journal rather than a
+    /// live attachment that a restart or a disconnect would have dropped.
     pub fn result(
         &self,
         workspace_id: u64,
@@ -749,14 +754,21 @@ impl PortalDispatcher {
             .journal
             .receipt(workspace_id, action_id)?
             .ok_or_else(|| PortalServiceError::UnknownAction(action_id.to_string()))?;
-        let entry = self.entry(receipt.portal_id)?;
-        if !entry.attached_agents.contains(&agent_id) {
-            return Err(PortalServiceError::AgentNotAttached {
-                portal_id: receipt.portal_id,
-                agent_id,
-            });
+        if self.journal.sender(workspace_id, action_id)? != Some(agent_id) {
+            return Err(PortalServiceError::UnknownAction(action_id.to_string()));
         }
         Ok(receipt)
+    }
+
+    fn fail_pending_action(
+        &mut self,
+        key: &(u64, MessageId),
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<(), PortalServiceError> {
+        self.pending_actions.remove(key);
+        self.journal
+            .finish(key.0, &key.1, "failed", Some(reason.to_owned()), now_ms)
     }
 
     pub fn set_policy_rule(&mut self, operation: PortalOperation, rule: crate::portal::PolicyRule) {
@@ -1413,6 +1425,72 @@ mod tests {
             .approve_action_at(4, &action_id, approval_id, 1_000, 101)
             .unwrap();
         assert_eq!(executed.lock().unwrap().as_slice(), &[action]);
+    }
+
+    #[test]
+    fn an_expired_approval_finalizes_its_action_instead_of_waiting_forever() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, executed) = dispatcher(&temp);
+        let observation = dispatcher.observe(4, 7, 10).unwrap();
+        let action_id = MessageId::new("expired").unwrap();
+        let receipt = dispatcher
+            .request_action_at(
+                4,
+                7,
+                action_id.clone(),
+                10,
+                PortalAction::Click(
+                    PortalElementRef::new(observation.observation.revision, "submit").unwrap(),
+                ),
+                100,
+            )
+            .unwrap();
+        let approval_id = match receipt.policy {
+            PortalPolicyOutcome::ApprovalRequired { approval_id, .. } => approval_id,
+            policy => panic!("unexpected policy outcome: {policy:?}"),
+        };
+
+        assert!(
+            dispatcher
+                .approve_action_at(4, &action_id, approval_id, 1_000, 100 + 120_000)
+                .is_err()
+        );
+
+        let receipt = dispatcher.result(4, 7, &action_id).unwrap();
+        assert_eq!(receipt.state, PortalActionState::Failed);
+        assert!(dispatcher.pending_approvals(4).is_empty());
+        assert!(executed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_receipt_outlives_the_portal_and_stays_with_its_sender() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, _) = dispatcher(&temp);
+        let observation = dispatcher.observe(4, 7, 10).unwrap();
+        let action_id = MessageId::new("durable").unwrap();
+        dispatcher
+            .request_action_at(
+                4,
+                7,
+                action_id.clone(),
+                10,
+                PortalAction::Click(
+                    PortalElementRef::new(observation.observation.revision, "submit").unwrap(),
+                ),
+                100,
+            )
+            .unwrap();
+
+        dispatcher.unregister(10).unwrap();
+
+        assert_eq!(
+            dispatcher.result(4, 7, &action_id).unwrap().action_id,
+            action_id
+        );
+        assert!(matches!(
+            dispatcher.result(4, 8, &action_id),
+            Err(PortalServiceError::UnknownAction(_))
+        ));
     }
 
     #[test]

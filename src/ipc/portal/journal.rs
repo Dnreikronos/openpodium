@@ -202,6 +202,18 @@ impl PortalActionJournal {
             .transpose()
     }
 
+    /// The agent that recorded the action, which stays available after the
+    /// portal it ran against is gone.
+    pub(super) fn sender(
+        &self,
+        workspace_id: u64,
+        action_id: &MessageId,
+    ) -> Result<Option<u64>, PortalServiceError> {
+        Ok(self
+            .record(workspace_id, action_id)?
+            .map(|record| record.agent_id))
+    }
+
     pub(super) fn duplicate_receipt(
         &self,
         workspace_id: u64,
