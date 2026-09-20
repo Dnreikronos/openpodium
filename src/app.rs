@@ -1,6 +1,7 @@
 mod context_nodes;
 mod floors;
 mod navigation;
+mod portals;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -88,6 +89,7 @@ struct PortableImportDraft {
 struct OpenPodium {
     floor_ui: floors::UiState,
     context_ui: context_nodes::UiState,
+    portal_ui: portals::UiState,
     camera: Camera,
     canvas_selection: Vec<NodeId>,
     canvas_preview: Option<CanvasLayout>,
@@ -194,6 +196,7 @@ impl Default for OpenPodium {
         let mut state = Self {
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
+            portal_ui: portals::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
@@ -251,6 +254,7 @@ impl Default for OpenPodium {
 #[derive(Clone)]
 enum Message {
     Floor(floors::Message),
+    Portal(portals::Message),
     OrchestrationTick,
     Canvas(canvas::Message),
     Chat(chat::Message),
@@ -382,13 +386,15 @@ pub(crate) fn run() -> iced::Result {
 fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
         Message::Floor(message) => return floors::update(state, message),
+        Message::Portal(message) => return portals::update(state, message),
         Message::OrchestrationTick => {
             run_orchestration_tick(state);
             let contexts = context_nodes::tick(state);
             let timelines = refresh_timelines(state);
             let floors = floors::tick(state);
             let navigation = navigation::tick(state);
-            return Task::batch([timelines, floors, contexts, navigation]);
+            let portals = portals::tick(state);
+            return Task::batch([timelines, floors, contexts, navigation, portals]);
         }
         Message::Canvas(message) => return handle_canvas_message(state, message),
         Message::SaveSelectionAsTemplate => return save_selection_as_template(state),
@@ -678,6 +684,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .on_input(Message::InstructionsChanged),
         button("Save settings").on_press(Message::SaveSettings),
         floors::view(state),
+        portals::creation_view(state),
         text("Add agent").size(18),
         row![
             button("Codex").on_press(Message::AddAgent(AgentProgram::Codex)),
@@ -1146,6 +1153,9 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             button("Start terminal").on_press(Message::StartTerminal(node_id))
         });
     }
+    if let Some(portal) = portals::selected_view(state) {
+        settings = settings.push(portal);
+    }
 
     let stage: Element<'_, Message> = if has_active_workspace {
         let workspace = state
@@ -1289,6 +1299,7 @@ impl OpenPodium {
 
 impl Drop for OpenPodium {
     fn drop(&mut self) {
+        portals::shutdown(self);
         self.stop_all_terminals();
     }
 }
@@ -3392,6 +3403,7 @@ fn persist_canvas(
                 .expect("workspace was just updated")
                 .all_canvas_layout();
             synchronize_terminals(state, &runtime_layout);
+            portals::sync_connections(state);
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
             Ok(())
         }
@@ -3876,6 +3888,7 @@ mod tests {
         let mut state = OpenPodium {
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
+            portal_ui: portals::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
@@ -4441,6 +4454,7 @@ mod tests {
         OpenPodium {
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
+            portal_ui: portals::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,

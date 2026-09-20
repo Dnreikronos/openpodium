@@ -21,8 +21,9 @@ CDP client or an iced image surface.
 Add `CanvasNodeContent::Portal(PortalConfig)` with backward-compatible journal,
 canvas-fragment, template, and workspace-archive decoding. A portal copy or
 import starts disconnected. Render the most recent bounded frame inside the
-existing canvas scene and route pointer, scroll, keyboard, resize, z-order, and
-camera events through the phase 1 geometry.
+existing canvas scene. The phase 1 geometry handles aspect-ratio-correct frame
+placement and provides the coordinate mapping needed by the remaining pointer
+and scroll input work.
 
 ## Phase 3: browser adapter and policy
 
@@ -46,3 +47,17 @@ because those agents currently receive no IPC endpoint.
 The product specification still lists portals outside the first release; this
 work therefore remains behind explicit portal configuration and does not change
 the release claim until the full acceptance matrix passes.
+
+## Current desktop flow
+
+The app can create a browser portal node from a URL, explicitly connect an
+isolated Chromium process, and capture bounded frames off the UI thread. Live
+sessions receive globally unique transient portal IDs, honor each node's frame
+rate limit, synchronize directly connected canvas agents before observation,
+and close when the node, floor, workspace, or application goes away. Undo and
+imports restore only the durable configuration.
+
+Canvas pointer, scroll, keyboard, and text-composition forwarding still need
+to be connected to semantic or coordinate actions. A real Chromium smoke test
+also remains pending because no compatible executable is installed on the
+development machine.
