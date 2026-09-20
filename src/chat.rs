@@ -308,7 +308,7 @@ fn connected_targets(workspace: &Workspace, agent_id: AgentId) -> Vec<NodeTarget
     let owner_nodes: Vec<_> = layout
         .nodes()
         .iter()
-        .filter(|node| node.target() == NodeTarget::Agent(agent_id))
+        .filter(|node| node.reference() == Some(NodeTarget::Agent(agent_id)))
         .map(|node| node.id())
         .collect();
     let mut targets = Vec::new();
@@ -320,9 +320,7 @@ fn connected_targets(workspace: &Workspace, agent_id: AgentId) -> Vec<NodeTarget
         } else {
             None
         };
-        let Some(target) =
-            other.and_then(|node_id| workspace.node(node_id).map(|node| node.target()))
-        else {
+        let Some(target) = other.and_then(|node_id| workspace.node(node_id)?.reference()) else {
             continue;
         };
         if target != NodeTarget::Agent(agent_id) && !targets.contains(&target) {

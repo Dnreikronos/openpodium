@@ -316,7 +316,7 @@ fn remove(
     for (node, assigned) in &before.node_floors {
         if *assigned == floor_id
             && let Some(node) = workspace.node(*node)
-            && let NodeTarget::Agent(agent_id) = node.target()
+            && let Some(NodeTarget::Agent(agent_id)) = node.reference()
             && let Some(agent) = workspace.agent(agent_id)
             && matches!(
                 agent.state(),

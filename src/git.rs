@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod changes;
+mod context;
 mod integration;
 
 pub use changes::{
     ChangeKind, ChangedPath, Collision, CollisionReport, CollisionSeverity, RepoPath,
     WorktreeInventory,
 };
+pub use context::{PathDiff, path_diff, path_is_ignored, path_is_tracked};
 pub use integration::{
     CommitPreview, IntegrationAction, IntegrationError, IntegrationOutcome, IntegrationPreview,
 };

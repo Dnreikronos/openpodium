@@ -905,7 +905,9 @@ impl Workspace {
             }
             DomainEvent::NodeAdded(node) => {
                 self.ensure_absent(EntityRef::Node(node.id()))?;
-                self.ensure_reference(EntityRef::Node(node.id()), "target", node.target().into())?;
+                if let Some(target) = node.reference() {
+                    self.ensure_reference(EntityRef::Node(node.id()), "target", target.into())?;
+                }
                 self.nodes.insert(node.id(), node.clone());
                 if let Some(floor) = self.floors.active {
                     self.floors.node_floors.insert(node.id(), floor);
@@ -935,11 +937,11 @@ impl Workspace {
                         EntityRef::CommandPreset(preset_id),
                     )?;
                 }
-                if node.target() != super::NodeTarget::Agent(agent.id()) {
+                if node.reference() != Some(super::NodeTarget::Agent(agent.id())) {
                     return Err(DomainError::InvalidReference {
                         entity: EntityRef::Node(node.id()),
                         field: "target",
-                        target: node.target().into(),
+                        target: EntityRef::Agent(agent.id()),
                     });
                 }
                 self.agents.insert(agent.id(), agent.clone());
@@ -1252,7 +1254,7 @@ impl Workspace {
         let owner_nodes: Vec<NodeId> = self
             .nodes
             .values()
-            .filter(|node| node.target() == NodeTarget::Agent(thread.agent_id()))
+            .filter(|node| node.reference() == Some(NodeTarget::Agent(thread.agent_id())))
             .map(Node::id)
             .collect();
         for mention in mentions {
@@ -1264,7 +1266,7 @@ impl Workspace {
             let target_nodes: Vec<NodeId> = self
                 .nodes
                 .values()
-                .filter(|node| node.target() == *mention)
+                .filter(|node| node.reference() == Some(*mention))
                 .map(Node::id)
                 .collect();
             let connected = self.connections.values().any(|connection| {
@@ -1289,7 +1291,9 @@ impl Workspace {
             if !node_ids.insert(node.id()) {
                 return Err(DomainError::DuplicateEntity(EntityRef::Node(node.id())));
             }
-            self.ensure_reference(EntityRef::Node(node.id()), "target", node.target().into())?;
+            if let Some(target) = node.reference() {
+                self.ensure_reference(EntityRef::Node(node.id()), "target", target.into())?;
+            }
         }
 
         let mut grouped_nodes = std::collections::BTreeSet::new();
@@ -1350,7 +1354,8 @@ impl Workspace {
                     detail: "target node does not exist",
                 });
             };
-            if ConnectionKind::between(source.target(), target.target()) != Some(connection.kind())
+            if ConnectionKind::between_content(source.content(), target.content())
+                != Some(connection.kind())
             {
                 return Err(DomainError::InvalidConnection {
                     connection_id: connection.id(),

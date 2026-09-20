@@ -1,3 +1,4 @@
+pub mod context;
 pub mod domain;
 pub mod git;
 pub mod ipc;

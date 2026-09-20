@@ -34,6 +34,8 @@ pub(crate) enum Message {
     RedoRequested,
     DeleteRequested,
     DuplicateRequested,
+    CopyRequested,
+    PasteRequested,
     TerminalFocused(Option<NodeId>),
     TerminalInput {
         node_id: NodeId,
@@ -611,6 +613,12 @@ impl Surface {
             }
             Key::Character("d") if command => {
                 return Some(Action::publish(Message::DuplicateRequested).and_capture());
+            }
+            Key::Character("c") if command && !self.selection.is_empty() => {
+                return Some(Action::publish(Message::CopyRequested).and_capture());
+            }
+            Key::Character("v") if command => {
+                return Some(Action::publish(Message::PasteRequested).and_capture());
             }
             Key::Named(Named::Delete | Named::Backspace) if !self.selection.is_empty() => {
                 return Some(Action::publish(Message::DeleteRequested).and_capture());

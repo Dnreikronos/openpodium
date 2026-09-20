@@ -181,9 +181,9 @@ pub(crate) fn duplicate(
         let id = NodeId::new(next_node);
         next_node = next_node.saturating_add(1);
         ids.insert(node.id(), id);
-        nodes.push(Node::with_z_index(
+        nodes.push(Node::with_content_and_z_index(
             id,
-            node.target(),
+            node.content().clone(),
             CanvasPoint::new(
                 node.position().x() + DUPLICATE_OFFSET,
                 node.position().y() + DUPLICATE_OFFSET,
@@ -224,6 +224,107 @@ pub(crate) fn duplicate(
 
     let selection = ids.values().copied().collect();
     (CanvasLayout::new(nodes, groups, connections), selection)
+}
+
+pub(crate) fn selection_fragment(layout: &CanvasLayout, selection: &[NodeId]) -> CanvasLayout {
+    let selected = expanded_selection(layout, selection);
+    CanvasLayout::new(
+        layout
+            .nodes()
+            .iter()
+            .filter(|node| selected.contains(&node.id()))
+            .cloned()
+            .collect(),
+        layout
+            .groups()
+            .iter()
+            .filter(|group| group.members().all(|member| selected.contains(&member)))
+            .cloned()
+            .collect(),
+        layout
+            .connections()
+            .iter()
+            .filter(|connection| {
+                selected.contains(&connection.source()) && selected.contains(&connection.target())
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+pub(crate) fn paste_fragment(
+    layout: &CanvasLayout,
+    fragment: &CanvasLayout,
+    all: &CanvasLayout,
+) -> (CanvasLayout, Vec<NodeId>) {
+    if fragment.nodes().is_empty() {
+        return (layout.clone(), Vec::new());
+    }
+    let mut next_node = next_id(all.nodes().iter().map(|node| node.id().get()));
+    let mut next_group = next_id(all.groups().iter().map(|group| group.id().get()));
+    let mut next_connection = next_id(
+        all.connections()
+            .iter()
+            .map(|connection| connection.id().get()),
+    );
+    let mut next_z = layout
+        .nodes()
+        .iter()
+        .map(Node::z_index)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut ids = BTreeMap::new();
+    let mut nodes = layout.nodes().to_vec();
+    for node in fragment.nodes() {
+        let id = NodeId::new(next_node);
+        next_node = next_node.saturating_add(1);
+        ids.insert(node.id(), id);
+        nodes.push(Node::with_content_and_z_index(
+            id,
+            node.content().clone(),
+            CanvasPoint::new(
+                node.position().x() + DUPLICATE_OFFSET,
+                node.position().y() + DUPLICATE_OFFSET,
+            )
+            .expect("finite paste offset remains finite"),
+            node.size(),
+            next_z,
+        ));
+        next_z = next_z.saturating_add(1);
+    }
+
+    let mut groups = layout.groups().to_vec();
+    for group in fragment.groups() {
+        let members = group
+            .members()
+            .map(|member| ids.get(&member).copied())
+            .collect::<Option<Vec<_>>>();
+        if let Some(members) = members {
+            groups.push(NodeGroup::new(NodeGroupId::new(next_group), members));
+            next_group = next_group.saturating_add(1);
+        }
+    }
+
+    let mut connections = layout.connections().to_vec();
+    for connection in fragment.connections() {
+        if let (Some(source), Some(target)) =
+            (ids.get(&connection.source()), ids.get(&connection.target()))
+        {
+            connections.push(Connection::new(
+                ConnectionId::new(next_connection),
+                *source,
+                *target,
+                connection.kind(),
+            ));
+            next_connection = next_connection.saturating_add(1);
+        }
+    }
+
+    (
+        CanvasLayout::new(nodes, groups, connections),
+        ids.values().copied().collect(),
+    )
 }
 
 pub(crate) fn remove(layout: &CanvasLayout, selection: &[NodeId]) -> CanvasLayout {
@@ -328,7 +429,7 @@ pub(crate) fn connect(
     {
         return Err("these nodes are already connected in that direction");
     }
-    let kind = ConnectionKind::between(source.target(), target.target())
+    let kind = ConnectionKind::between_content(source.content(), target.content())
         .ok_or("the selected node types cannot be connected in that direction")?;
     let mut connections = layout.connections().to_vec();
     connections.push(Connection::new(
@@ -432,9 +533,9 @@ pub(crate) fn change_z_order(
         .map(|(index, node)| (node.id(), i32::try_from(index).unwrap_or(i32::MAX)))
         .collect::<BTreeMap<_, _>>();
     map_nodes(layout, |node| {
-        Node::with_z_index(
+        Node::with_content_and_z_index(
             node.id(),
-            node.target(),
+            node.content().clone(),
             node.position(),
             node.size(),
             z_indexes[&node.id()],
@@ -451,7 +552,13 @@ fn map_nodes(layout: &CanvasLayout, map: impl Fn(&Node) -> Node) -> CanvasLayout
 }
 
 fn with_geometry(node: &Node, position: CanvasPoint, size: CanvasSize) -> Node {
-    Node::with_z_index(node.id(), node.target(), position, size, node.z_index())
+    Node::with_content_and_z_index(
+        node.id(),
+        node.content().clone(),
+        position,
+        size,
+        node.z_index(),
+    )
 }
 
 fn group_members(layout: &CanvasLayout, node_id: NodeId) -> Vec<NodeId> {
@@ -612,6 +719,46 @@ mod tests {
         history.complete_redo(before);
         assert!(history.can_undo());
         assert!(!history.can_redo());
+    }
+
+    #[test]
+    fn portable_fragments_remap_owned_nodes_and_internal_connections() {
+        use openpodium::domain::{CanvasNodeContent, CanvasText};
+
+        let first = Node::with_content(
+            NodeId::new(10),
+            CanvasNodeContent::Text {
+                markdown: CanvasText::new("First").unwrap(),
+            },
+            CanvasPoint::new(0.0, 0.0).unwrap(),
+            CanvasSize::new(240.0, 160.0).unwrap(),
+        );
+        let second = Node::with_content(
+            NodeId::new(11),
+            CanvasNodeContent::Text {
+                markdown: CanvasText::new("Second").unwrap(),
+            },
+            CanvasPoint::new(300.0, 0.0).unwrap(),
+            CanvasSize::new(240.0, 160.0).unwrap(),
+        );
+        let source = CanvasLayout::new(
+            vec![first, second],
+            vec![],
+            vec![Connection::new(
+                ConnectionId::new(4),
+                NodeId::new(10),
+                NodeId::new(11),
+                ConnectionKind::Reference,
+            )],
+        );
+        let fragment = selection_fragment(&source, &[NodeId::new(10), NodeId::new(11)]);
+        let (pasted, selection) = paste_fragment(&CanvasLayout::default(), &fragment, &source);
+
+        assert_eq!(selection, vec![NodeId::new(12), NodeId::new(13)]);
+        assert_eq!(pasted.nodes()[0].content(), source.nodes()[0].content());
+        assert_eq!(pasted.connections()[0].source(), NodeId::new(12));
+        assert_eq!(pasted.connections()[0].target(), NodeId::new(13));
+        assert_eq!(pasted.connections()[0].kind(), ConnectionKind::Reference);
     }
 
     #[test]

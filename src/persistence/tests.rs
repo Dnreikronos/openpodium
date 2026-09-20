@@ -5,14 +5,16 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use crate::domain::{
-    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize,
-    ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft, ChatMessage, ChatMessageId,
-    ChatThread, ChatThreadId, CommandPreset, CommandPresetId, Connection as DomainConnection,
-    ConnectionId, ConnectionKind, Content, DeliveryMechanism, DomainCommand, DomainEvent,
-    EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId,
-    HandoffMessageId, HandoffPayload, HandoffProgress, HandoffResponse, HandoffResponseStatus,
-    Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleColor, RoleIcon, RoleId,
-    SshEnvironment, Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceId,
+    Agent, AgentId, AgentProgram, AgentState, Arrow, CanvasColor, CanvasLayout, CanvasNodeContent,
+    CanvasPoint, CanvasSize, CanvasText, ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft,
+    ChatMessage, ChatMessageId, ChatThread, ChatThreadId, CommandPreset, CommandPresetId,
+    Connection as DomainConnection, ConnectionId, ConnectionKind, Content, DeliveryMechanism,
+    DiffComparison, DomainCommand, DomainEvent, EnvironmentKind, EnvironmentProfile,
+    EnvironmentProfileId, Freehand, Handoff, HandoffId, HandoffMessageId, HandoffPayload,
+    HandoffProgress, HandoffResponse, HandoffResponseStatus, Name, Node, NodeGroup, NodeGroupId,
+    NodeId, NodeTarget, NormalizedPoint, ProjectPath, Role, RoleColor, RoleIcon, RoleId, Shape,
+    ShapeKind, SshEnvironment, StrokeWidth, Task, TaskId, TaskState, ThreadColor, Timestamp,
+    Workspace, WorkspaceId,
 };
 
 use super::codec::{EVENT_FORMAT_VERSION, decode_event, decode_workspace};
@@ -422,6 +424,93 @@ fn canvas_graph_and_agent_program_survive_restart() {
         recovered.agent(AgentId::new(1)).unwrap().program(),
         AgentProgram::Codex
     );
+}
+
+#[test]
+fn context_and_drawing_nodes_survive_restart() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    let expected = {
+        let mut journal = Journal::open(&path).unwrap();
+        let mut workspace = test_workspace();
+        let point = |x, y| NormalizedPoint::new(x, y).unwrap();
+        let stroke = StrokeWidth::new(2.0).unwrap();
+        let blue = CanvasColor::rgba(59, 130, 246, 255);
+        let contents = vec![
+            CanvasNodeContent::Note {
+                path: ProjectPath::new(".openpodium/notes/1.md").unwrap(),
+                title: name("Context"),
+            },
+            CanvasNodeContent::FileTree {
+                root: ProjectPath::new(".").unwrap(),
+            },
+            CanvasNodeContent::Artifact {
+                path: ProjectPath::new("README.md").unwrap(),
+            },
+            CanvasNodeContent::Diff {
+                path: ProjectPath::new("src/lib.rs").unwrap(),
+                comparison: DiffComparison::WorkingTreeAgainstHead,
+            },
+            CanvasNodeContent::Text {
+                markdown: CanvasText::new("Decision").unwrap(),
+            },
+            CanvasNodeContent::Shape(Shape::new(
+                ShapeKind::Ellipse,
+                CanvasColor::rgba(59, 130, 246, 48),
+                blue,
+                stroke,
+            )),
+            CanvasNodeContent::Arrow(Arrow::new(
+                point(0.1, 0.5),
+                point(0.9, 0.5),
+                blue,
+                stroke,
+                Some(name("leads to")),
+            )),
+            CanvasNodeContent::Freehand(
+                Freehand::new(vec![point(0.1, 0.2), point(0.9, 0.8)], blue, stroke).unwrap(),
+            ),
+        ];
+        let nodes = contents
+            .into_iter()
+            .enumerate()
+            .map(|(index, content)| {
+                Node::with_content(
+                    NodeId::new(index as u64 + 1),
+                    content,
+                    CanvasPoint::new(index as f32 * 40.0, 0.0).unwrap(),
+                    CanvasSize::new(320.0, 240.0).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let after = CanvasLayout::new(
+            nodes,
+            vec![],
+            vec![DomainConnection::new(
+                ConnectionId::new(1),
+                NodeId::new(1),
+                NodeId::new(2),
+                ConnectionKind::Reference,
+            )],
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::ReplaceCanvas {
+                before: CanvasLayout::default(),
+                after,
+            },
+            1,
+        );
+        workspace
+    };
+
+    let recovered = Journal::open(&path)
+        .unwrap()
+        .recover(WorkspaceId::new(7))
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered, expected);
 }
 
 #[test]

@@ -1,3 +1,4 @@
+mod context_nodes;
 mod floors;
 
 use std::collections::BTreeMap;
@@ -8,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, row, scrollable, text, text_editor, text_input};
 use iced::{Element, Fill, Task, Theme, clipboard};
 use openpodium::domain::{
     Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, ChatAttachmentId,
@@ -23,7 +24,9 @@ use openpodium::ipc::{
     IpcService, SUPPORTED_VERSIONS, TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
 };
 use openpodium::orchestration::{DeliveryRequest, Orchestrator};
-use openpodium::persistence::{export_role, import_role};
+use openpodium::persistence::{
+    export_canvas_fragment, export_role, import_canvas_fragment, import_role,
+};
 use openpodium::runtime::{
     EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, ProcessSpec,
     RuntimeError, check_agent_capability, check_environment, prepare_environment_process,
@@ -62,6 +65,7 @@ enum EnvironmentDraftKind {
 
 struct OpenPodium {
     floor_ui: floors::UiState,
+    context_ui: context_nodes::UiState,
     camera: Camera,
     canvas_selection: Vec<NodeId>,
     canvas_preview: Option<CanvasLayout>,
@@ -102,6 +106,7 @@ struct OpenPodium {
     role_color: String,
     role_icon: String,
     role_instructions: String,
+    context_path: String,
     notice: Option<String>,
 }
 
@@ -150,6 +155,7 @@ impl Default for OpenPodium {
             };
         let mut state = Self {
             floor_ui: floors::UiState::default(),
+            context_ui: context_nodes::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
@@ -190,6 +196,7 @@ impl Default for OpenPodium {
             role_color: RoleColor::DEFAULT.to_owned(),
             role_icon: RoleIcon::DEFAULT.to_owned(),
             role_instructions: String::new(),
+            context_path: String::new(),
             notice,
         };
         state.load_active_settings();
@@ -209,6 +216,13 @@ enum Message {
     AddAgent(AgentProgram),
     PreviewAgent(AgentProgram),
     CanvasAction(CanvasAction),
+    ContextPathChanged(String),
+    AddContextNode(context_nodes::Kind),
+    ContextScanCompleted(Result<context_nodes::ScanResult, String>),
+    EditNote(text_editor::Action),
+    SaveNote(bool),
+    ReloadNote,
+    SaveCanvasText,
     CreateDirectoryChanged(String),
     CreateWorkspace,
     SwitchWorkspace(WorkspaceId),
@@ -251,6 +265,7 @@ enum Message {
     ExportRole(RoleId),
     ImportRole,
     RoleImportRead(Option<String>),
+    CanvasFragmentRead(Option<String>),
     StartTerminal(NodeId),
     StopTerminal(NodeId),
     TerminalStarted {
@@ -301,9 +316,10 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::Floor(message) => return floors::update(state, message),
         Message::OrchestrationTick => {
             run_orchestration_tick(state);
+            let contexts = context_nodes::tick(state);
             let timelines = refresh_timelines(state);
             let floors = floors::tick(state);
-            return Task::batch([timelines, floors]);
+            return Task::batch([timelines, floors, contexts]);
         }
         Message::Canvas(message) => return handle_canvas_message(state, message),
         Message::Chat(message) => return handle_chat_message(state, message),
@@ -313,6 +329,13 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::AddAgent(program) => return add_agent(state, program),
         Message::PreviewAgent(program) => preview_agent(state, program),
         Message::CanvasAction(action) => apply_canvas_action(state, action),
+        Message::ContextPathChanged(value) => state.context_path = value,
+        Message::AddContextNode(kind) => return context_nodes::add(state, kind),
+        Message::ContextScanCompleted(result) => context_nodes::scan_completed(state, result),
+        Message::EditNote(action) => context_nodes::edit_note(state, action),
+        Message::SaveNote(overwrite) => context_nodes::save_note(state, overwrite),
+        Message::ReloadNote => context_nodes::reload_note(state),
+        Message::SaveCanvasText => context_nodes::save_canvas_text(state),
         Message::CreateDirectoryChanged(value) => state.create_directory = value,
         Message::NameChanged(value) => state.name = value,
         Message::IconChanged(value) => state.icon = value,
@@ -435,6 +458,9 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::ExportRole(role_id) => return export_role_to_clipboard(state, role_id),
         Message::ImportRole => return clipboard::read().map(Message::RoleImportRead),
         Message::RoleImportRead(payload) => import_role_from_clipboard(state, payload.as_deref()),
+        Message::CanvasFragmentRead(payload) => {
+            paste_canvas_fragment(state, payload.as_deref());
+        }
         Message::StartTerminal(node_id) => return start_terminal(state, node_id),
         Message::StopTerminal(node_id) => stop_terminal(state, node_id),
         Message::TerminalStarted {
@@ -564,6 +590,8 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             button("Redo").on_press(Message::CanvasAction(CanvasAction::Redo)),
             button("Duplicate").on_press(Message::CanvasAction(CanvasAction::Duplicate)),
             button("Delete").on_press(Message::CanvasAction(CanvasAction::Remove)),
+            button("Copy / export").on_press(Message::Canvas(canvas::Message::CopyRequested)),
+            button("Paste / import").on_press(Message::Canvas(canvas::Message::PasteRequested)),
         ]
         .spacing(8),
         row![
@@ -591,6 +619,24 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             button("To front")
                 .on_press(Message::CanvasAction(CanvasAction::ZOrder(ZOrder::Front,))),
             button("To back").on_press(Message::CanvasAction(CanvasAction::ZOrder(ZOrder::Back,))),
+        ]
+        .spacing(8),
+        text("Context and drawing nodes").size(18),
+        row![
+            button("Note").on_press(Message::AddContextNode(context_nodes::Kind::Note)),
+            button("Files").on_press(Message::AddContextNode(context_nodes::Kind::FileTree)),
+            button("Text").on_press(Message::AddContextNode(context_nodes::Kind::Text)),
+            button("Rectangle").on_press(Message::AddContextNode(context_nodes::Kind::Rectangle)),
+            button("Ellipse").on_press(Message::AddContextNode(context_nodes::Kind::Ellipse)),
+            button("Arrow").on_press(Message::AddContextNode(context_nodes::Kind::Arrow)),
+            button("Freehand").on_press(Message::AddContextNode(context_nodes::Kind::Freehand)),
+        ]
+        .spacing(8),
+        row![
+            text_input("Project-relative file path", &state.context_path)
+                .on_input(Message::ContextPathChanged),
+            button("Artifact").on_press(Message::AddContextNode(context_nodes::Kind::Artifact)),
+            button("Diff").on_press(Message::AddContextNode(context_nodes::Kind::Diff)),
         ]
         .spacing(8),
         text(format!(
@@ -836,6 +882,9 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .spacing(12)
         .max_width(720);
     }
+    if let Some(panel) = context_nodes::note_panel(&state.context_ui) {
+        settings = settings.push(panel);
+    }
     if let Some(notice) = &state.notice {
         settings = settings.push(text(notice));
     }
@@ -881,7 +930,8 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .unwrap_or_else(|| workspace.canvas_layout());
         let terminal_views = terminal_views(state, &layout);
         let document = canvas::CanvasDocument::new(workspace, layout, terminal_views)
-            .with_git_severity(floors::node_severities(state));
+            .with_git_severity(floors::node_severities(state))
+            .with_context_bodies(context_nodes::bodies(&state.context_ui));
         row![
             canvas::view(
                 state.camera,
@@ -1278,7 +1328,7 @@ fn delivery_target(
         .all_canvas_layout()
         .nodes()
         .iter()
-        .find(|node| node.target() == NodeTarget::Agent(request.recipient_agent_id()))
+        .find(|node| node.reference() == Some(NodeTarget::Agent(request.recipient_agent_id())))
         .map(Node::id)
         .ok_or_else(|| {
             format!(
@@ -1301,6 +1351,7 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
         canvas::Message::SelectionChanged(selection) => {
             state.canvas_selection = selection;
             state.focused_terminal = None;
+            context_nodes::selection_changed(state);
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
         }
         canvas::Message::PreviewLayout(layout) => {
@@ -1319,6 +1370,10 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
         canvas::Message::DeleteRequested => apply_canvas_action(state, CanvasAction::Remove),
         canvas::Message::DuplicateRequested => {
             apply_canvas_action(state, CanvasAction::Duplicate);
+        }
+        canvas::Message::CopyRequested => return copy_canvas_fragment(state),
+        canvas::Message::PasteRequested => {
+            return clipboard::read().map(Message::CanvasFragmentRead);
         }
         canvas::Message::TerminalFocused(node_id) => {
             state.focused_terminal = node_id;
@@ -2418,41 +2473,53 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
             Some("Wait for the Git operation to finish before starting a terminal".to_owned());
         return Task::none();
     }
-    let Some((workspace_id, agent_id, program, preset, role, profile, working_directory, size)) =
-        state
-            .workspaces
-            .as_ref()
-            .and_then(WorkspaceManager::active_workspace)
-            .and_then(|workspace| {
-                let node = workspace.node(node_id)?;
-                let NodeTarget::Agent(agent_id) = node.target() else {
-                    return None;
-                };
-                let agent = workspace.agent(agent_id)?;
-                let working_directory = workspace.node_directory(node_id)?.as_str();
-                let profile = agent
-                    .environment_id()
-                    .and_then(|environment_id| workspace.environment_profile(environment_id))
-                    .cloned();
-                let preset = match agent.program() {
-                    AgentProgram::Custom(preset_id) => workspace.command_preset(preset_id).cloned(),
-                    _ => None,
-                };
-                let role = agent
-                    .role_id()
-                    .and_then(|role_id| workspace.role(role_id))
-                    .cloned();
-                Some((
-                    workspace.id(),
-                    agent.id(),
-                    agent.program(),
-                    preset,
-                    role,
-                    profile,
-                    PathBuf::from(working_directory),
-                    terminal::GridSize::for_node(node.size().width(), node.size().height()),
-                ))
-            })
+    let Some((
+        workspace_id,
+        agent_id,
+        program,
+        preset,
+        role,
+        profile,
+        working_directory,
+        connected_notes,
+        size,
+    )) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .and_then(|workspace| {
+            let node = workspace.node(node_id)?;
+            let Some(NodeTarget::Agent(agent_id)) = node.reference() else {
+                return None;
+            };
+            let agent = workspace.agent(agent_id)?;
+            let working_directory = PathBuf::from(workspace.node_directory(node_id)?.as_str());
+            let connected_notes =
+                context_nodes::connected_note_paths(workspace, node_id, &working_directory);
+            let profile = agent
+                .environment_id()
+                .and_then(|environment_id| workspace.environment_profile(environment_id))
+                .cloned();
+            let preset = match agent.program() {
+                AgentProgram::Custom(preset_id) => workspace.command_preset(preset_id).cloned(),
+                _ => None,
+            };
+            let role = agent
+                .role_id()
+                .and_then(|role_id| workspace.role(role_id))
+                .cloned();
+            Some((
+                workspace.id(),
+                agent.id(),
+                agent.program(),
+                preset,
+                role,
+                profile,
+                working_directory,
+                connected_notes,
+                terminal::GridSize::for_node(node.size().width(), node.size().height()),
+            ))
+        })
     else {
         state.notice = Some("The selected agent has no workspace working directory".to_owned());
         return Task::none();
@@ -2498,6 +2565,18 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
             agent_id,
             profile.is_none() && supports_automatic_delivery(program),
         );
+        let spec = if profile.is_none() && !connected_notes.is_empty() {
+            let paths = connected_notes
+                .iter()
+                .map(|path| path.to_string_lossy())
+                .collect::<Vec<_>>();
+            spec.env(
+                openpodium::context::CONNECTED_NOTES_ENV,
+                serde_json::to_string(&paths).expect("note paths are JSON serializable"),
+            )
+        } else {
+            spec
+        };
         prepare_environment_process(profile.as_ref(), spec).map_err(|error| error.to_string())
     }) {
         Ok(spec) => spec,
@@ -2699,6 +2778,62 @@ fn stop_terminal(state: &mut OpenPodium, node_id: NodeId) {
     state.canvas_revision = state.canvas_revision.wrapping_add(1);
 }
 
+fn copy_canvas_fragment(state: &mut OpenPodium) -> Task<Message> {
+    let Some(layout) = current_canvas(state) else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return Task::none();
+    };
+    let fragment = canvas::editor::selection_fragment(&layout, &state.canvas_selection);
+    if fragment.nodes().is_empty() {
+        state.notice = Some("Select at least one canvas node to copy".to_owned());
+        return Task::none();
+    }
+    match export_canvas_fragment(&fragment) {
+        Ok(payload) => {
+            state.notice = Some("Canvas fragment copied and exported".to_owned());
+            clipboard::write(payload)
+        }
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            Task::none()
+        }
+    }
+}
+
+fn paste_canvas_fragment(state: &mut OpenPodium, payload: Option<&str>) {
+    let Some(payload) = payload else {
+        state.notice = Some("The clipboard does not contain text".to_owned());
+        return;
+    };
+    let fragment = match import_canvas_fragment(payload) {
+        Ok(fragment) => fragment,
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            return;
+        }
+    };
+    let Some(before) = current_canvas(state) else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+    let all = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .map(Workspace::all_canvas_layout)
+        .unwrap_or_else(|| before.clone());
+    let (after, selection) = canvas::editor::paste_fragment(&before, &fragment, &all);
+    if before == after {
+        state.notice = Some("The canvas fragment contains no nodes".to_owned());
+        return;
+    }
+    if persist_canvas(state, before.clone(), after).is_ok() {
+        state.canvas_history.record(before);
+        state.canvas_selection = selection;
+        state.notice = Some("Canvas fragment pasted and imported".to_owned());
+    }
+}
+
 fn apply_canvas_action(state: &mut OpenPodium, action: CanvasAction) {
     if matches!(action, CanvasAction::Undo) {
         undo_canvas(state);
@@ -2860,7 +2995,7 @@ fn terminal_views(state: &OpenPodium, layout: &CanvasLayout) -> BTreeMap<NodeId,
         .nodes()
         .iter()
         .filter_map(|node| {
-            matches!(node.target(), NodeTarget::Agent(_)).then(|| {
+            matches!(node.reference(), Some(NodeTarget::Agent(_))).then(|| {
                 let size = terminal::GridSize::for_node(node.size().width(), node.size().height());
                 let view = state
                     .terminals
@@ -2880,14 +3015,14 @@ fn selected_terminal_node(state: &OpenPodium) -> Option<NodeId> {
     state.canvas_selection.iter().copied().find(|node_id| {
         workspace
             .node(*node_id)
-            .is_some_and(|node| matches!(node.target(), NodeTarget::Agent(_)))
+            .is_some_and(|node| matches!(node.reference(), Some(NodeTarget::Agent(_))))
     })
 }
 
 fn selected_agent(state: &OpenPodium) -> Option<(WorkspaceId, AgentId)> {
     let workspace = state.workspaces.as_ref()?.active_workspace()?;
     let node = workspace.node(selected_terminal_node(state)?)?;
-    let NodeTarget::Agent(agent_id) = node.target() else {
+    let Some(NodeTarget::Agent(agent_id)) = node.reference() else {
         return None;
     };
     Some((workspace.id(), agent_id))
@@ -3294,6 +3429,7 @@ mod tests {
             .unwrap();
         let mut state = OpenPodium {
             floor_ui: floors::UiState::default(),
+            context_ui: context_nodes::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
@@ -3334,6 +3470,7 @@ mod tests {
             role_color: RoleColor::DEFAULT.to_owned(),
             role_icon: RoleIcon::DEFAULT.to_owned(),
             role_instructions: String::new(),
+            context_path: String::new(),
             notice: None,
         };
 
@@ -3710,6 +3847,7 @@ mod tests {
     ) -> OpenPodium {
         OpenPodium {
             floor_ui: floors::UiState::default(),
+            context_ui: context_nodes::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
@@ -3750,6 +3888,7 @@ mod tests {
             role_color: RoleColor::DEFAULT.to_owned(),
             role_icon: RoleIcon::DEFAULT.to_owned(),
             role_instructions: String::new(),
+            context_path: String::new(),
             notice: None,
         }
     }

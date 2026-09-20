@@ -2,8 +2,11 @@ use std::collections::BTreeSet;
 
 use iced::theme::palette;
 use iced::widget::canvas::{self, Path, Stroke};
-use iced::{Color, Font, Pixels, Point, Size, Theme, font};
-use openpodium::domain::{AgentProgram, ConnectionKind, Node, NodeGroup, NodeId};
+use iced::{Color, Font, Pixels, Point, Radians, Size, Theme, Vector, font};
+use openpodium::domain::{
+    AgentProgram, CanvasColor, CanvasNodeContent, ConnectionKind, Node, NodeGroup, NodeId,
+    ShapeKind,
+};
 
 use crate::terminal::{self, BODY_PADDING, CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT};
 
@@ -269,6 +272,23 @@ fn draw_nodes(
                     (terminal_overlay.focused == Some(node.id()))
                         .then_some(terminal_overlay.preedit),
                 );
+            } else {
+                let body_padding = (12.0 * zoom).clamp(7.0, 16.0);
+                draw_content(
+                    frame,
+                    Point::new(
+                        top_left.x + body_padding,
+                        top_left.y + header_height + body_padding,
+                    ),
+                    Size::new(
+                        (size.width - body_padding * 2.0).max(1.0),
+                        (size.height - header_height - body_padding * 2.0).max(1.0),
+                    ),
+                    zoom,
+                    node.content(),
+                    document.body(node.id()),
+                    palette.background.base.text,
+                );
             }
         }
 
@@ -284,6 +304,162 @@ fn draw_nodes(
             );
         }
     }
+}
+
+fn draw_content(
+    frame: &mut canvas::Frame,
+    body_top_left: Point,
+    body_size: Size,
+    zoom: f32,
+    content: &CanvasNodeContent,
+    body: Option<&str>,
+    text_color: Color,
+) {
+    match content {
+        CanvasNodeContent::Reference(_) => {}
+        CanvasNodeContent::Note { path, .. } => draw_body_text(
+            frame,
+            body_top_left,
+            body.unwrap_or(path.as_str()),
+            zoom,
+            text_color,
+        ),
+        CanvasNodeContent::FileTree { root } => draw_body_text(
+            frame,
+            body_top_left,
+            body.unwrap_or(root.as_str()),
+            zoom,
+            text_color,
+        ),
+        CanvasNodeContent::Artifact { path } => draw_body_text(
+            frame,
+            body_top_left,
+            body.unwrap_or(path.as_str()),
+            zoom,
+            text_color,
+        ),
+        CanvasNodeContent::Diff { path, .. } => draw_body_text(
+            frame,
+            body_top_left,
+            body.unwrap_or(path.as_str()),
+            zoom,
+            text_color,
+        ),
+        CanvasNodeContent::Text { markdown } => {
+            draw_body_text(frame, body_top_left, markdown.as_str(), zoom, text_color)
+        }
+        CanvasNodeContent::Shape(shape) => {
+            let path = match shape.kind() {
+                ShapeKind::Rectangle => Path::rounded_rectangle(
+                    body_top_left,
+                    body_size,
+                    (8.0 * zoom).clamp(3.0, 12.0).into(),
+                ),
+                ShapeKind::Ellipse => Path::new(|path| {
+                    path.ellipse(canvas::path::arc::Elliptical {
+                        center: Point::new(
+                            body_top_left.x + body_size.width / 2.0,
+                            body_top_left.y + body_size.height / 2.0,
+                        ),
+                        radii: Vector::new(body_size.width / 2.0, body_size.height / 2.0),
+                        rotation: Radians(0.0),
+                        start_angle: Radians(0.0),
+                        end_angle: Radians(std::f32::consts::TAU),
+                    });
+                    path.close();
+                }),
+            };
+            frame.fill(&path, canvas_color(shape.fill()));
+            frame.stroke(
+                &path,
+                Stroke::default()
+                    .with_color(canvas_color(shape.stroke()))
+                    .with_width((shape.stroke_width().get() * zoom).max(1.0)),
+            );
+        }
+        CanvasNodeContent::Arrow(arrow) => {
+            let start = normalized_screen_point(body_top_left, body_size, arrow.start());
+            let end = normalized_screen_point(body_top_left, body_size, arrow.end());
+            let color = canvas_color(arrow.stroke());
+            let width = (arrow.stroke_width().get() * zoom).max(1.0);
+            frame.stroke(
+                &Path::line(start, end),
+                Stroke::default().with_color(color).with_width(width),
+            );
+            let angle = (end.y - start.y).atan2(end.x - start.x);
+            let head = 12.0 * zoom;
+            let left = Point::new(
+                end.x - head * (angle - 0.55).cos(),
+                end.y - head * (angle - 0.55).sin(),
+            );
+            let right = Point::new(
+                end.x - head * (angle + 0.55).cos(),
+                end.y - head * (angle + 0.55).sin(),
+            );
+            let arrowhead = Path::new(|path| {
+                path.move_to(end);
+                path.line_to(left);
+                path.line_to(right);
+                path.close();
+            });
+            frame.fill(&arrowhead, color);
+        }
+        CanvasNodeContent::Freehand(freehand) => {
+            let points = freehand.points();
+            let path = Path::new(|path| {
+                if let Some(first) = points.first() {
+                    path.move_to(normalized_screen_point(body_top_left, body_size, *first));
+                    for point in &points[1..] {
+                        path.line_to(normalized_screen_point(body_top_left, body_size, *point));
+                    }
+                }
+            });
+            frame.stroke(
+                &path,
+                Stroke::default()
+                    .with_color(canvas_color(freehand.stroke()))
+                    .with_width((freehand.stroke_width().get() * zoom).max(1.0)),
+            );
+        }
+    }
+}
+
+fn normalized_screen_point(
+    top_left: Point,
+    size: Size,
+    point: openpodium::domain::NormalizedPoint,
+) -> Point {
+    Point::new(
+        top_left.x + size.width * point.x(),
+        top_left.y + size.height * point.y(),
+    )
+}
+
+fn draw_body_text(
+    frame: &mut canvas::Frame,
+    position: Point,
+    content: &str,
+    zoom: f32,
+    color: Color,
+) {
+    let content = content
+        .lines()
+        .take(12)
+        .map(|line| line.chars().take(80).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    frame.fill_text(canvas::Text {
+        content,
+        position,
+        color,
+        size: Pixels((12.0 * zoom).clamp(8.0, 15.0)),
+        ..canvas::Text::default()
+    });
+}
+
+fn canvas_color(color: CanvasColor) -> Color {
+    let [red, green, blue, alpha] = color.channels();
+    Color::from_rgba8(red, green, blue, f32::from(alpha) / 255.0)
 }
 
 fn draw_terminal(
@@ -463,6 +639,7 @@ fn node_color(kind: NodeKind, palette: &palette::Extended) -> Color {
         } => palette.success.base.color,
         NodeKind::Task => palette.secondary.base.color,
         NodeKind::Handoff => palette.danger.base.color,
+        NodeKind::Context => palette.primary.weak.color,
     }
 }
 
@@ -472,6 +649,7 @@ fn connection_color(kind: ConnectionKind, palette: &palette::Extended) -> Color 
         ConnectionKind::Assignment => palette.success.base.color,
         ConnectionKind::Dependency => palette.warning.base.color,
         ConnectionKind::Handoff => palette.danger.base.color,
+        ConnectionKind::Reference => palette.primary.weak.color,
     }
 }
 
