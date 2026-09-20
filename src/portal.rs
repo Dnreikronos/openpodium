@@ -744,12 +744,25 @@ pub trait PortalBackend {
         PortalCapabilities::browser_defaults()
     }
 
+    fn policy_target(&mut self, config: &PortalConfig) -> Result<String, Self::Error> {
+        Ok(config.target().selector().to_owned())
+    }
+
     fn connect(
         &mut self,
         config: &PortalConfig,
         session: &mut PortalSession,
     ) -> Result<(), Self::Error>;
     fn observe(&mut self, session: &mut PortalSession) -> Result<PortalObservation, Self::Error>;
+    fn capture_frame(
+        &mut self,
+        session: &PortalSession,
+    ) -> Result<Option<PortalFrame>, Self::Error> {
+        Ok(session
+            .latest_observation()
+            .and_then(PortalObservation::frame)
+            .cloned())
+    }
     fn execute(
         &mut self,
         session: &mut PortalSession,
