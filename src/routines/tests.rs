@@ -773,3 +773,966 @@ fn a_second_run_of_the_same_routine_is_refused_while_one_is_active() {
         Err(RoutineSchedulerError::RunAlreadyActive { .. })
     ));
 }
+
+// Trigger adapters.
+
+use crate::domain::{
+    RoutineCadence, RoutineSchedule, RoutineTrigger, RoutineTriggerId, RoutineTriggerKind,
+};
+
+fn install_trigger(
+    manager: &mut WorkspaceManager,
+    workspace_id: WorkspaceId,
+    routine_id: RoutineId,
+    kind: RoutineTriggerKind,
+    enabled: bool,
+) -> RoutineTriggerId {
+    let trigger = RoutineTrigger::new(
+        RoutineTriggerId::new(1),
+        routine_id,
+        name("Trigger"),
+        kind,
+        enabled,
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let trigger_id = trigger.id();
+    manager
+        .execute(
+            workspace_id,
+            DomainCommand::PutRoutineTrigger {
+                routine_id,
+                trigger,
+            },
+            timestamp(12),
+        )
+        .unwrap();
+    trigger_id
+}
+
+fn simple_routine(manager: &mut WorkspaceManager, workspace_id: WorkspaceId) -> RoutineId {
+    install(
+        manager,
+        workspace_id,
+        version(
+            vec![step(1, 1, "Investigate", vec![], vec![], vec![])],
+            Vec::new(),
+        ),
+    )
+}
+
+#[test]
+fn a_filesystem_trigger_debounces_and_deduplicates_what_it_observed() {
+    let (temp, mut manager, workspace_id) = manager();
+    let routine_id = simple_routine(&mut manager, workspace_id);
+    install_trigger(
+        &mut manager,
+        workspace_id,
+        routine_id,
+        RoutineTriggerKind::Filesystem {
+            patterns: vec!["**/*.rs".to_owned()],
+            debounce_ms: 100,
+        },
+        true,
+    );
+    let project = temp.path().join("project");
+    let mut watcher = TriggerWatcher::new(timestamp(1_000));
+
+    // The first observation is a baseline, not a change.
+    assert!(watcher.poll(&manager, timestamp(1_000)).events.is_empty());
+
+    fs::write(project.join("main.rs"), "fn main() {}").unwrap();
+    assert!(
+        watcher.poll(&manager, timestamp(1_010)).events.is_empty(),
+        "a change inside the debounce window does not fire yet"
+    );
+    let poll = watcher.poll(&manager, timestamp(1_200));
+    assert_eq!(poll.events.len(), 1);
+    let occurrence = poll.events[0].firing.occurrence.clone();
+
+    // Re-observing the same tree must not produce a second occurrence.
+    watcher.mark_consumed(&poll.events[0]);
+    assert!(watcher.poll(&manager, timestamp(1_300)).events.is_empty());
+
+    fs::write(project.join("notes.txt"), "ignored").unwrap();
+    assert!(
+        watcher.poll(&manager, timestamp(1_500)).events.is_empty(),
+        "paths outside the trigger's patterns are filtered out"
+    );
+
+    fs::write(project.join("main.rs"), "fn main() { todo!() }").unwrap();
+    assert!(watcher.poll(&manager, timestamp(2_000)).events.is_empty());
+    let poll = watcher.poll(&manager, timestamp(2_200));
+    assert_eq!(poll.events.len(), 1);
+    assert_ne!(
+        poll.events[0].firing.occurrence, occurrence,
+        "a new observed state is a new occurrence"
+    );
+}
+
+#[test]
+fn a_disabled_trigger_is_not_observed_and_cannot_start_a_run() {
+    let (_temp, mut manager, workspace_id) = manager();
+    let routine_id = simple_routine(&mut manager, workspace_id);
+    let trigger_id = install_trigger(
+        &mut manager,
+        workspace_id,
+        routine_id,
+        RoutineTriggerKind::Schedule(
+            RoutineSchedule::new(
+                RoutineCadence::Hourly { minute: 0 },
+                0,
+                None,
+                Some(timestamp(1_000)),
+            )
+            .unwrap(),
+        ),
+        false,
+    );
+    let mut watcher = TriggerWatcher::new(timestamp(500));
+    assert!(watcher.poll(&manager, timestamp(5_000)).events.is_empty());
+
+    let mut scheduler = RoutineScheduler::default();
+    let refused = scheduler.start_run(
+        &mut manager,
+        workspace_id,
+        routine_id,
+        RunRequest {
+            trigger: Some(TriggerFiring {
+                trigger_id,
+                occurrence: crate::domain::RoutineOccurrenceKey::new("sched-1-1000").unwrap(),
+                next_occurrence: None,
+            }),
+            ..RunRequest::default()
+        },
+        timestamp(5_000),
+    );
+    assert!(matches!(
+        refused,
+        Err(RoutineSchedulerError::TriggerDisabled(_))
+    ));
+}
+
+#[test]
+fn schedule_occurrences_missed_while_closed_are_skipped_and_counted() {
+    let (_temp, mut manager, workspace_id) = manager();
+    let routine_id = simple_routine(&mut manager, workspace_id);
+    let hour = 3_600_000_u64;
+    let trigger_id = install_trigger(
+        &mut manager,
+        workspace_id,
+        routine_id,
+        RoutineTriggerKind::Schedule(
+            RoutineSchedule::new(
+                RoutineCadence::Hourly { minute: 0 },
+                0,
+                None,
+                Some(timestamp(hour)),
+            )
+            .unwrap(),
+        ),
+        true,
+    );
+
+    // The session starts three hours after the stored occurrence, so those
+    // three passed while OpenPodium was closed.
+    let session_start = timestamp(hour * 4);
+    let mut watcher = TriggerWatcher::new(session_start);
+    let poll = watcher.poll(&manager, timestamp(hour * 4 + 60_000));
+
+    assert_eq!(poll.missed.len(), 1);
+    assert_eq!(poll.missed[0].trigger_id, trigger_id);
+    assert_eq!(poll.missed[0].skipped, 3);
+    assert_eq!(
+        poll.events.len(),
+        1,
+        "the occurrence due this session fires"
+    );
+    assert_eq!(
+        poll.events[0].firing.occurrence.as_str(),
+        format!("sched-{}-{}", trigger_id.get(), hour * 4)
+    );
+}
+
+#[test]
+fn a_duplicate_trigger_occurrence_cannot_start_a_second_run() {
+    let (_temp, mut manager, workspace_id) = manager();
+    let routine_id = simple_routine(&mut manager, workspace_id);
+    let trigger_id = install_trigger(
+        &mut manager,
+        workspace_id,
+        routine_id,
+        RoutineTriggerKind::Manual,
+        true,
+    );
+    let occurrence = crate::domain::RoutineOccurrenceKey::new("manual-1").unwrap();
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let firing = TriggerFiring {
+        trigger_id,
+        occurrence: occurrence.clone(),
+        next_occurrence: None,
+    };
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest {
+                trigger: Some(firing.clone()),
+                ..RunRequest::default()
+            },
+            timestamp(20),
+        )
+        .unwrap();
+
+    // Finish the run so the "one active run" rule is not what refuses the
+    // duplicate; the consumed occurrence must be what stops it.
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+    respond(
+        &mut manager,
+        workspace_id,
+        run_id,
+        RoutineStepId::new(1),
+        HandoffResponseStatus::Completed,
+        &[],
+        30,
+    );
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(40))
+        .unwrap();
+    assert_eq!(
+        manager
+            .workspace(workspace_id)
+            .unwrap()
+            .routine_run(run_id)
+            .unwrap()
+            .state(),
+        RoutineRunState::Completed
+    );
+
+    let duplicate = scheduler.start_run(
+        &mut manager,
+        workspace_id,
+        routine_id,
+        RunRequest {
+            trigger: Some(firing),
+            ..RunRequest::default()
+        },
+        timestamp(50),
+    );
+    assert!(matches!(
+        duplicate,
+        Err(RoutineSchedulerError::OccurrenceAlreadyConsumed(_))
+    ));
+}
+
+#[test]
+fn a_routine_template_gives_each_run_its_own_agents() {
+    let (_temp, mut manager, workspace_id) = manager();
+
+    // Put the authoring agent on the canvas so it can be exported, then save a
+    // template of that arrangement.
+    manager
+        .execute(
+            workspace_id,
+            DomainCommand::AddNode(crate::domain::Node::new(
+                crate::domain::NodeId::new(1),
+                crate::domain::NodeTarget::Agent(AgentId::new(1)),
+                crate::domain::CanvasPoint::new(0.0, 0.0).unwrap(),
+                crate::domain::CanvasSize::new(320.0, 200.0).unwrap(),
+            )),
+            timestamp(5),
+        )
+        .unwrap();
+    let template = manager
+        .export_template(workspace_id, &[crate::domain::NodeId::new(1)])
+        .unwrap();
+
+    let step = RoutineStep::new(
+        RoutineStepId::new(1),
+        name("Investigate"),
+        AgentId::new(1),
+        content("Investigate"),
+        [],
+        [],
+        [],
+        RoutineApproval::NotRequired,
+        RoutineRetryPolicy::default(),
+        RoutineStepClaims::default(),
+    )
+    .unwrap();
+    let version = RoutineVersion::new(
+        RoutineVersionId::new(1),
+        RoutineId::new(1),
+        1,
+        Vec::new(),
+        vec![step],
+        Some(Content::new(template).unwrap()),
+        timestamp(10),
+    )
+    .unwrap();
+    let routine_id = install(&mut manager, workspace_id, version);
+
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+
+    let run = manager
+        .workspace(workspace_id)
+        .unwrap()
+        .routine_run(run_id)
+        .unwrap();
+    let bound = run.pin().agent(RoutineStepId::new(1)).unwrap();
+    assert_ne!(
+        bound,
+        AgentId::new(1),
+        "the run binds the agent its template instantiation created"
+    );
+    assert!(
+        manager
+            .workspace(workspace_id)
+            .unwrap()
+            .agent(bound)
+            .is_some(),
+        "the instantiated agent exists in the workspace"
+    );
+
+    // The run dispatches to the agent it bound, not to the authoring one.
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+    let workspace = manager.workspace(workspace_id).unwrap();
+    let attempt = workspace
+        .routine_run(run_id)
+        .unwrap()
+        .step(RoutineStepId::new(1))
+        .unwrap()
+        .attempts()
+        .last()
+        .unwrap();
+    assert_eq!(attempt.agent_id(), bound);
+    assert_eq!(
+        workspace.task(attempt.task_id()).unwrap().assignee(),
+        Some(bound)
+    );
+}
+
+/// Drives the real orchestrator path an agent's completion takes: delivery of
+/// the prompt, then an authenticated response routed to the scheduler.
+fn complete_through_orchestrator(
+    manager: &mut WorkspaceManager,
+    orchestrator: &mut Orchestrator,
+    workspace_id: WorkspaceId,
+    run_id: RoutineRunId,
+    step_id: RoutineStepId,
+    outputs: &[(&str, &str)],
+    at: u64,
+) {
+    let request = orchestrator
+        .prepare_next(manager, timestamp(at))
+        .unwrap()
+        .expect("a dispatched routine step has a pending delivery");
+    orchestrator
+        .finish_delivery(manager, &request, Ok(()), timestamp(at))
+        .unwrap();
+
+    let workspace = manager.workspace(workspace_id).unwrap();
+    let attempt = workspace
+        .routine_run(run_id)
+        .unwrap()
+        .step(step_id)
+        .unwrap()
+        .attempts()
+        .last()
+        .unwrap();
+    let handoff = workspace.handoff(attempt.handoff_id()).unwrap();
+    let message_id = handoff.message_id().unwrap().as_str().to_owned();
+    let agent_id = handoff.recipient().get();
+
+    let accepted = crate::ipc::AcceptedMessage {
+        workspace_id: workspace_id.get(),
+        sender_agent_id: agent_id,
+        recipient: crate::ipc::MessagePeer::Routine,
+        command: crate::ipc::ProtocolCommand::RespondToHandoff {
+            message_id: crate::ipc::MessageId::new(format!("{message_id}-reply")).unwrap(),
+            handoff_message_id: crate::ipc::MessageId::new(message_id).unwrap(),
+            status: crate::ipc::ResponseStatus::Completed,
+            body: "Done".to_owned(),
+            outputs: outputs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+        },
+    };
+    orchestrator
+        .accept(manager, &accepted, timestamp(at + 1))
+        .unwrap();
+}
+
+#[test]
+fn a_routine_step_completes_through_the_authenticated_response_path() {
+    let (_temp, mut manager, workspace_id) = manager();
+    let routine_id = install(
+        &mut manager,
+        workspace_id,
+        version(
+            vec![
+                step(1, 1, "Investigate", vec![], vec![], vec!["finding"]),
+                step(
+                    2,
+                    2,
+                    "Fix {{report}}",
+                    vec![1],
+                    vec![(
+                        "report",
+                        RoutineBindingSource::StepOutput {
+                            step_id: RoutineStepId::new(1),
+                            key: output_key("finding"),
+                        },
+                    )],
+                    vec![],
+                ),
+            ],
+            Vec::new(),
+        ),
+    );
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+
+    complete_through_orchestrator(
+        &mut manager,
+        &mut orchestrator,
+        workspace_id,
+        run_id,
+        RoutineStepId::new(1),
+        &[("finding", "the parser drops escapes")],
+        30,
+    );
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(40))
+        .unwrap();
+
+    let workspace = manager.workspace(workspace_id).unwrap();
+    let run = workspace.routine_run(run_id).unwrap();
+    let first = run.step(RoutineStepId::new(1)).unwrap();
+    assert_eq!(first.state(), RoutineStepState::Completed);
+    assert_eq!(
+        first
+            .outputs()
+            .get(&output_key("finding"))
+            .unwrap()
+            .as_str(),
+        "the parser drops escapes"
+    );
+    assert_eq!(
+        workspace
+            .task(first.attempts()[0].task_id())
+            .unwrap()
+            .state(),
+        TaskState::Completed,
+        "the task lifecycle stays authoritative and follows the same response"
+    );
+
+    let second = run.step(RoutineStepId::new(2)).unwrap();
+    assert_eq!(second.state(), RoutineStepState::Dispatched);
+    assert_eq!(
+        workspace
+            .task(second.attempts().last().unwrap().task_id())
+            .unwrap()
+            .prompt()
+            .as_str(),
+        "Fix the parser drops escapes"
+    );
+}
+
+#[test]
+fn a_retry_after_a_live_task_still_records_its_predecessor() {
+    let (_temp, mut manager, workspace_id) = manager();
+    let retried = RoutineStep::new(
+        RoutineStepId::new(1),
+        name("Flaky"),
+        AgentId::new(1),
+        content("Try"),
+        [],
+        [],
+        [],
+        RoutineApproval::NotRequired,
+        RoutineRetryPolicy::new(2).unwrap(),
+        RoutineStepClaims::default(),
+    )
+    .unwrap();
+    let routine_id = install(
+        &mut manager,
+        workspace_id,
+        version(vec![retried], Vec::new()),
+    );
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+
+    // Cancel and confirm the agent stopped. The first task never left the queue,
+    // so the retry has to leave it in a state a retry source may be in.
+    scheduler
+        .cancel_run(
+            &mut manager,
+            &mut orchestrator,
+            workspace_id,
+            run_id,
+            timestamp(30),
+        )
+        .unwrap();
+    scheduler
+        .resolve_interruption(
+            &mut manager,
+            workspace_id,
+            run_id,
+            RoutineStepId::new(1),
+            timestamp(40),
+        )
+        .unwrap();
+
+    let first_task = manager
+        .workspace(workspace_id)
+        .unwrap()
+        .routine_run(run_id)
+        .unwrap()
+        .step(RoutineStepId::new(1))
+        .unwrap()
+        .attempts()[0]
+        .task_id();
+    assert!(
+        matches!(
+            manager
+                .workspace(workspace_id)
+                .unwrap()
+                .task(first_task)
+                .unwrap()
+                .state(),
+            TaskState::Failed | TaskState::Cancelled
+        ),
+        "a finished attempt must leave its task in a terminal state"
+    );
+}
+
+#[test]
+fn a_retry_after_a_completed_task_does_not_claim_an_invalid_predecessor() {
+    let (_temp, mut manager, workspace_id) = manager();
+    // The agent answers "completed" but omits the declared output, so the step
+    // fails while its task legitimately completed.
+    let retried = RoutineStep::new(
+        RoutineStepId::new(1),
+        name("Investigate"),
+        AgentId::new(1),
+        content("Investigate"),
+        [],
+        [],
+        [output_key("finding")],
+        RoutineApproval::NotRequired,
+        RoutineRetryPolicy::new(2).unwrap(),
+        RoutineStepClaims::default(),
+    )
+    .unwrap();
+    let routine_id = install(
+        &mut manager,
+        workspace_id,
+        version(vec![retried], Vec::new()),
+    );
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+    complete_through_orchestrator(
+        &mut manager,
+        &mut orchestrator,
+        workspace_id,
+        run_id,
+        RoutineStepId::new(1),
+        &[],
+        30,
+    );
+
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(40))
+        .unwrap();
+
+    let workspace = manager.workspace(workspace_id).unwrap();
+    let step = workspace
+        .routine_run(run_id)
+        .unwrap()
+        .step(RoutineStepId::new(1))
+        .unwrap();
+    assert_eq!(
+        step.attempts().len(),
+        2,
+        "the step retried within its budget"
+    );
+    assert_eq!(step.state(), RoutineStepState::Dispatched);
+    assert_eq!(
+        workspace
+            .task(step.attempts()[0].task_id())
+            .unwrap()
+            .state(),
+        TaskState::Completed
+    );
+}
+
+#[test]
+fn two_routines_cannot_hold_the_same_checkout_at_once() {
+    let (_temp, mut manager, workspace_id) = manager();
+    // Both routines bind different agents, and neither declares a named
+    // resource, so only the checkout they resolve to can keep them apart.
+    for (routine_id, agent) in [(1_u64, 1_u64), (2, 2)] {
+        let version = RoutineVersion::new(
+            RoutineVersionId::new(routine_id),
+            RoutineId::new(routine_id),
+            1,
+            Vec::new(),
+            vec![
+                RoutineStep::new(
+                    RoutineStepId::new(1),
+                    name("Build"),
+                    AgentId::new(agent),
+                    content("Build"),
+                    [],
+                    [],
+                    [],
+                    RoutineApproval::NotRequired,
+                    RoutineRetryPolicy::default(),
+                    RoutineStepClaims::default(),
+                )
+                .unwrap(),
+            ],
+            None,
+            timestamp(10),
+        )
+        .unwrap();
+        let routine = Routine::new(
+            RoutineId::new(routine_id),
+            name(&format!("Routine {routine_id}")),
+            None,
+            version,
+        )
+        .unwrap();
+        manager
+            .execute(
+                workspace_id,
+                DomainCommand::AddRoutine(routine),
+                timestamp(10 + routine_id),
+            )
+            .unwrap();
+    }
+
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let first = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            RoutineId::new(1),
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+    let second = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            RoutineId::new(2),
+            RunRequest::default(),
+            timestamp(21),
+        )
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(22))
+        .unwrap();
+
+    let workspace = manager.workspace(workspace_id).unwrap();
+    let dispatched = [first, second]
+        .into_iter()
+        .filter(|run_id| {
+            workspace
+                .routine_run(*run_id)
+                .unwrap()
+                .step(RoutineStepId::new(1))
+                .unwrap()
+                .state()
+                == RoutineStepState::Dispatched
+        })
+        .count();
+    assert_eq!(
+        dispatched, 1,
+        "two runs on the same checkout must not execute at once"
+    );
+
+    complete_through_orchestrator(
+        &mut manager,
+        &mut orchestrator,
+        workspace_id,
+        first,
+        RoutineStepId::new(1),
+        &[],
+        30,
+    );
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(40))
+        .unwrap();
+    assert_eq!(
+        manager
+            .workspace(workspace_id)
+            .unwrap()
+            .routine_run(second)
+            .unwrap()
+            .step(RoutineStepId::new(1))
+            .unwrap()
+            .state(),
+        RoutineStepState::Dispatched,
+        "the waiting run starts once the checkout is released"
+    );
+}
+
+#[test]
+fn a_response_that_arrives_after_cancellation_does_not_resurrect_the_step() {
+    let (_temp, mut manager, workspace_id) = manager();
+    let routine_id = install(
+        &mut manager,
+        workspace_id,
+        version(
+            vec![step(1, 1, "Investigate", vec![], vec![], vec![])],
+            Vec::new(),
+        ),
+    );
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+
+    // Deliver, then cancel while the agent is still working.
+    let request = orchestrator
+        .prepare_next(&mut manager, timestamp(22))
+        .unwrap()
+        .unwrap();
+    orchestrator
+        .finish_delivery(&mut manager, &request, Ok(()), timestamp(22))
+        .unwrap();
+    scheduler
+        .cancel_run(
+            &mut manager,
+            &mut orchestrator,
+            workspace_id,
+            run_id,
+            timestamp(30),
+        )
+        .unwrap();
+
+    // The agent answers anyway. The handoff is already terminal, so the late
+    // response is refused rather than silently completing a cancelled step.
+    let workspace = manager.workspace(workspace_id).unwrap();
+    let attempt = workspace
+        .routine_run(run_id)
+        .unwrap()
+        .step(RoutineStepId::new(1))
+        .unwrap()
+        .attempts()
+        .last()
+        .unwrap();
+    let message_id = workspace
+        .handoff(attempt.handoff_id())
+        .unwrap()
+        .message_id()
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let late = crate::ipc::AcceptedMessage {
+        workspace_id: workspace_id.get(),
+        sender_agent_id: 1,
+        recipient: crate::ipc::MessagePeer::Routine,
+        command: crate::ipc::ProtocolCommand::RespondToHandoff {
+            message_id: crate::ipc::MessageId::new(format!("{message_id}-late")).unwrap(),
+            handoff_message_id: crate::ipc::MessageId::new(message_id).unwrap(),
+            status: crate::ipc::ResponseStatus::Completed,
+            body: "Finished anyway".to_owned(),
+            outputs: BTreeMap::new(),
+        },
+    };
+    assert!(
+        orchestrator
+            .accept(&mut manager, &late, timestamp(35))
+            .is_err(),
+        "a response to a cancelled handoff is rejected"
+    );
+
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(40))
+        .unwrap();
+    let run = manager
+        .workspace(workspace_id)
+        .unwrap()
+        .routine_run(run_id)
+        .unwrap();
+    assert_eq!(
+        run.step(RoutineStepId::new(1)).unwrap().state(),
+        RoutineStepState::Interrupted
+    );
+    assert_eq!(
+        run.held_reservations().len(),
+        2,
+        "the cancelled step keeps its reservations until shutdown is confirmed"
+    );
+}
+
+#[test]
+fn a_git_trigger_records_the_revisions_it_observed_and_holds_its_baseline() {
+    let (temp, mut manager, workspace_id) = manager();
+    let project = temp.path().join("project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(&project)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success())
+    };
+    if !git(&["init", "--initial-branch=main"]) {
+        return; // Git is unavailable; the adapter has nothing to observe.
+    }
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    fs::write(project.join("README.md"), "first").unwrap();
+    git(&["add", "."]);
+    assert!(git(&["commit", "-m", "first"]));
+
+    // The routine declares the inputs the trigger offers, so they are recorded.
+    let routine_id = install(
+        &mut manager,
+        workspace_id,
+        version(
+            vec![step(
+                1,
+                1,
+                "Review {{after}}",
+                vec![],
+                vec![("after", RoutineBindingSource::Input(input_key("git.after")))],
+                vec![],
+            )],
+            vec![
+                RoutineInputDeclaration::new(input_key("git.after"), name("After"), true, None),
+                RoutineInputDeclaration::new(input_key("git.before"), name("Before"), false, None),
+            ],
+        ),
+    );
+    install_trigger(
+        &mut manager,
+        workspace_id,
+        routine_id,
+        RoutineTriggerKind::Git {
+            refs: vec!["main".to_owned()],
+        },
+        true,
+    );
+
+    let mut watcher = TriggerWatcher::new(timestamp(1_000));
+    assert!(
+        watcher.poll(&manager, timestamp(1_000)).events.is_empty(),
+        "the first observation is a baseline, not a change"
+    );
+
+    fs::write(project.join("README.md"), "second").unwrap();
+    git(&["add", "."]);
+    assert!(git(&["commit", "-m", "second"]));
+
+    let poll = watcher.poll(&manager, timestamp(1_100));
+    assert_eq!(poll.events.len(), 1);
+    let event = poll.events[0].clone();
+    assert!(event.observed.contains_key(&input_key("git.after")));
+    assert_ne!(
+        event.observed.get(&input_key("git.before")),
+        event.observed.get(&input_key("git.after"))
+    );
+
+    // Without consuming the event the baseline holds, so a transient failure
+    // to start the run re-reports the same change rather than dropping it.
+    assert_eq!(watcher.poll(&manager, timestamp(1_200)).events.len(), 1);
+
+    watcher.mark_consumed(&event);
+    assert!(watcher.poll(&manager, timestamp(1_300)).events.is_empty());
+
+    let mut scheduler = RoutineScheduler::default();
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest {
+                observed: event.observed.clone(),
+                trigger: Some(event.firing.clone()),
+                ..RunRequest::default()
+            },
+            timestamp(1_400),
+        )
+        .unwrap();
+    let run = manager
+        .workspace(workspace_id)
+        .unwrap()
+        .routine_run(run_id)
+        .unwrap();
+    assert_eq!(
+        run.pin().inputs().get(&input_key("git.after")),
+        event.observed.get(&input_key("git.after")),
+        "the run records the revision the trigger observed"
+    );
+}
