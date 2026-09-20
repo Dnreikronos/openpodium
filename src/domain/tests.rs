@@ -711,6 +711,77 @@ fn typed_task_handoffs_record_atomic_delivery_progress_and_response() {
 }
 
 #[test]
+fn task_cancellation_does_not_mutate_the_handoff_when_the_transition_is_invalid() {
+    let mut workspace = test_workspace();
+    for (id, agent_name) in [(1, "Lead"), (2, "Builder")] {
+        workspace
+            .execute(DomainCommand::AddAgent(Agent::new(
+                AgentId::new(id),
+                name(agent_name),
+                None,
+            )))
+            .unwrap();
+    }
+    let task_id = TaskId::new(1);
+    let task = Task::new(
+        task_id,
+        name("Already complete"),
+        content("Keep recovery atomic"),
+        Some(AgentId::new(2)),
+        None,
+    );
+    let handoff = Handoff::tracked(
+        HandoffId::new(1),
+        HandoffMessageId::new("task-1").unwrap(),
+        AgentId::new(1),
+        AgentId::new(2),
+        HandoffPayload::Task(task_id),
+        None,
+        Timestamp::from_unix_millis(100),
+        None,
+    )
+    .unwrap();
+    workspace
+        .execute(DomainCommand::AddTaskHandoff { task, handoff })
+        .unwrap();
+    for to in [
+        TaskState::Delivered,
+        TaskState::Running,
+        TaskState::Completed,
+    ] {
+        workspace
+            .execute(DomainCommand::TransitionTask { task_id, to })
+            .unwrap();
+    }
+    let before = workspace.handoff(HandoffId::new(1)).unwrap().clone();
+    let mut after = before.clone();
+    after
+        .cancel(
+            HandoffMessageId::new("cancel-1").unwrap(),
+            content("Too late"),
+            Timestamp::from_unix_millis(200),
+        )
+        .unwrap();
+    let snapshot = workspace.clone();
+
+    let result = workspace.execute(DomainCommand::CancelTask {
+        task_id,
+        before,
+        after,
+    });
+
+    assert_eq!(
+        result,
+        Err(DomainError::InvalidTaskTransition {
+            task_id,
+            from: TaskState::Completed,
+            to: TaskState::Cancelled,
+        })
+    );
+    assert_eq!(workspace, snapshot);
+}
+
+#[test]
 fn handoff_updates_reject_combined_transitions_and_bound_parent_chains() {
     let mut workspace = test_workspace();
     for (id, agent_name) in [(1, "Lead"), (2, "Builder")] {

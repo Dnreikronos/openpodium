@@ -291,6 +291,24 @@ fn project_event(workspace: &Workspace, event: &TimelineEvent) -> TimelineItem {
         DomainEvent::HandoffAdded(handoff) => handoff_added(workspace, handoff),
         DomainEvent::TaskHandoffAdded { task, .. } => task_added(workspace, task),
         DomainEvent::HandoffChanged { before, after } => handoff_changed(before, after),
+        DomainEvent::TaskCancelled { task_id, from, .. } => (
+            Some(*task_id),
+            "Task cancelled".to_owned(),
+            format!(
+                "{}: {from} → {}",
+                task_label(workspace, *task_id),
+                TaskState::Cancelled
+            ),
+        ),
+        DomainEvent::TaskResumed { task_id, from, .. } => (
+            Some(*task_id),
+            "Task resumed".to_owned(),
+            format!(
+                "{}: {from} → {}",
+                task_label(workspace, *task_id),
+                TaskState::Running
+            ),
+        ),
         DomainEvent::NodeAdded(node) => (
             task_from_target(node.target()),
             "Canvas node added".to_owned(),

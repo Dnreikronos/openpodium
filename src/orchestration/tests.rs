@@ -4,8 +4,8 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::domain::{
-    Agent, AgentId, AgentProgram, DomainCommand, HandoffMessageId, Name, TaskId, TaskState,
-    Timestamp,
+    Agent, AgentId, AgentProgram, DomainCommand, DomainEvent, HandoffMessageId, Name, TaskId,
+    TaskState, Timestamp,
 };
 use crate::ipc::{AcceptedMessage, HandoffKind, MessageId, ProtocolCommand, ResponseStatus};
 use crate::workspaces::WorkspaceManager;
@@ -428,6 +428,7 @@ fn user_cancel_and_resume_follow_task_lifecycle_rules() {
     orchestrator
         .accept(&mut manager, &task("task-1", "Cancel me"), timestamp(20))
         .unwrap();
+    let before_cancel = manager.timeline(workspace_id).unwrap().len();
     orchestrator
         .cancel_task(&mut manager, workspace_id, TaskId::new(1), timestamp(21))
         .unwrap();
@@ -440,6 +441,12 @@ fn user_cancel_and_resume_follow_task_lifecycle_rules() {
             .state(),
         TaskState::Cancelled
     );
+    let timeline = manager.timeline(workspace_id).unwrap();
+    assert_eq!(timeline.len(), before_cancel + 1);
+    assert!(matches!(
+        timeline.last().unwrap().event(),
+        DomainEvent::TaskCancelled { task_id, .. } if *task_id == TaskId::new(1)
+    ));
     assert!(
         orchestrator
             .resume_task(&mut manager, workspace_id, TaskId::new(1), timestamp(22))
@@ -486,6 +493,7 @@ fn user_cancel_and_resume_follow_task_lifecycle_rules() {
     orchestrator
         .finish_delivery(&mut manager, &blocked_delivery, Ok(()), timestamp(37))
         .unwrap();
+    let before_resume = manager.timeline(workspace_id).unwrap().len();
     orchestrator
         .resume_task(&mut manager, workspace_id, TaskId::new(2), timestamp(38))
         .unwrap();
@@ -498,6 +506,12 @@ fn user_cancel_and_resume_follow_task_lifecycle_rules() {
             .state(),
         TaskState::Running
     );
+    let timeline = manager.timeline(workspace_id).unwrap();
+    assert_eq!(timeline.len(), before_resume + 1);
+    assert!(matches!(
+        timeline.last().unwrap().event(),
+        DomainEvent::TaskResumed { task_id, .. } if *task_id == TaskId::new(2)
+    ));
     let resumed = orchestrator
         .prepare_next(&mut manager, timestamp(39))
         .unwrap()

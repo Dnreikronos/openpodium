@@ -15,7 +15,7 @@ use crate::domain::{
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 7;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 8;
 pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 7;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
@@ -79,6 +79,13 @@ pub(crate) fn decode_event(
             "domain event",
             sequence,
             "typed handoffs and orchestration history require event format version 7",
+        ));
+    }
+    if format_version < 8 && stored.requires_version_eight() {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "atomic task recovery requires event format version 8",
         ));
     }
 
@@ -207,6 +214,17 @@ enum StoredEvent {
         before: HandoffV1,
         after: HandoffV1,
     },
+    TaskCancelled {
+        task_id: u64,
+        from: TaskStateV1,
+        before: HandoffV1,
+        after: HandoffV1,
+    },
+    TaskResumed {
+        task_id: u64,
+        from: TaskStateV1,
+        handoff: HandoffV1,
+    },
     NodeAdded {
         node: NodeV1,
     },
@@ -331,6 +349,26 @@ impl From<&DomainEvent> for StoredEvent {
                 before: HandoffV1::from(before),
                 after: HandoffV1::from(after),
             },
+            DomainEvent::TaskCancelled {
+                task_id,
+                from,
+                before,
+                after,
+            } => Self::TaskCancelled {
+                task_id: task_id.get(),
+                from: (*from).into(),
+                before: HandoffV1::from(before),
+                after: HandoffV1::from(after),
+            },
+            DomainEvent::TaskResumed {
+                task_id,
+                from,
+                handoff,
+            } => Self::TaskResumed {
+                task_id: task_id.get(),
+                from: (*from).into(),
+                handoff: HandoffV1::from(handoff),
+            },
             DomainEvent::NodeAdded(node) => Self::NodeAdded {
                 node: NodeV1::from(node),
             },
@@ -415,6 +453,10 @@ impl StoredEvent {
             Self::HandoffAdded { handoff } => handoff.has_orchestration_fields(),
             _ => false,
         }
+    }
+
+    fn requires_version_eight(&self) -> bool {
+        matches!(self, Self::TaskCancelled { .. } | Self::TaskResumed { .. })
     }
 
     fn into_domain(self) -> Result<DomainEvent, String> {
@@ -526,6 +568,26 @@ impl StoredEvent {
             Self::HandoffChanged { before, after } => Ok(DomainEvent::HandoffChanged {
                 before: before.into_domain()?,
                 after: after.into_domain()?,
+            }),
+            Self::TaskCancelled {
+                task_id,
+                from,
+                before,
+                after,
+            } => Ok(DomainEvent::TaskCancelled {
+                task_id: TaskId::new(task_id),
+                from: from.into(),
+                before: before.into_domain()?,
+                after: after.into_domain()?,
+            }),
+            Self::TaskResumed {
+                task_id,
+                from,
+                handoff,
+            } => Ok(DomainEvent::TaskResumed {
+                task_id: TaskId::new(task_id),
+                from: from.into(),
+                handoff: handoff.into_domain()?,
             }),
             Self::NodeAdded { node } => Ok(DomainEvent::NodeAdded(node.into_domain()?)),
             Self::AgentNodeAdded { agent, node } => {
@@ -1495,9 +1557,11 @@ impl HandoffV1 {
             .created_at
             .map(Timestamp::from_unix_millis)
             .ok_or_else(|| "tracked handoff is missing created_at".to_owned())?;
+        let root_message_id =
+            HandoffMessageId::new(message_id).map_err(|error| error.to_string())?;
         let mut handoff = Handoff::tracked(
             id,
-            HandoffMessageId::new(message_id).map_err(|error| error.to_string())?,
+            root_message_id.clone(),
             source,
             recipient,
             payload,
@@ -1507,36 +1571,11 @@ impl HandoffV1 {
         )
         .map_err(|error| error.to_string())?;
 
-        for attempt in self.delivery_attempts {
-            let ordinal = handoff
-                .begin_delivery(
-                    HandoffMessageId::new(attempt.message_id).map_err(|error| error.to_string())?,
-                    attempt.mechanism.into(),
-                    Timestamp::from_unix_millis(attempt.started_at),
-                )
-                .map_err(|error| error.to_string())?;
-            if ordinal != attempt.ordinal {
-                return Err("delivery attempt ordinals are not contiguous".to_owned());
-            }
-            match attempt.outcome {
-                DeliveryOutcomeV1::Started => {}
-                DeliveryOutcomeV1::Delivered { finished_at } => handoff
-                    .complete_delivery(ordinal, Timestamp::from_unix_millis(finished_at))
-                    .map_err(|error| error.to_string())?,
-                DeliveryOutcomeV1::Failed {
-                    finished_at,
-                    error,
-                    retryable,
-                } => handoff
-                    .fail_delivery(
-                        ordinal,
-                        Timestamp::from_unix_millis(finished_at),
-                        Content::new(error).map_err(|error| error.to_string())?,
-                        retryable,
-                    )
-                    .map_err(|error| error.to_string())?,
-            }
-        }
+        let (root_attempts, follow_up_attempts): (Vec<_>, Vec<_>) = self
+            .delivery_attempts
+            .into_iter()
+            .partition(|attempt| attempt.message_id == root_message_id.as_str());
+        restore_delivery_attempts(&mut handoff, root_attempts)?;
         for progress in self.progress {
             handoff
                 .report_progress(progress.into_domain()?)
@@ -1565,6 +1604,7 @@ impl HandoffV1 {
                     .map_err(|error| error.to_string())?,
             }
         }
+        restore_delivery_attempts(&mut handoff, follow_up_attempts)?;
         Ok(handoff)
     }
 
@@ -1578,6 +1618,43 @@ impl HandoffV1 {
             || self.response.is_some()
             || self.termination.is_some()
     }
+}
+
+fn restore_delivery_attempts(
+    handoff: &mut Handoff,
+    attempts: impl IntoIterator<Item = DeliveryAttemptV1>,
+) -> Result<(), String> {
+    for attempt in attempts {
+        let ordinal = handoff
+            .begin_delivery(
+                HandoffMessageId::new(attempt.message_id).map_err(|error| error.to_string())?,
+                attempt.mechanism.into(),
+                Timestamp::from_unix_millis(attempt.started_at),
+            )
+            .map_err(|error| error.to_string())?;
+        if ordinal != attempt.ordinal {
+            return Err("delivery attempt ordinals are not contiguous".to_owned());
+        }
+        match attempt.outcome {
+            DeliveryOutcomeV1::Started => {}
+            DeliveryOutcomeV1::Delivered { finished_at } => handoff
+                .complete_delivery(ordinal, Timestamp::from_unix_millis(finished_at))
+                .map_err(|error| error.to_string())?,
+            DeliveryOutcomeV1::Failed {
+                finished_at,
+                error,
+                retryable,
+            } => handoff
+                .fail_delivery(
+                    ordinal,
+                    Timestamp::from_unix_millis(finished_at),
+                    Content::new(error).map_err(|error| error.to_string())?,
+                    retryable,
+                )
+                .map_err(|error| error.to_string())?,
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]

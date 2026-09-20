@@ -267,14 +267,14 @@ impl Orchestrator {
             content("Cancelled by the user")?,
             cancelled_at,
         )?;
-        execute_handoff_update(
+        execute_task_cancellation(
             workspaces,
             workspace_id,
+            task_id,
             before.clone(),
             after,
             cancelled_at,
         )?;
-        transition_task_cancelled(workspaces, workspace_id, task_id, cancelled_at)?;
         self.remove_pending(workspace_id, &root_message_id);
         self.enqueue(
             workspaces,
@@ -300,13 +300,18 @@ impl Orchestrator {
         let previous = task_handoff(workspace, task_id)?.clone();
         let (handoff_id, message_id) =
             if previous.response().is_none() && previous.termination().is_none() {
-                (
-                    previous.id(),
-                    previous
-                        .message_id()
-                        .expect("orchestrated task handoffs have message IDs")
-                        .clone(),
-                )
+                let message_id = previous
+                    .message_id()
+                    .expect("orchestrated task handoffs have message IDs")
+                    .clone();
+                transition_task(
+                    workspaces,
+                    workspace_id,
+                    task_id,
+                    TaskState::Running,
+                    resumed_at,
+                )?;
+                (previous.id(), message_id)
             } else {
                 delivery_mechanism(workspace, previous.recipient())?;
                 let handoff_id = next_handoff_id(workspace)?;
@@ -321,16 +326,13 @@ impl Orchestrator {
                     resumed_at,
                     None,
                 )?;
-                workspaces.execute(workspace_id, DomainCommand::AddHandoff(handoff), resumed_at)?;
+                workspaces.execute(
+                    workspace_id,
+                    DomainCommand::ResumeTask { task_id, handoff },
+                    resumed_at,
+                )?;
                 (handoff_id, message_id)
             };
-        transition_task(
-            workspaces,
-            workspace_id,
-            task_id,
-            TaskState::Running,
-            resumed_at,
-        )?;
         self.enqueue(
             workspaces,
             workspace_id,
@@ -612,6 +614,10 @@ impl Orchestrator {
             .ok_or_else(|| OrchestrationError::UnknownHandoff(root_id.to_string()))?;
         let before = handoff(workspaces, workspace_id, handoff_id)?.clone();
         validate_routed_participants(&before, accepted, false)?;
+        let task_id = match before.payload() {
+            HandoffPayload::Task(task_id) => Some(*task_id),
+            HandoffPayload::Question(_) => None,
+        };
         if before.termination().is_none() {
             let mut after = before.clone();
             after.cancel(
@@ -619,12 +625,20 @@ impl Orchestrator {
                 Content::new(reason.to_owned())?,
                 accepted_at,
             )?;
-            execute_handoff_update(workspaces, workspace_id, before, after, accepted_at)?;
-        }
-        if let HandoffPayload::Task(task_id) =
-            handoff(workspaces, workspace_id, handoff_id)?.payload()
-        {
-            transition_task_cancelled(workspaces, workspace_id, *task_id, accepted_at)?;
+            if let Some(task_id) = task_id {
+                execute_task_cancellation(
+                    workspaces,
+                    workspace_id,
+                    task_id,
+                    before,
+                    after,
+                    accepted_at,
+                )?;
+            } else {
+                execute_handoff_update(workspaces, workspace_id, before, after, accepted_at)?;
+            }
+        } else if let Some(task_id) = task_id {
+            transition_task_cancelled(workspaces, workspace_id, task_id, accepted_at)?;
         }
         self.remove_pending(workspace_id, &root_id);
         self.enqueue(
@@ -1151,6 +1165,26 @@ fn execute_handoff_update(
     workspaces.execute(
         workspace_id,
         DomainCommand::UpdateHandoff { before, after },
+        at,
+    )?;
+    Ok(())
+}
+
+fn execute_task_cancellation(
+    workspaces: &mut WorkspaceManager,
+    workspace_id: WorkspaceId,
+    task_id: TaskId,
+    before: Handoff,
+    after: Handoff,
+    at: Timestamp,
+) -> Result<(), OrchestrationError> {
+    workspaces.execute(
+        workspace_id,
+        DomainCommand::CancelTask {
+            task_id,
+            before,
+            after,
+        },
         at,
     )?;
     Ok(())

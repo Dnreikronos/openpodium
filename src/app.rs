@@ -1143,8 +1143,7 @@ fn navigate_to_task(state: &mut OpenPodium, target: NavigationTarget) {
         .as_ref()
         .and_then(|workspaces| workspaces.workspace(target.workspace_id))
         .and_then(|workspace| timeline::navigation_target(workspace, target.task_id))
-        .and_then(|target| target.node_id)
-        .or(target.node_id);
+        .and_then(|target| target.node_id);
     state.canvas_selection = current_node.into_iter().collect();
     state.focused_terminal = None;
     state.canvas_revision = state.canvas_revision.wrapping_add(1);
@@ -3559,6 +3558,37 @@ mod tests {
         assert_eq!(active_workspace_id(&state), Some(second_id));
         assert_eq!(state.canvas_selection, vec![NodeId::new(9)]);
         assert_eq!(state.timeline_ui.selected_task(second_id), Some(task_id));
+
+        let before = state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .workspace(second_id)
+            .unwrap()
+            .canvas_layout();
+        let reused_node = Node::new(
+            NodeId::new(9),
+            NodeTarget::Agent(AgentId::new(1)),
+            CanvasPoint::new(0.0, 0.0).unwrap(),
+            CanvasSize::new(400.0, 300.0).unwrap(),
+        );
+        state
+            .workspaces
+            .as_mut()
+            .unwrap()
+            .execute(
+                second_id,
+                DomainCommand::ReplaceCanvas {
+                    before,
+                    after: CanvasLayout::new(vec![reused_node], vec![], vec![]),
+                },
+                Timestamp::from_unix_millis(7),
+            )
+            .unwrap();
+
+        navigate_to_task(&mut state, target);
+
+        assert!(state.canvas_selection.is_empty());
     }
 
     fn test_state(
