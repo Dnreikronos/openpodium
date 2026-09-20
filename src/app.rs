@@ -1763,6 +1763,22 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
                 },
             );
         }
+        canvas::Message::PortalKey {
+            node_id,
+            observation_revision,
+            key,
+            shift,
+        } => {
+            return portals::execute(
+                state,
+                node_id,
+                PortalAction::Key {
+                    observation_revision,
+                    key,
+                    shift,
+                },
+            );
+        }
     }
     Task::none()
 }

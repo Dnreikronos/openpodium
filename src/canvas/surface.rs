@@ -4,7 +4,6 @@ use iced::advanced::widget::{self, Tree};
 use iced::advanced::{
     Clipboard, InputMethod, Layout, Shell, Widget, input_method, layout, renderer,
 };
-#[cfg(test)]
 use iced::keyboard::key::Named;
 use iced::keyboard::{self, Key, Modifiers};
 use iced::mouse;
@@ -12,7 +11,7 @@ use iced::widget::canvas::{self, Action};
 use iced::{Element, Fill, Length, Point, Rectangle, Renderer, Size, Theme};
 use openpodium::domain::{CanvasLayout, CanvasNodeContent, Node, NodeId};
 use openpodium::navigation::Shortcut;
-use openpodium::portal::{PortalFrameTransform, PortalPoint, PortalRect};
+use openpodium::portal::{PortalFrameTransform, PortalKeyInput, PortalPoint, PortalRect};
 
 use crate::terminal::{self, BODY_PADDING, CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT};
 
@@ -75,6 +74,12 @@ pub(crate) enum Message {
         node_id: NodeId,
         observation_revision: u64,
         text: String,
+    },
+    PortalKey {
+        node_id: NodeId,
+        observation_revision: u64,
+        key: PortalKeyInput,
+        shift: bool,
     },
 }
 
@@ -699,6 +704,18 @@ impl Surface {
         if modifiers.command() || modifiers.control() || modifiers.alt() {
             return None;
         }
+        if let Some(key) = portal_key_input(key) {
+            let observation_revision = self.document.portal_frame(node_id)?.revision();
+            return Some(
+                Action::publish(Message::PortalKey {
+                    node_id,
+                    observation_revision,
+                    key,
+                    shift: modifiers.shift(),
+                })
+                .and_capture(),
+            );
+        }
         self.portal_text_action(node_id, text?.to_owned())
     }
 
@@ -902,6 +919,25 @@ fn saturating_i32(value: f64) -> i32 {
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
+fn portal_key_input(key: &Key) -> Option<PortalKeyInput> {
+    match key.as_ref() {
+        Key::Named(Named::Enter) => Some(PortalKeyInput::Enter),
+        Key::Named(Named::Tab) => Some(PortalKeyInput::Tab),
+        Key::Named(Named::Backspace) => Some(PortalKeyInput::Backspace),
+        Key::Named(Named::Delete) => Some(PortalKeyInput::Delete),
+        Key::Named(Named::Escape) => Some(PortalKeyInput::Escape),
+        Key::Named(Named::ArrowUp) => Some(PortalKeyInput::ArrowUp),
+        Key::Named(Named::ArrowDown) => Some(PortalKeyInput::ArrowDown),
+        Key::Named(Named::ArrowLeft) => Some(PortalKeyInput::ArrowLeft),
+        Key::Named(Named::ArrowRight) => Some(PortalKeyInput::ArrowRight),
+        Key::Named(Named::Home) => Some(PortalKeyInput::Home),
+        Key::Named(Named::End) => Some(PortalKeyInput::End),
+        Key::Named(Named::PageUp) => Some(PortalKeyInput::PageUp),
+        Key::Named(Named::PageDown) => Some(PortalKeyInput::PageDown),
+        Key::Named(_) | Key::Character(_) | Key::Unidentified => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1007,5 +1043,18 @@ mod tests {
             ),
             Some(release)
         );
+    }
+
+    #[test]
+    fn portal_named_keys_map_without_exposing_arbitrary_backend_commands() {
+        assert_eq!(
+            portal_key_input(&Key::Named(Named::Enter)),
+            Some(PortalKeyInput::Enter)
+        );
+        assert_eq!(
+            portal_key_input(&Key::Named(Named::ArrowDown)),
+            Some(PortalKeyInput::ArrowDown)
+        );
+        assert_eq!(portal_key_input(&Key::Character("x".into())), None);
     }
 }

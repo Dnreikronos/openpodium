@@ -658,6 +658,11 @@ fn action_at_revision(action: PortalAction, observation_revision: u64) -> Portal
             observation_revision,
             text,
         },
+        PortalAction::Key { key, shift, .. } => PortalAction::Key {
+            observation_revision,
+            key,
+            shift,
+        },
         PortalAction::ScrollCoordinate {
             x,
             y,
