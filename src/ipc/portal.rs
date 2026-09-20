@@ -769,13 +769,14 @@ fn action_target<'a>(action: &'a PortalAction, current_target: &'a str) -> &'a s
 fn operation_for(action: &PortalAction) -> PortalOperation {
     match action {
         PortalAction::Navigate(_) => PortalOperation::Navigate,
+        PortalAction::ClickCoordinate { .. } | PortalAction::ScrollCoordinate { .. } => {
+            PortalOperation::CoordinateFallback
+        }
         PortalAction::Click(_)
-        | PortalAction::ClickCoordinate { .. }
         | PortalAction::TypeText { .. }
         | PortalAction::TypeFocused { .. }
         | PortalAction::Key { .. }
-        | PortalAction::Scroll { .. }
-        | PortalAction::ScrollCoordinate { .. } => PortalOperation::Input,
+        | PortalAction::Scroll { .. } => PortalOperation::Input,
     }
 }
 
@@ -1060,6 +1061,33 @@ mod tests {
 
         dispatcher.execute_local(10, action.clone()).unwrap();
 
+        assert_eq!(executed.lock().unwrap().as_slice(), &[action]);
+    }
+
+    #[test]
+    fn agent_coordinate_input_requires_fallback_approval() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, executed) = dispatcher(&temp);
+        let observation = dispatcher.observe(4, 7, 10).unwrap();
+        let action_id = MessageId::new("coordinate-1").unwrap();
+        let action = PortalAction::ClickCoordinate {
+            observation_revision: observation.observation.revision,
+            x: 4,
+            y: 6,
+        };
+
+        let receipt = dispatcher
+            .request_action_at(4, 7, action_id.clone(), 10, action.clone(), 100)
+            .unwrap();
+        let approval_id = match receipt.policy {
+            PortalPolicyOutcome::ApprovalRequired { approval_id, .. } => approval_id,
+            policy => panic!("unexpected policy outcome: {policy:?}"),
+        };
+        assert!(executed.lock().unwrap().is_empty());
+
+        dispatcher
+            .approve_action_at(4, &action_id, approval_id, 1_000, 101)
+            .unwrap();
         assert_eq!(executed.lock().unwrap().as_slice(), &[action]);
     }
 

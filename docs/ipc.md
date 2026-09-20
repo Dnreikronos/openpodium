@@ -168,8 +168,10 @@ openpodium ipc portals list
 openpodium ipc portal inspect --portal <portal-id>
 openpodium ipc portal observe --portal <portal-id>
 openpodium ipc portal click --portal <portal-id> --element <element-id> --revision <revision> [--action-id <id>]
+openpodium ipc portal click-coordinate --portal <portal-id> --x <pixels> --y <pixels> --revision <revision> [--action-id <id>]
 openpodium ipc portal type --portal <portal-id> --element <element-id> --revision <revision> --text <text> [--action-id <id>]
 openpodium ipc portal scroll --portal <portal-id> --revision <revision> --delta-x <pixels> --delta-y <pixels> [--element <element-id>] [--action-id <id>]
+openpodium ipc portal scroll-coordinate --portal <portal-id> --x <pixels> --y <pixels> --revision <revision> --delta-x <pixels> --delta-y <pixels> [--action-id <id>]
 openpodium ipc portal navigate --portal <portal-id> --target <url> [--action-id <id>]
 openpodium ipc portal result --action <action-id>
 openpodium ipc task send --to <agent-id> --title <title> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]

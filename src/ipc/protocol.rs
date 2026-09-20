@@ -286,6 +286,11 @@ pub enum PortalActionRequest {
         element_id: String,
         observation_revision: u64,
     },
+    ClickCoordinate {
+        observation_revision: u64,
+        x: u32,
+        y: u32,
+    },
     TypeText {
         element_id: String,
         observation_revision: u64,
@@ -295,6 +300,13 @@ pub enum PortalActionRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         element_id: Option<String>,
         observation_revision: u64,
+        delta_x: i32,
+        delta_y: i32,
+    },
+    ScrollCoordinate {
+        observation_revision: u64,
+        x: u32,
+        y: u32,
         delta_x: i32,
         delta_y: i32,
     },
@@ -310,6 +322,10 @@ impl PortalActionRequest {
                 element_id,
                 observation_revision,
             } => validate_element(element_id, *observation_revision),
+            Self::ClickCoordinate {
+                observation_revision,
+                ..
+            } => validate_observation_revision(*observation_revision),
             Self::TypeText {
                 element_id,
                 observation_revision,
@@ -334,6 +350,18 @@ impl PortalActionRequest {
                 }
                 Ok(())
             }
+            Self::ScrollCoordinate {
+                observation_revision,
+                delta_x,
+                delta_y,
+                ..
+            } => {
+                validate_observation_revision(*observation_revision)?;
+                if *delta_x == 0 && *delta_y == 0 {
+                    return Err(ProtocolValidationError::EmptyPortalScroll);
+                }
+                Ok(())
+            }
             Self::Navigate { target } => {
                 validate_text(target, MAX_PORTAL_TARGET_CHARS, "portal navigation target")
             }
@@ -345,6 +373,14 @@ fn validate_portal_id(portal_id: u64) -> Result<(), ProtocolValidationError> {
     portal_id_is_positive(portal_id)
         .then_some(())
         .ok_or(ProtocolValidationError::InvalidPortalId)
+}
+
+fn validate_observation_revision(revision: u64) -> Result<(), ProtocolValidationError> {
+    if revision == 0 {
+        Err(ProtocolValidationError::InvalidObservationRevision)
+    } else {
+        Ok(())
+    }
 }
 
 fn portal_id_is_positive(portal_id: u64) -> bool {

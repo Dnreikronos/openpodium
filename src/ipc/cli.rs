@@ -21,8 +21,10 @@ const USAGE: &str = "Usage:
   openpodium ipc portal inspect --portal <portal-id>
   openpodium ipc portal observe --portal <portal-id>
   openpodium ipc portal click --portal <portal-id> --element <element-id> --revision <revision> [--action-id <id>]
+  openpodium ipc portal click-coordinate --portal <portal-id> --x <pixels> --y <pixels> --revision <revision> [--action-id <id>]
   openpodium ipc portal type --portal <portal-id> --element <element-id> --revision <revision> --text <text> [--action-id <id>]
   openpodium ipc portal scroll --portal <portal-id> --revision <revision> --delta-x <pixels> --delta-y <pixels> [--element <element-id>] [--action-id <id>]
+  openpodium ipc portal scroll-coordinate --portal <portal-id> --x <pixels> --y <pixels> --revision <revision> --delta-x <pixels> --delta-y <pixels> [--action-id <id>]
   openpodium ipc portal navigate --portal <portal-id> --target <url> [--action-id <id>]
   openpodium ipc portal result --action <action-id>
   openpodium ipc task send --to <agent-id> --title <title> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]
@@ -138,6 +140,21 @@ fn parse_command(arguments: &[String]) -> Result<ProtocolCommand, CliUsageError>
                 },
             })
         }
+        ["ipc", "portal", "click-coordinate", options @ ..] => {
+            let options = parse_options(
+                options,
+                &["--portal", "--x", "--y", "--revision", "--action-id"],
+            )?;
+            Ok(ProtocolCommand::RequestPortalAction {
+                action_id: action_id(&options)?,
+                portal_id: portal_id(&options)?,
+                action: PortalActionRequest::ClickCoordinate {
+                    observation_revision: positive_u64(&options, "--revision", "revision")?,
+                    x: unsigned_u32(&options, "--x")?,
+                    y: unsigned_u32(&options, "--y")?,
+                },
+            })
+        }
         ["ipc", "portal", "type", options @ ..] => {
             let options = parse_options(
                 options,
@@ -177,6 +194,31 @@ fn parse_command(arguments: &[String]) -> Result<ProtocolCommand, CliUsageError>
                 action: PortalActionRequest::Scroll {
                     element_id: options.get("--element").map(|value| (*value).to_owned()),
                     observation_revision: positive_u64(&options, "--revision", "revision")?,
+                    delta_x: signed_i32(&options, "--delta-x")?,
+                    delta_y: signed_i32(&options, "--delta-y")?,
+                },
+            })
+        }
+        ["ipc", "portal", "scroll-coordinate", options @ ..] => {
+            let options = parse_options(
+                options,
+                &[
+                    "--portal",
+                    "--x",
+                    "--y",
+                    "--revision",
+                    "--delta-x",
+                    "--delta-y",
+                    "--action-id",
+                ],
+            )?;
+            Ok(ProtocolCommand::RequestPortalAction {
+                action_id: action_id(&options)?,
+                portal_id: portal_id(&options)?,
+                action: PortalActionRequest::ScrollCoordinate {
+                    observation_revision: positive_u64(&options, "--revision", "revision")?,
+                    x: unsigned_u32(&options, "--x")?,
+                    y: unsigned_u32(&options, "--y")?,
                     delta_x: signed_i32(&options, "--delta-x")?,
                     delta_y: signed_i32(&options, "--delta-y")?,
                 },
@@ -353,6 +395,12 @@ fn signed_i32(options: &BTreeMap<&str, &str>, name: &str) -> Result<i32, CliUsag
         .map_err(|_| CliUsageError(format!("{name} must be a 32-bit integer")))
 }
 
+fn unsigned_u32(options: &BTreeMap<&str, &str>, name: &str) -> Result<u32, CliUsageError> {
+    required(options, name)?
+        .parse::<u32>()
+        .map_err(|_| CliUsageError(format!("{name} must be a non-negative 32-bit integer")))
+}
+
 fn recipient_id(options: &BTreeMap<&str, &str>) -> Result<u64, CliUsageError> {
     required(options, "--to")?
         .parse::<u64>()
@@ -474,6 +522,30 @@ mod tests {
         assert!(matches!(
             parse_command(&arguments(&[
                 "ipc",
+                "portal",
+                "click-coordinate",
+                "--portal",
+                "9",
+                "--x",
+                "320",
+                "--y",
+                "240",
+                "--revision",
+                "4",
+            ]))
+            .unwrap(),
+            ProtocolCommand::RequestPortalAction {
+                action: PortalActionRequest::ClickCoordinate {
+                    observation_revision: 4,
+                    x: 320,
+                    y: 240,
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_command(&arguments(&[
+                "ipc",
                 "question",
                 "send",
                 "--to",
@@ -579,6 +651,30 @@ mod tests {
                 },
             }
         );
+        assert!(matches!(
+            parse_command(&arguments(&[
+                "ipc",
+                "portal",
+                "scroll-coordinate",
+                "--portal",
+                "9",
+                "--x",
+                "320",
+                "--y",
+                "240",
+                "--revision",
+                "4",
+                "--delta-x",
+                "0",
+                "--delta-y",
+                "-120",
+            ]))
+            .unwrap(),
+            ProtocolCommand::RequestPortalAction {
+                action: PortalActionRequest::ScrollCoordinate { x: 320, y: 240, .. },
+                ..
+            }
+        ));
         assert!(matches!(
             parse_command(&arguments(&[
                 "ipc",

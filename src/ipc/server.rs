@@ -683,6 +683,15 @@ fn portal_action(action: PortalActionRequest) -> Result<PortalAction, ProtocolEr
         } => PortalElementRef::new(observation_revision, element_id)
             .map(PortalAction::Click)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())),
+        PortalActionRequest::ClickCoordinate {
+            observation_revision,
+            x,
+            y,
+        } => Ok(PortalAction::ClickCoordinate {
+            observation_revision,
+            x,
+            y,
+        }),
         PortalActionRequest::TypeText {
             element_id,
             observation_revision,
@@ -704,6 +713,19 @@ fn portal_action(action: PortalActionRequest) -> Result<PortalAction, ProtocolEr
                 delta_y,
             })
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())),
+        PortalActionRequest::ScrollCoordinate {
+            observation_revision,
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } => Ok(PortalAction::ScrollCoordinate {
+            observation_revision,
+            x,
+            y,
+            delta_x,
+            delta_y,
+        }),
         PortalActionRequest::Navigate { target } => Ok(PortalAction::Navigate(target)),
     }
 }
