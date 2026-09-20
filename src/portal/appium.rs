@@ -490,13 +490,16 @@ mod tests {
     }
 
     #[test]
-    fn creates_and_deletes_only_the_appium_session() {
+    fn observes_and_operates_without_stopping_the_device() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let worker = thread::spawn(move || {
             for response in [
                 r#"{"value":{"sessionId":"session-1"}}"#,
                 r#"{"value":{"width":800,"height":600}}"#,
+                r#"{"value":"AQ=="}"#,
+                r#"{"value":"<hierarchy/>"}"#,
+                r#"{"value":null}"#,
                 r#"{"value":null}"#,
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -524,6 +527,26 @@ mod tests {
 
         backend.connect(&config, &mut session).unwrap();
         assert_eq!(backend.viewport, PortalViewport::new(800, 600).unwrap());
+        let observation = backend.observe(&mut session).unwrap();
+        assert_eq!(observation.revision(), 1);
+        assert_eq!(observation.frame().unwrap().bytes(), &[1]);
+        assert!(
+            observation
+                .accessibility()
+                .unwrap()
+                .json()
+                .contains("<hierarchy/>")
+        );
+        backend
+            .execute(
+                &mut session,
+                &PortalAction::ClickCoordinate {
+                    observation_revision: 1,
+                    x: 100,
+                    y: 200,
+                },
+            )
+            .unwrap();
         backend.close(&mut session).unwrap();
 
         worker.join().unwrap();
