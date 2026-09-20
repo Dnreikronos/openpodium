@@ -131,6 +131,25 @@ impl PortalActionJournal {
             .map_err(journal_error)
     }
 
+    pub(super) fn mark_rejected(
+        &self,
+        workspace_id: u64,
+        action_id: &MessageId,
+        reason: &str,
+        finished_at_ms: u64,
+    ) -> Result<(), PortalServiceError> {
+        self.connection
+            .execute(
+                "UPDATE portal_actions
+                 SET state = 'failed', policy = 'denied', policy_detail = ?3,
+                     outcome = ?3, finished_at_ms = ?4
+                 WHERE workspace_id = ?1 AND action_id = ?2",
+                params![workspace_id, action_id.as_str(), reason, finished_at_ms],
+            )
+            .map(|_| ())
+            .map_err(journal_error)
+    }
+
     pub(super) fn finish(
         &self,
         workspace_id: u64,
@@ -164,6 +183,26 @@ impl PortalActionJournal {
         self.record(workspace_id, action_id)?
             .map(|record| record.into_receipt(false))
             .transpose()
+    }
+
+    pub(super) fn duplicate_receipt(
+        &self,
+        workspace_id: u64,
+        action_id: &MessageId,
+        agent_id: u64,
+        portal_id: u64,
+        fingerprint: &str,
+    ) -> Result<Option<PortalActionReceipt>, PortalServiceError> {
+        let Some(record) = self.record(workspace_id, action_id)? else {
+            return Ok(None);
+        };
+        if record.agent_id != agent_id
+            || record.portal_id != portal_id
+            || record.fingerprint != fingerprint
+        {
+            return Err(PortalServiceError::ActionConflict(action_id.to_string()));
+        }
+        record.into_receipt(true).map(Some)
     }
 
     fn record(

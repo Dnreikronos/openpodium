@@ -143,8 +143,39 @@ impl PortalControl {
         mutex_lock(&self.portals).observe_local(portal_id)
     }
 
+    pub fn capture_frame(
+        &self,
+        portal_id: u64,
+    ) -> Result<Option<crate::portal::PortalFrame>, PortalServiceError> {
+        mutex_lock(&self.portals).capture_frame_local(portal_id)
+    }
+
     pub fn execute(&self, portal_id: u64, action: PortalAction) -> Result<(), PortalServiceError> {
         mutex_lock(&self.portals).execute_local(portal_id, action)
+    }
+
+    pub fn pending_approvals(&self, workspace_id: u64) -> Vec<super::PortalPendingApproval> {
+        mutex_lock(&self.portals).pending_approvals(workspace_id)
+    }
+
+    pub fn approve(
+        &self,
+        workspace_id: u64,
+        action_id: &MessageId,
+        approval_id: u64,
+        lifetime_ms: u64,
+    ) -> Result<PortalActionReceipt, PortalServiceError> {
+        mutex_lock(&self.portals).approve_action(workspace_id, action_id, approval_id, lifetime_ms)
+    }
+
+    pub fn reject(
+        &self,
+        workspace_id: u64,
+        action_id: &MessageId,
+        approval_id: u64,
+        reason: &str,
+    ) -> Result<PortalActionReceipt, PortalServiceError> {
+        mutex_lock(&self.portals).reject_action(workspace_id, action_id, approval_id, reason)
     }
 }
 
@@ -650,6 +681,22 @@ fn execute_portal_command(
             .observe(credentials.workspace_id, credentials.agent_id, portal_id)
             .map(|result| ProtocolResult::PortalObservation(result.observation))
             .map_err(portal_protocol_error),
+        ProtocolCommand::GetPortalFrame {
+            portal_id,
+            observation_revision,
+            offset,
+            max_bytes,
+        } => portals
+            .frame_chunk(
+                credentials.workspace_id,
+                credentials.agent_id,
+                portal_id,
+                observation_revision,
+                offset,
+                max_bytes,
+            )
+            .map(ProtocolResult::PortalFrame)
+            .map_err(portal_protocol_error),
         ProtocolCommand::RequestPortalAction {
             action_id,
             portal_id,
@@ -737,6 +784,7 @@ fn portal_protocol_error(error: PortalServiceError) -> ProtocolError {
         | PortalServiceError::NotConnected(_)
         | PortalServiceError::UnknownPortal(_) => ErrorCode::PortalUnavailable,
         PortalServiceError::ActionConflict(_) => ErrorCode::IdempotencyConflict,
+        PortalServiceError::StaleFrame { .. } => ErrorCode::StalePortalObservation,
         PortalServiceError::UnknownAction(_) => ErrorCode::UnknownPortalAction,
         PortalServiceError::Policy(crate::portal::PortalPolicyError::Denied(_)) => {
             ErrorCode::PortalPolicyDenied
@@ -751,6 +799,8 @@ fn portal_protocol_error(error: PortalServiceError) -> ProtocolError {
         | PortalServiceError::InvalidAgentId
         | PortalServiceError::InvalidScope
         | PortalServiceError::DuplicatePortal(_)
+        | PortalServiceError::FrameUnavailable(_)
+        | PortalServiceError::InvalidFrameOffset(_)
         | PortalServiceError::ApprovalMismatch { .. }
         | PortalServiceError::Policy(_) => ErrorCode::InvalidRequest,
     };
@@ -807,6 +857,7 @@ fn validate_capabilities(
         | ProtocolCommand::ListPortals
         | ProtocolCommand::InspectPortal { .. }
         | ProtocolCommand::ObservePortal { .. }
+        | ProtocolCommand::GetPortalFrame { .. }
         | ProtocolCommand::RequestPortalAction { .. }
         | ProtocolCommand::GetPortalResult { .. } => {
             unreachable!("read and portal commands are handled before routing")
@@ -904,6 +955,7 @@ fn route_message(
         | ProtocolCommand::ListPortals
         | ProtocolCommand::InspectPortal { .. }
         | ProtocolCommand::ObservePortal { .. }
+        | ProtocolCommand::GetPortalFrame { .. }
         | ProtocolCommand::RequestPortalAction { .. }
         | ProtocolCommand::GetPortalResult { .. } => {
             unreachable!("read and portal commands are handled before routing")

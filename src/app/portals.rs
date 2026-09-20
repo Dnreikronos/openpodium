@@ -6,7 +6,7 @@ use openpodium::domain::{
     CanvasNodeContent, CanvasPoint, CanvasSize, DomainCommand, Node, NodeId, NodeTarget, Workspace,
     WorkspaceId,
 };
-use openpodium::ipc::{PortalControl, PortalScope};
+use openpodium::ipc::{MessageId, PortalControl, PortalPendingApproval, PortalScope};
 use openpodium::portal::{
     AppiumBackend, BrowserBackend, DeviceAvailability, DeviceDiscovery, DeviceDiscoveryReport,
     PortalAction, PortalConfig, PortalFrame, PortalPresentation, PortalTarget, PortalTargetKind,
@@ -41,6 +41,8 @@ pub(super) struct UiState {
     tick: u64,
     discovery: Option<DeviceDiscoveryReport>,
     discovery_busy: bool,
+    approvals: Vec<PortalPendingApproval>,
+    approval_refresh_busy: bool,
 }
 
 impl Default for UiState {
@@ -51,6 +53,8 @@ impl Default for UiState {
             tick: 0,
             discovery: None,
             discovery_busy: false,
+            approvals: Vec::new(),
+            approval_refresh_busy: false,
         }
     }
 }
@@ -85,6 +89,25 @@ pub(super) enum Message {
     ActionCompleted {
         key: PortalKey,
         portal_id: u64,
+        result: Result<(), String>,
+    },
+    ApprovalsLoaded {
+        workspace_id: u64,
+        result: Result<Vec<PortalPendingApproval>, String>,
+    },
+    Approve {
+        workspace_id: u64,
+        action_id: MessageId,
+        approval_id: u64,
+        lifetime_ms: u64,
+    },
+    Reject {
+        workspace_id: u64,
+        action_id: MessageId,
+        approval_id: u64,
+    },
+    ApprovalResolved {
+        action_id: MessageId,
         result: Result<(), String>,
     },
 }
@@ -124,6 +147,38 @@ pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessag
             portal_id,
             result,
         } => action_completed(state, key, portal_id, result),
+        Message::ApprovalsLoaded {
+            workspace_id,
+            result,
+        } => approvals_loaded(state, workspace_id, result),
+        Message::Approve {
+            workspace_id,
+            action_id,
+            approval_id,
+            lifetime_ms,
+        } => resolve_approval(
+            state,
+            workspace_id,
+            action_id,
+            approval_id,
+            Some(lifetime_ms),
+        ),
+        Message::Reject {
+            workspace_id,
+            action_id,
+            approval_id,
+        } => resolve_approval(state, workspace_id, action_id, approval_id, None),
+        Message::ApprovalResolved { action_id, result } => {
+            state
+                .portal_ui
+                .approvals
+                .retain(|approval| approval.action_id != action_id);
+            state.notice = Some(match result {
+                Ok(()) => "Portal action decision recorded".to_owned(),
+                Err(error) => error,
+            });
+            Task::none()
+        }
     }
 }
 
@@ -205,6 +260,29 @@ pub(super) fn tick(state: &mut OpenPodium) -> Task<AppMessage> {
                 AppMessage::Portal(Message::FrameCaptured {
                     key,
                     portal_id,
+                    result,
+                })
+            },
+        ));
+    }
+
+    if state.portal_ui.tick.is_multiple_of(10)
+        && !state.portal_ui.approval_refresh_busy
+        && let Some((workspace_id, control)) = active
+            .as_ref()
+            .zip(control)
+            .map(|((workspace_id, _), control)| (workspace_id.get(), control))
+    {
+        state.portal_ui.approval_refresh_busy = true;
+        tasks.push(Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || control.pending_approvals(workspace_id))
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            move |result| {
+                AppMessage::Portal(Message::ApprovalsLoaded {
+                    workspace_id,
                     result,
                 })
             },
@@ -336,6 +414,9 @@ pub(super) fn creation_view(state: &OpenPodium) -> Element<'_, AppMessage> {
             content = content.push(add);
         }
     }
+    if let Some(approvals) = approval_view(state, None) {
+        content = content.push(approvals);
+    }
     content.into()
 }
 
@@ -359,6 +440,63 @@ pub(super) fn selected_view(state: &OpenPodium) -> Option<Element<'_, AppMessage
             ),
         Some(Phase::Disconnecting { .. }) => content.push(text("Disconnecting browser…")),
     };
+    let content = if let Some(Phase::Connected { portal_id, .. }) =
+        state.portal_ui.sessions.get(&key).map(|live| &live.phase)
+        && let Some(approvals) = approval_view(state, Some(*portal_id))
+    {
+        content.push(approvals)
+    } else {
+        content
+    };
+    Some(content.into())
+}
+
+fn approval_view(state: &OpenPodium, portal_id: Option<u64>) -> Option<Element<'_, AppMessage>> {
+    let approvals = state
+        .portal_ui
+        .approvals
+        .iter()
+        .filter(|approval| portal_id.is_none_or(|portal_id| approval.portal_id == portal_id))
+        .collect::<Vec<_>>();
+    if approvals.is_empty() {
+        return None;
+    }
+    let mut content = column![text("Pending portal actions").size(18)].spacing(8);
+    for approval in approvals {
+        let approve_once = Message::Approve {
+            workspace_id: approval.workspace_id,
+            action_id: approval.action_id.clone(),
+            approval_id: approval.approval_id,
+            lifetime_ms: 1,
+        };
+        let allow_five_minutes = Message::Approve {
+            workspace_id: approval.workspace_id,
+            action_id: approval.action_id.clone(),
+            approval_id: approval.approval_id,
+            lifetime_ms: 5 * 60 * 1_000,
+        };
+        let reject = Message::Reject {
+            workspace_id: approval.workspace_id,
+            action_id: approval.action_id.clone(),
+            approval_id: approval.approval_id,
+        };
+        content = content.push(
+            column![
+                text(format!(
+                    "Agent {} requests {} on {}",
+                    approval.agent_id, approval.operation, approval.target
+                )),
+                text(&approval.reason).size(12),
+                row![
+                    button("Approve once").on_press(AppMessage::Portal(approve_once)),
+                    button("Allow 5 min").on_press(AppMessage::Portal(allow_five_minutes)),
+                    button("Reject").on_press(AppMessage::Portal(reject)),
+                ]
+                .spacing(8),
+            ]
+            .spacing(4),
+        );
+    }
     Some(content.into())
 }
 
@@ -746,6 +884,70 @@ fn action_completed(
     start_action(state, key, portal_id, action)
 }
 
+fn approvals_loaded(
+    state: &mut OpenPodium,
+    workspace_id: u64,
+    result: Result<Vec<PortalPendingApproval>, String>,
+) -> Task<AppMessage> {
+    state.portal_ui.approval_refresh_busy = false;
+    if state
+        .workspaces
+        .as_ref()
+        .and_then(|manager| manager.active_workspace_id())
+        .is_none_or(|active| active.get() != workspace_id)
+    {
+        return Task::none();
+    }
+    match result {
+        Ok(approvals) => state.portal_ui.approvals = approvals,
+        Err(error) => state.notice = Some(error),
+    }
+    Task::none()
+}
+
+fn resolve_approval(
+    state: &mut OpenPodium,
+    workspace_id: u64,
+    action_id: MessageId,
+    approval_id: u64,
+    lifetime_ms: Option<u64>,
+) -> Task<AppMessage> {
+    let Some(control) = state.ipc.as_ref().map(|ipc| ipc.portal_control()) else {
+        state.notice = Some("IPC service is unavailable".to_owned());
+        return Task::none();
+    };
+    state
+        .portal_ui
+        .approvals
+        .retain(|approval| approval.action_id != action_id);
+    let completed_action_id = action_id.clone();
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                if let Some(lifetime_ms) = lifetime_ms {
+                    control
+                        .approve(workspace_id, &action_id, approval_id, lifetime_ms)
+                        .map(|_| ())
+                } else {
+                    control
+                        .reject(workspace_id, &action_id, approval_id, "Rejected by user")
+                        .map(|_| ())
+                }
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+        },
+        move |result| {
+            AppMessage::Portal(Message::ApprovalResolved {
+                action_id: completed_action_id,
+                result,
+            })
+        },
+    )
+}
+
 fn action_at_revision(action: PortalAction, observation_revision: u64) -> PortalAction {
     match action {
         PortalAction::ClickCoordinate { x, y, .. } => PortalAction::ClickCoordinate {
@@ -850,14 +1052,14 @@ fn capture(
         .replace_agents(portal_id, agents)
         .map_err(|error| error.to_string())?;
     let observation = control
-        .observe(portal_id)
+        .capture_frame(portal_id)
         .map_err(|error| error.to_string())?;
-    Ok(observation.core.frame().cloned())
+    Ok(observation)
 }
 
 fn selected_portal(state: &OpenPodium) -> Option<(PortalKey, &PortalConfig)> {
     let workspace = state.workspaces.as_ref()?.active_workspace()?;
-    let node_id = (state.canvas_selection.len() == 1).then_some(state.canvas_selection[0])?;
+    let node_id = single_selection(&state.canvas_selection)?;
     let CanvasNodeContent::Portal(config) = workspace.node(node_id)?.content() else {
         return None;
     };
@@ -868,6 +1070,13 @@ fn selected_portal(state: &OpenPodium) -> Option<(PortalKey, &PortalConfig)> {
         },
         config,
     ))
+}
+
+fn single_selection(selection: &[NodeId]) -> Option<NodeId> {
+    let [node_id] = selection else {
+        return None;
+    };
+    Some(*node_id)
 }
 
 fn session_config_is_active(state: &OpenPodium, key: PortalKey) -> bool {
@@ -940,6 +1149,13 @@ mod tests {
                 y: 20,
             }
         );
+    }
+
+    #[test]
+    fn empty_or_multiple_selection_has_no_selected_portal() {
+        assert_eq!(single_selection(&[]), None);
+        assert_eq!(single_selection(&[NodeId::new(1), NodeId::new(2)]), None);
+        assert_eq!(single_selection(&[NodeId::new(3)]), Some(NodeId::new(3)));
     }
 
     #[test]

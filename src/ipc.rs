@@ -15,14 +15,15 @@ pub use client::{
     TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
 };
 pub use portal::{
-    PortalDispatcher, PortalInspection, PortalObservationResult, PortalScope, PortalServiceError,
+    PortalDispatcher, PortalInspection, PortalObservationResult, PortalPendingApproval,
+    PortalScope, PortalServiceError,
 };
 pub use protocol::{
     AgentCapabilities, AgentDescriptor, Credentials, ErrorCode, HandoffKind, MessageId,
     PortalActionReceipt, PortalActionRequest, PortalActionState, PortalCapability,
-    PortalCapabilityStatus, PortalDescriptor, PortalObservation, PortalPolicyOutcome,
-    PortalTargetKind, ProtocolCommand, ProtocolError, ProtocolRequest, ProtocolResponse,
-    ProtocolResult, ProtocolValidationError, ResponseStatus,
+    PortalCapabilityStatus, PortalDescriptor, PortalFrameChunk, PortalObservation,
+    PortalPolicyOutcome, PortalTargetKind, ProtocolCommand, ProtocolError, ProtocolRequest,
+    ProtocolResponse, ProtocolResult, ProtocolValidationError, ResponseStatus,
 };
 pub use server::{
     AcceptedMessage, AgentRegistration, ConnectionInfo, IpcService, PortalControl, ServiceError,

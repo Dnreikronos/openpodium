@@ -4,12 +4,15 @@ use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+
 use crate::portal::{
     CapabilityStatus, PolicyDecision, PolicyRequest, PortalAction, PortalBackend,
     PortalCapabilities, PortalConfig, PortalObservation as CoreObservation, PortalOperation,
     PortalPolicy, PortalPolicyError, PortalSession, PortalSessionState, PortalTargetKind,
 };
 
+use super::protocol::{MAX_PORTAL_FRAME_CHUNK_BYTES, PortalFrameChunk};
 use super::{
     MessageId, PortalActionReceipt, PortalCapability, PortalCapabilityStatus, PortalDescriptor,
     PortalObservation, PortalTargetKind as WireTargetKind,
@@ -69,6 +72,18 @@ pub struct PortalObservationResult {
     pub core: CoreObservation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortalPendingApproval {
+    pub workspace_id: u64,
+    pub action_id: MessageId,
+    pub portal_id: u64,
+    pub agent_id: u64,
+    pub approval_id: u64,
+    pub operation: String,
+    pub target: String,
+    pub reason: String,
+}
+
 pub struct PortalDispatcher {
     portals: BTreeMap<u64, PortalEntry>,
     next_portal_id: u64,
@@ -82,6 +97,14 @@ struct PendingAction {
     agent_id: u64,
     portal_id: u64,
     approval_id: u64,
+    reason: String,
+    request: PolicyRequest,
+    action: PortalAction,
+}
+
+struct ActionDispatch {
+    agent_id: u64,
+    portal_id: u64,
     request: PolicyRequest,
     action: PortalAction,
 }
@@ -89,6 +112,7 @@ struct PendingAction {
 struct PortalEntry {
     scope: PortalScope,
     config: PortalConfig,
+    runtime_target: String,
     session: PortalSession,
     capabilities: PortalCapabilities,
     attached_agents: BTreeSet<u64>,
@@ -96,6 +120,8 @@ struct PortalEntry {
 }
 
 trait ErasedPortalBackend: Send {
+    fn policy_target(&mut self, config: &PortalConfig) -> Result<String, PortalServiceError>;
+
     fn connect(
         &mut self,
         config: &PortalConfig,
@@ -106,6 +132,11 @@ trait ErasedPortalBackend: Send {
         &mut self,
         session: &mut PortalSession,
     ) -> Result<CoreObservation, PortalServiceError>;
+
+    fn capture_frame(
+        &mut self,
+        session: &PortalSession,
+    ) -> Result<Option<crate::portal::PortalFrame>, PortalServiceError>;
 
     fn execute(
         &mut self,
@@ -123,6 +154,12 @@ where
     B: PortalBackend + Send,
     B::Error: Send + Sync,
 {
+    fn policy_target(&mut self, config: &PortalConfig) -> Result<String, PortalServiceError> {
+        self.0
+            .policy_target(config)
+            .map_err(|error| PortalServiceError::Backend(error.to_string()))
+    }
+
     fn connect(
         &mut self,
         config: &PortalConfig,
@@ -139,6 +176,15 @@ where
     ) -> Result<CoreObservation, PortalServiceError> {
         self.0
             .observe(session)
+            .map_err(|error| PortalServiceError::Backend(error.to_string()))
+    }
+
+    fn capture_frame(
+        &mut self,
+        session: &PortalSession,
+    ) -> Result<Option<crate::portal::PortalFrame>, PortalServiceError> {
+        self.0
+            .capture_frame(session)
             .map_err(|error| PortalServiceError::Backend(error.to_string()))
     }
 
@@ -188,11 +234,13 @@ impl PortalDispatcher {
             return Err(PortalServiceError::DuplicatePortal(portal_id));
         }
         let capabilities = backend.capabilities();
+        let runtime_target = config.target().selector().to_owned();
         self.portals.insert(
             portal_id,
             PortalEntry {
                 scope,
                 config,
+                runtime_target,
                 session: PortalSession::new(1),
                 capabilities,
                 attached_agents: BTreeSet::new(),
@@ -371,6 +419,59 @@ impl PortalDispatcher {
         observe_entry(portal_id, entry)
     }
 
+    pub fn frame_chunk(
+        &self,
+        workspace_id: u64,
+        agent_id: u64,
+        portal_id: u64,
+        observation_revision: u64,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<PortalFrameChunk, PortalServiceError> {
+        let entry = self.authorized_entry(workspace_id, agent_id, portal_id)?;
+        let observation = entry
+            .session
+            .latest_observation()
+            .ok_or(PortalServiceError::FrameUnavailable(portal_id))?;
+        if observation.revision() != observation_revision {
+            return Err(PortalServiceError::StaleFrame {
+                expected: observation.revision(),
+                found: observation_revision,
+            });
+        }
+        let frame = observation
+            .frame()
+            .ok_or(PortalServiceError::FrameUnavailable(portal_id))?;
+        let offset =
+            usize::try_from(offset).map_err(|_| PortalServiceError::InvalidFrameOffset(offset))?;
+        if offset > frame.bytes().len() {
+            return Err(PortalServiceError::InvalidFrameOffset(
+                u64::try_from(offset).unwrap_or(u64::MAX),
+            ));
+        }
+        let chunk_size = usize::try_from(max_bytes.min(MAX_PORTAL_FRAME_CHUNK_BYTES))
+            .expect("frame chunk limit fits in usize");
+        let end = offset.saturating_add(chunk_size).min(frame.bytes().len());
+        let viewport = frame.viewport();
+        Ok(PortalFrameChunk {
+            portal_id,
+            revision: frame.revision(),
+            width: viewport.width(),
+            height: viewport.height(),
+            encoding: match frame.encoding() {
+                crate::portal::PortalFrameEncoding::Png => "png",
+                crate::portal::PortalFrameEncoding::Jpeg => "jpeg",
+                crate::portal::PortalFrameEncoding::Webp => "webp",
+            }
+            .to_owned(),
+            offset: u64::try_from(offset).expect("validated frame offset fits in u64"),
+            total_bytes: u64::try_from(frame.bytes().len()).expect("frame length fits in u64"),
+            data_base64: base64::engine::general_purpose::STANDARD
+                .encode(&frame.bytes()[offset..end]),
+            complete: end == frame.bytes().len(),
+        })
+    }
+
     pub fn observe_local(
         &mut self,
         portal_id: u64,
@@ -380,6 +481,17 @@ impl PortalDispatcher {
             return Err(PortalServiceError::NotConnected(portal_id));
         }
         observe_entry(portal_id, entry)
+    }
+
+    pub fn capture_frame_local(
+        &mut self,
+        portal_id: u64,
+    ) -> Result<Option<crate::portal::PortalFrame>, PortalServiceError> {
+        let entry = self.entry_mut(portal_id)?;
+        if entry.session.state() != PortalSessionState::Connected {
+            return Err(PortalServiceError::NotConnected(portal_id));
+        }
+        entry.backend.capture_frame(&entry.session)
     }
 
     pub fn execute_local(
@@ -427,8 +539,21 @@ impl PortalDispatcher {
         action: PortalAction,
         now_ms: u64,
     ) -> Result<PortalActionReceipt, PortalServiceError> {
+        self.authorized_entry(workspace_id, agent_id, portal_id)?;
+        let fingerprint = action_fingerprint(&action);
+        if let Some(existing) = self.journal.duplicate_receipt(
+            workspace_id,
+            &action_id,
+            agent_id,
+            portal_id,
+            &fingerprint,
+        )? {
+            return Ok(existing);
+        }
+
+        let current_target = self.refresh_runtime_target(portal_id)?;
         let entry = self.authorized_entry(workspace_id, agent_id, portal_id)?;
-        let target = action_target(&action, entry.config.target().selector());
+        let target = action_target(&action, &current_target);
         let request = PolicyRequest::new(
             agent_id,
             portal_id,
@@ -437,17 +562,6 @@ impl PortalDispatcher {
             entry.capabilities.clone(),
         )
         .map_err(PortalServiceError::Policy)?;
-        let fingerprint = action_fingerprint(&action);
-
-        if let Some(existing) = self.journal.receipt(workspace_id, &action_id)? {
-            if existing.portal_id == portal_id && existing.action_id == action_id {
-                return Ok(PortalActionReceipt {
-                    duplicate: true,
-                    ..existing
-                });
-            }
-            return Err(PortalServiceError::ActionConflict(action_id.to_string()));
-        }
 
         let decision = self.policy.evaluate(&request, now_ms);
         match decision {
@@ -472,6 +586,7 @@ impl PortalDispatcher {
                         agent_id,
                         portal_id,
                         approval_id,
+                        reason,
                         request,
                         action,
                     },
@@ -501,7 +616,17 @@ impl PortalDispatcher {
                     policy_detail: None,
                     created_at_ms: now_ms,
                 })?;
-                self.dispatch_action(workspace_id, agent_id, action_id, portal_id, action, now_ms)
+                self.dispatch_action(
+                    workspace_id,
+                    action_id,
+                    ActionDispatch {
+                        agent_id,
+                        portal_id,
+                        request,
+                        action,
+                    },
+                    now_ms,
+                )
             }
         }
     }
@@ -514,6 +639,52 @@ impl PortalDispatcher {
         lifetime_ms: u64,
     ) -> Result<PortalActionReceipt, PortalServiceError> {
         self.approve_action_at(workspace_id, action_id, approval_id, lifetime_ms, now_ms())
+    }
+
+    pub fn pending_approvals(&self, workspace_id: u64) -> Vec<PortalPendingApproval> {
+        self.pending_actions
+            .iter()
+            .filter(|((pending_workspace_id, _), _)| *pending_workspace_id == workspace_id)
+            .map(|((_, action_id), pending)| PortalPendingApproval {
+                workspace_id,
+                action_id: action_id.clone(),
+                portal_id: pending.portal_id,
+                agent_id: pending.agent_id,
+                approval_id: pending.approval_id,
+                operation: operation_name(pending.request.operation()).to_owned(),
+                target: pending.request.target().to_owned(),
+                reason: pending.reason.clone(),
+            })
+            .collect()
+    }
+
+    pub fn reject_action(
+        &mut self,
+        workspace_id: u64,
+        action_id: &MessageId,
+        approval_id: u64,
+        reason: &str,
+    ) -> Result<PortalActionReceipt, PortalServiceError> {
+        let key = (workspace_id, action_id.clone());
+        let pending = self
+            .pending_actions
+            .get(&key)
+            .ok_or_else(|| PortalServiceError::PendingActionUnavailable(action_id.to_string()))?;
+        if pending.approval_id != approval_id {
+            return Err(PortalServiceError::ApprovalMismatch {
+                expected: pending.approval_id,
+                found: approval_id,
+            });
+        }
+        self.policy
+            .reject(approval_id)
+            .map_err(PortalServiceError::Policy)?;
+        self.pending_actions.remove(&key);
+        self.journal
+            .mark_rejected(workspace_id, action_id, reason, now_ms())?;
+        self.journal
+            .receipt(workspace_id, action_id)?
+            .ok_or_else(|| PortalServiceError::MissingReceipt(action_id.to_string()))
     }
 
     pub fn approve_action_at(
@@ -536,12 +707,14 @@ impl PortalDispatcher {
             });
         }
 
+        self.authorized_entry(workspace_id, pending.agent_id, pending.portal_id)?;
+        let current_target = self.refresh_runtime_target(pending.portal_id)?;
         let entry = self.authorized_entry(workspace_id, pending.agent_id, pending.portal_id)?;
         let current_request = PolicyRequest::new(
             pending.agent_id,
             pending.portal_id,
             operation_for(&pending.action),
-            action_target(&pending.action, entry.config.target().selector()),
+            action_target(&pending.action, &current_target),
             entry.capabilities.clone(),
         )
         .map_err(PortalServiceError::Policy)?;
@@ -555,10 +728,13 @@ impl PortalDispatcher {
         self.pending_actions.remove(&key);
         self.dispatch_action(
             workspace_id,
-            pending.agent_id,
             action_id.clone(),
-            pending.portal_id,
-            pending.action,
+            ActionDispatch {
+                agent_id: pending.agent_id,
+                portal_id: pending.portal_id,
+                request: current_request,
+                action: pending.action,
+            },
             now_ms,
         )
     }
@@ -590,12 +766,39 @@ impl PortalDispatcher {
     fn dispatch_action(
         &mut self,
         workspace_id: u64,
-        agent_id: u64,
         action_id: MessageId,
-        portal_id: u64,
-        action: PortalAction,
+        dispatch: ActionDispatch,
         now_ms: u64,
     ) -> Result<PortalActionReceipt, PortalServiceError> {
+        let ActionDispatch {
+            agent_id,
+            portal_id,
+            request: expected_request,
+            action,
+        } = dispatch;
+        let current_target = self.refresh_runtime_target(portal_id)?;
+        let entry = self.authorized_entry(workspace_id, agent_id, portal_id)?;
+        let current_request = PolicyRequest::new(
+            agent_id,
+            portal_id,
+            operation_for(&action),
+            action_target(&action, &current_target),
+            entry.capabilities.clone(),
+        )
+        .map_err(PortalServiceError::Policy)?;
+        if current_request != expected_request {
+            self.journal.finish(
+                workspace_id,
+                &action_id,
+                "failed",
+                Some("portal target changed before dispatch".to_owned()),
+                now_ms,
+            )?;
+            return self
+                .journal
+                .receipt(workspace_id, &action_id)?
+                .ok_or_else(|| PortalServiceError::MissingReceipt(action_id.to_string()));
+        }
         self.journal
             .mark_dispatched(workspace_id, &action_id, now_ms)?;
         let entry = self.authorized_entry_mut(workspace_id, agent_id, portal_id)?;
@@ -621,6 +824,22 @@ impl PortalDispatcher {
         self.portals
             .get_mut(&portal_id)
             .ok_or(PortalServiceError::UnknownPortal(portal_id))
+    }
+
+    fn refresh_runtime_target(&mut self, portal_id: u64) -> Result<String, PortalServiceError> {
+        let (target, changed) = {
+            let entry = self.entry_mut(portal_id)?;
+            let target = entry.backend.policy_target(&entry.config)?;
+            let changed = target != entry.runtime_target;
+            if changed {
+                entry.runtime_target.clone_from(&target);
+            }
+            (target, changed)
+        };
+        if changed {
+            self.policy.revoke_portal_grants(portal_id);
+        }
+        Ok(target)
     }
 
     fn authorized_entry(
@@ -814,6 +1033,9 @@ pub enum PortalServiceError {
     MissingReceipt(String),
     PendingActionUnavailable(String),
     ApprovalMismatch { expected: u64, found: u64 },
+    FrameUnavailable(u64),
+    StaleFrame { expected: u64, found: u64 },
+    InvalidFrameOffset(u64),
     Journal(String),
 }
 
@@ -864,6 +1086,22 @@ impl Display for PortalServiceError {
                 formatter,
                 "portal approval changed: expected {expected}, found {found}"
             ),
+            Self::FrameUnavailable(id) => {
+                write!(
+                    formatter,
+                    "portal {id} has no frame for its latest observation"
+                )
+            }
+            Self::StaleFrame { expected, found } => write!(
+                formatter,
+                "portal frame revision is stale: expected {expected}, found {found}"
+            ),
+            Self::InvalidFrameOffset(offset) => {
+                write!(
+                    formatter,
+                    "portal frame offset {offset} is outside the frame"
+                )
+            }
             Self::Journal(message) => write!(formatter, "portal action journal failed: {message}"),
         }
     }
@@ -873,6 +1111,7 @@ impl Error for PortalServiceError {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     use tempfile::TempDir;
@@ -884,9 +1123,21 @@ mod tests {
         PortalViewport,
     };
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct FakeBackend {
         executed: Arc<Mutex<Vec<PortalAction>>>,
+        target: Arc<Mutex<String>>,
+        target_queries: Arc<Mutex<VecDeque<String>>>,
+    }
+
+    impl Default for FakeBackend {
+        fn default() -> Self {
+            Self {
+                executed: Arc::default(),
+                target: Arc::new(Mutex::new("https://example.test".to_owned())),
+                target_queries: Arc::default(),
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -902,6 +1153,13 @@ mod tests {
 
     impl PortalBackend for FakeBackend {
         type Error = FakeError;
+
+        fn policy_target(&mut self, _config: &PortalConfig) -> Result<String, Self::Error> {
+            if let Some(target) = self.target_queries.lock().unwrap().pop_front() {
+                self.target.lock().unwrap().clone_from(&target);
+            }
+            Ok(self.target.lock().unwrap().clone())
+        }
 
         fn connect(
             &mut self,
@@ -920,7 +1178,7 @@ mod tests {
                         revision,
                         PortalViewport::new(10, 10).unwrap(),
                         PortalFrameEncoding::Png,
-                        vec![1],
+                        vec![1, 2, 3, 4],
                     )
                     .unwrap(),
                 );
@@ -930,11 +1188,29 @@ mod tests {
             Ok(observation)
         }
 
+        fn capture_frame(
+            &mut self,
+            session: &PortalSession,
+        ) -> Result<Option<PortalFrame>, Self::Error> {
+            Ok(Some(
+                PortalFrame::new(
+                    session.observation_revision(),
+                    PortalViewport::new(10, 10).unwrap(),
+                    PortalFrameEncoding::Png,
+                    vec![2],
+                )
+                .unwrap(),
+            ))
+        }
+
         fn execute(
             &mut self,
             _session: &mut PortalSession,
             action: &PortalAction,
         ) -> Result<(), Self::Error> {
+            if let PortalAction::Navigate(target) = action {
+                self.target.lock().unwrap().clone_from(target);
+            }
             self.executed.lock().unwrap().push(action.clone());
             Ok(())
         }
@@ -950,6 +1226,7 @@ mod tests {
         let executed = Arc::new(Mutex::new(Vec::new()));
         let backend = FakeBackend {
             executed: Arc::clone(&executed),
+            ..FakeBackend::default()
         };
         let config = PortalConfig::browser("https://example.test").unwrap();
         let mut dispatcher = PortalDispatcher::open(temp.path()).unwrap();
@@ -1065,6 +1342,53 @@ mod tests {
     }
 
     #[test]
+    fn local_frame_refresh_preserves_agent_observation_revision() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, _) = dispatcher(&temp);
+        let observation = dispatcher.observe(4, 7, 10).unwrap();
+
+        let frame = dispatcher.capture_frame_local(10).unwrap().unwrap();
+
+        assert_eq!(frame.revision(), observation.observation.revision);
+        assert_eq!(
+            dispatcher
+                .portals
+                .get(&10)
+                .unwrap()
+                .session
+                .observation_revision(),
+            observation.observation.revision
+        );
+    }
+
+    #[test]
+    fn authenticated_frame_retrieval_is_revision_bound_and_chunked() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, _) = dispatcher(&temp);
+        let observation = dispatcher.observe(4, 7, 10).unwrap();
+
+        let first = dispatcher
+            .frame_chunk(4, 7, 10, observation.observation.revision, 0, 2)
+            .unwrap();
+        let second = dispatcher
+            .frame_chunk(4, 7, 10, observation.observation.revision, 2, 2)
+            .unwrap();
+
+        assert_eq!(first.data_base64, "AQI=");
+        assert!(!first.complete);
+        assert_eq!(second.data_base64, "AwQ=");
+        assert!(second.complete);
+        assert!(matches!(
+            dispatcher.frame_chunk(4, 8, 10, observation.observation.revision, 0, 2),
+            Err(PortalServiceError::AgentNotAttached { .. })
+        ));
+        assert!(matches!(
+            dispatcher.frame_chunk(4, 7, 10, observation.observation.revision + 1, 0, 2),
+            Err(PortalServiceError::StaleFrame { .. })
+        ));
+    }
+
+    #[test]
     fn agent_coordinate_input_requires_fallback_approval() {
         let temp = TempDir::new().unwrap();
         let (mut dispatcher, executed) = dispatcher(&temp);
@@ -1089,6 +1413,193 @@ mod tests {
             .approve_action_at(4, &action_id, approval_id, 1_000, 101)
             .unwrap();
         assert_eq!(executed.lock().unwrap().as_slice(), &[action]);
+    }
+
+    #[test]
+    fn pending_action_can_be_inspected_and_rejected_by_the_desktop() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, executed) = dispatcher(&temp);
+        let observation = dispatcher.observe(4, 7, 10).unwrap();
+        let action_id = MessageId::new("reject-me").unwrap();
+        let receipt = dispatcher
+            .request_action_at(
+                4,
+                7,
+                action_id.clone(),
+                10,
+                PortalAction::Click(
+                    PortalElementRef::new(observation.observation.revision, "delete").unwrap(),
+                ),
+                100,
+            )
+            .unwrap();
+        let approval_id = match receipt.policy {
+            PortalPolicyOutcome::ApprovalRequired { approval_id, .. } => approval_id,
+            policy => panic!("unexpected policy outcome: {policy:?}"),
+        };
+
+        let pending = dispatcher.pending_approvals(4);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].action_id, action_id);
+        assert_eq!(pending[0].operation, "input");
+
+        let rejected = dispatcher
+            .reject_action(4, &action_id, approval_id, "Rejected by user")
+            .unwrap();
+
+        assert_eq!(rejected.state, PortalActionState::Failed);
+        assert_eq!(
+            rejected.policy,
+            PortalPolicyOutcome::Denied {
+                reason: "Rejected by user".to_owned()
+            }
+        );
+        assert!(dispatcher.pending_approvals(4).is_empty());
+        assert!(executed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn conflicting_action_id_reuse_is_rejected_before_policy_evaluation() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, _) = dispatcher(&temp);
+        let observation = dispatcher.observe(4, 7, 10).unwrap();
+        let action_id = MessageId::new("conflicting-action").unwrap();
+        dispatcher
+            .request_action_at(
+                4,
+                7,
+                action_id.clone(),
+                10,
+                PortalAction::Click(
+                    PortalElementRef::new(observation.observation.revision, "first").unwrap(),
+                ),
+                100,
+            )
+            .unwrap();
+
+        let conflict = dispatcher.request_action_at(
+            4,
+            7,
+            action_id,
+            10,
+            PortalAction::Click(
+                PortalElementRef::new(observation.observation.revision, "second").unwrap(),
+            ),
+            101,
+        );
+
+        assert!(matches!(
+            conflict,
+            Err(PortalServiceError::ActionConflict(_))
+        ));
+    }
+
+    #[test]
+    fn browser_target_change_requires_a_new_input_grant() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, _) = dispatcher(&temp);
+        let observation = dispatcher.observe(4, 7, 10).unwrap();
+        let click_id = MessageId::new("click-site-a").unwrap();
+        let click = PortalAction::Click(
+            PortalElementRef::new(observation.observation.revision, "submit").unwrap(),
+        );
+        let click_receipt = dispatcher
+            .request_action_at(4, 7, click_id.clone(), 10, click.clone(), 100)
+            .unwrap();
+        let click_approval = match click_receipt.policy {
+            PortalPolicyOutcome::ApprovalRequired { approval_id, .. } => approval_id,
+            policy => panic!("unexpected policy outcome: {policy:?}"),
+        };
+        dispatcher
+            .approve_action_at(4, &click_id, click_approval, 10_000, 101)
+            .unwrap();
+
+        let navigation_id = MessageId::new("navigate-site-b").unwrap();
+        let navigation_receipt = dispatcher
+            .request_action_at(
+                4,
+                7,
+                navigation_id.clone(),
+                10,
+                PortalAction::Navigate("https://other.test".to_owned()),
+                102,
+            )
+            .unwrap();
+        let navigation_approval = match navigation_receipt.policy {
+            PortalPolicyOutcome::ApprovalRequired { approval_id, .. } => approval_id,
+            policy => panic!("unexpected policy outcome: {policy:?}"),
+        };
+        dispatcher
+            .approve_action_at(4, &navigation_id, navigation_approval, 10_000, 103)
+            .unwrap();
+
+        let receipt = dispatcher
+            .request_action_at(
+                4,
+                7,
+                MessageId::new("click-site-b").unwrap(),
+                10,
+                click,
+                104,
+            )
+            .unwrap();
+
+        assert_eq!(receipt.state, PortalActionState::AwaitingApproval);
+    }
+
+    #[test]
+    fn target_is_rechecked_immediately_before_dispatch() {
+        let temp = TempDir::new().unwrap();
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeBackend {
+            executed: Arc::clone(&executed),
+            target_queries: Arc::new(Mutex::new(VecDeque::from([
+                "https://example.test".to_owned(),
+                "https://example.test".to_owned(),
+                "https://other.test".to_owned(),
+            ]))),
+            ..FakeBackend::default()
+        };
+        let mut dispatcher = PortalDispatcher::open(temp.path()).unwrap();
+        dispatcher
+            .register(
+                10,
+                PortalScope::new(4, Some(2), 99).unwrap(),
+                PortalConfig::browser("https://example.test").unwrap(),
+                backend,
+            )
+            .unwrap();
+        dispatcher.attach_agent(10, 7).unwrap();
+        dispatcher.connect(10).unwrap();
+        let observation = dispatcher.observe(4, 7, 10).unwrap();
+
+        let action_id = MessageId::new("target-race").unwrap();
+        let pending = dispatcher
+            .request_action_at(
+                4,
+                7,
+                action_id.clone(),
+                10,
+                PortalAction::Click(
+                    PortalElementRef::new(observation.observation.revision, "submit").unwrap(),
+                ),
+                100,
+            )
+            .unwrap();
+        let approval_id = match pending.policy {
+            PortalPolicyOutcome::ApprovalRequired { approval_id, .. } => approval_id,
+            policy => panic!("unexpected policy outcome: {policy:?}"),
+        };
+        let receipt = dispatcher
+            .approve_action_at(4, &action_id, approval_id, 1_000, 101)
+            .unwrap();
+
+        assert_eq!(receipt.state, PortalActionState::Failed);
+        assert_eq!(
+            receipt.outcome.as_deref(),
+            Some("portal target changed before dispatch")
+        );
+        assert!(executed.lock().unwrap().is_empty());
     }
 
     #[test]

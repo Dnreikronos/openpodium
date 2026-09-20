@@ -10,6 +10,7 @@ const MAX_TITLE_CHARS: usize = 255;
 const MAX_BODY_CHARS: usize = 32_768;
 const MAX_PORTAL_TARGET_CHARS: usize = 2_048;
 const MAX_PORTAL_ELEMENT_CHARS: usize = 256;
+pub(crate) const MAX_PORTAL_FRAME_CHUNK_BYTES: u32 = 512 * 1024;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -111,6 +112,12 @@ pub enum ProtocolCommand {
     ObservePortal {
         portal_id: u64,
     },
+    GetPortalFrame {
+        portal_id: u64,
+        observation_revision: u64,
+        offset: u64,
+        max_bytes: u32,
+    },
     RequestPortalAction {
         action_id: MessageId,
         portal_id: u64,
@@ -170,7 +177,10 @@ impl ProtocolCommand {
     pub fn message_id(&self) -> Option<&MessageId> {
         match self {
             Self::ListAgents => None,
-            Self::ListPortals | Self::InspectPortal { .. } | Self::ObservePortal { .. } => None,
+            Self::ListPortals
+            | Self::InspectPortal { .. }
+            | Self::ObservePortal { .. }
+            | Self::GetPortalFrame { .. } => None,
             Self::RequestPortalAction { action_id, .. } => Some(action_id),
             Self::GetPortalResult { .. } => None,
             Self::SendTask { message_id, .. }
@@ -196,6 +206,7 @@ impl ProtocolCommand {
             Self::ListPortals
             | Self::InspectPortal { .. }
             | Self::ObservePortal { .. }
+            | Self::GetPortalFrame { .. }
             | Self::RequestPortalAction { .. }
             | Self::GetPortalResult { .. } => 3,
         }
@@ -207,6 +218,7 @@ impl ProtocolCommand {
             Self::ListPortals
                 | Self::InspectPortal { .. }
                 | Self::ObservePortal { .. }
+                | Self::GetPortalFrame { .. }
                 | Self::RequestPortalAction { .. }
                 | Self::GetPortalResult { .. }
         )
@@ -218,6 +230,21 @@ impl ProtocolCommand {
             Self::ListPortals => Ok(()),
             Self::InspectPortal { portal_id } | Self::ObservePortal { portal_id } => {
                 validate_portal_id(*portal_id)
+            }
+            Self::GetPortalFrame {
+                portal_id,
+                observation_revision,
+                max_bytes,
+                ..
+            } => {
+                validate_portal_id(*portal_id)?;
+                if *observation_revision == 0 {
+                    return Err(ProtocolValidationError::InvalidObservationRevision);
+                }
+                if *max_bytes == 0 || *max_bytes > MAX_PORTAL_FRAME_CHUNK_BYTES {
+                    return Err(ProtocolValidationError::InvalidPortalFrameChunk);
+                }
+                Ok(())
             }
             Self::RequestPortalAction {
                 portal_id, action, ..
@@ -496,6 +523,19 @@ pub struct PortalObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalFrameChunk {
+    pub portal_id: u64,
+    pub revision: u64,
+    pub width: u32,
+    pub height: u32,
+    pub encoding: String,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub data_base64: String,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PortalActionState {
     Queued,
@@ -584,6 +624,7 @@ pub enum ProtocolResult {
         capabilities: Vec<PortalCapability>,
     },
     PortalObservation(PortalObservation),
+    PortalFrame(PortalFrameChunk),
     PortalReceipt(PortalActionReceipt),
     Accepted {
         message_id: MessageId,
@@ -641,6 +682,7 @@ pub enum ProtocolValidationError {
     InvalidAgentId,
     InvalidPortalId,
     InvalidObservationRevision,
+    InvalidPortalFrameChunk,
     EmptyPortalScroll,
     MissingTaskTitle,
     UnexpectedQuestionTitle,
@@ -668,6 +710,10 @@ impl Display for ProtocolValidationError {
             Self::InvalidObservationRevision => {
                 formatter.write_str("portal observation revision must be greater than zero")
             }
+            Self::InvalidPortalFrameChunk => write!(
+                formatter,
+                "portal frame chunk size must be between 1 and {MAX_PORTAL_FRAME_CHUNK_BYTES} bytes"
+            ),
             Self::EmptyPortalScroll => {
                 formatter.write_str("portal scroll must move along at least one axis")
             }
@@ -801,6 +847,25 @@ mod tests {
         };
         assert_eq!(action.minimum_version(), 3);
         assert_eq!(action.validate(), Ok(()));
+
+        let frame = ProtocolCommand::GetPortalFrame {
+            portal_id: 9,
+            observation_revision: 4,
+            offset: 0,
+            max_bytes: MAX_PORTAL_FRAME_CHUNK_BYTES,
+        };
+        assert_eq!(frame.minimum_version(), 3);
+        assert_eq!(frame.validate(), Ok(()));
+        assert_eq!(
+            ProtocolCommand::GetPortalFrame {
+                portal_id: 9,
+                observation_revision: 4,
+                offset: 0,
+                max_bytes: MAX_PORTAL_FRAME_CHUNK_BYTES + 1,
+            }
+            .validate(),
+            Err(ProtocolValidationError::InvalidPortalFrameChunk)
+        );
 
         let encoded = serde_json::to_string(&action).unwrap();
         assert!(encoded.contains("request_portal_action"));

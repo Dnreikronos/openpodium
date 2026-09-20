@@ -9,8 +9,8 @@ use crate::ipc::{
     PortalPolicyOutcome, PortalScope, ResponseStatus,
 };
 use crate::portal::{
-    PortalAction as CoreAction, PortalBackend, PortalCapabilities, PortalConfig,
-    PortalObservation as CoreObservation, PortalSession,
+    PortalAction as CoreAction, PortalBackend, PortalCapabilities, PortalConfig, PortalFrame,
+    PortalFrameEncoding, PortalObservation as CoreObservation, PortalSession, PortalViewport,
 };
 
 fn registration(id: u64, name: &str) -> AgentRegistration {
@@ -77,7 +77,16 @@ impl PortalBackend for RecordingPortalBackend {
 
     fn observe(&mut self, session: &mut PortalSession) -> Result<CoreObservation, Self::Error> {
         let revision = session.observe().unwrap();
-        let observation = CoreObservation::new(revision, PortalCapabilities::browser_defaults());
+        let observation = CoreObservation::new(revision, PortalCapabilities::browser_defaults())
+            .with_frame(
+                PortalFrame::new(
+                    revision,
+                    PortalViewport::new(2, 2).unwrap(),
+                    PortalFrameEncoding::Png,
+                    vec![1, 2, 3, 4],
+                )
+                .unwrap(),
+            );
         session.record_observation(observation.clone()).unwrap();
         Ok(observation)
     }
@@ -209,6 +218,27 @@ fn portal_action_flows_from_observation_through_approval_to_receipt() {
     let Some(ProtocolResult::PortalObservation(observation)) = observed.result else {
         panic!("expected a portal observation: {observed:?}");
     };
+
+    let frame = round_trip(
+        service.endpoint(),
+        &request(
+            &service,
+            1,
+            1,
+            "portal-frame",
+            ProtocolCommand::GetPortalFrame {
+                portal_id: 10,
+                observation_revision: observation.revision,
+                offset: 0,
+                max_bytes: 2,
+            },
+        ),
+    );
+    assert!(matches!(
+        frame.result,
+        Some(ProtocolResult::PortalFrame(chunk))
+            if chunk.data_base64 == "AQI=" && !chunk.complete && chunk.total_bytes == 4
+    ));
 
     let action_id = MessageId::new("portal-action-1").unwrap();
     let requested = round_trip(

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
 
+use super::protocol::MAX_PORTAL_FRAME_CHUNK_BYTES;
 use super::{
     ClientError, ConnectionConfig, ErrorCode, HandoffKind, IpcClient, MessageId,
     PortalActionRequest, ProtocolCommand, ProtocolResponse, ResponseStatus,
@@ -20,6 +21,7 @@ const USAGE: &str = "Usage:
   openpodium ipc portals list
   openpodium ipc portal inspect --portal <portal-id>
   openpodium ipc portal observe --portal <portal-id>
+  openpodium ipc portal frame --portal <portal-id> --revision <revision> [--offset <bytes>] [--max-bytes <bytes>]
   openpodium ipc portal click --portal <portal-id> --element <element-id> --revision <revision> [--action-id <id>]
   openpodium ipc portal click-coordinate --portal <portal-id> --x <pixels> --y <pixels> --revision <revision> [--action-id <id>]
   openpodium ipc portal type --portal <portal-id> --element <element-id> --revision <revision> --text <text> [--action-id <id>]
@@ -124,6 +126,19 @@ fn parse_command(arguments: &[String]) -> Result<ProtocolCommand, CliUsageError>
             let options = parse_options(options, &["--portal"])?;
             Ok(ProtocolCommand::ObservePortal {
                 portal_id: portal_id(&options)?,
+            })
+        }
+        ["ipc", "portal", "frame", options @ ..] => {
+            let options = parse_options(
+                options,
+                &["--portal", "--revision", "--offset", "--max-bytes"],
+            )?;
+            Ok(ProtocolCommand::GetPortalFrame {
+                portal_id: portal_id(&options)?,
+                observation_revision: positive_u64(&options, "--revision", "revision")?,
+                offset: optional_unsigned_u64(&options, "--offset")?.unwrap_or(0),
+                max_bytes: optional_positive_u32(&options, "--max-bytes")?
+                    .unwrap_or(MAX_PORTAL_FRAME_CHUNK_BYTES),
             })
         }
         ["ipc", "portal", "click", options @ ..] => {
@@ -401,6 +416,36 @@ fn unsigned_u32(options: &BTreeMap<&str, &str>, name: &str) -> Result<u32, CliUs
         .map_err(|_| CliUsageError(format!("{name} must be a non-negative 32-bit integer")))
 }
 
+fn optional_unsigned_u64(
+    options: &BTreeMap<&str, &str>,
+    name: &str,
+) -> Result<Option<u64>, CliUsageError> {
+    options
+        .get(name)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| CliUsageError(format!("{name} must be a non-negative integer")))
+        })
+        .transpose()
+}
+
+fn optional_positive_u32(
+    options: &BTreeMap<&str, &str>,
+    name: &str,
+) -> Result<Option<u32>, CliUsageError> {
+    options
+        .get(name)
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| CliUsageError(format!("{name} must be a positive 32-bit integer")))
+        })
+        .transpose()
+}
+
 fn recipient_id(options: &BTreeMap<&str, &str>) -> Result<u64, CliUsageError> {
     required(options, "--to")?
         .parse::<u64>()
@@ -626,6 +671,28 @@ mod tests {
         assert_eq!(
             parse_command(&arguments(&["ipc", "portal", "observe", "--portal", "9"])).unwrap(),
             ProtocolCommand::ObservePortal { portal_id: 9 }
+        );
+        assert_eq!(
+            parse_command(&arguments(&[
+                "ipc",
+                "portal",
+                "frame",
+                "--portal",
+                "9",
+                "--revision",
+                "4",
+                "--offset",
+                "512",
+                "--max-bytes",
+                "4096",
+            ]))
+            .unwrap(),
+            ProtocolCommand::GetPortalFrame {
+                portal_id: 9,
+                observation_revision: 4,
+                offset: 512,
+                max_bytes: 4096,
+            }
         );
         assert_eq!(
             parse_command(&arguments(&[

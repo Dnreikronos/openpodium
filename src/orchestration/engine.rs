@@ -246,6 +246,7 @@ impl Orchestrator {
             | ProtocolCommand::ListPortals
             | ProtocolCommand::InspectPortal { .. }
             | ProtocolCommand::ObservePortal { .. }
+            | ProtocolCommand::GetPortalFrame { .. }
             | ProtocolCommand::RequestPortalAction { .. }
             | ProtocolCommand::GetPortalResult { .. } => Err(OrchestrationError::InvalidMessage(
                 "agent-list and portal requests do not enter the orchestration queue".to_owned(),
