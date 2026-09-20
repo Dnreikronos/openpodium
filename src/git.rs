@@ -3,6 +3,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod changes;
+mod integration;
+
+pub use changes::{
+    ChangeKind, ChangedPath, Collision, CollisionReport, CollisionSeverity, RepoPath,
+    WorktreeInventory,
+};
+pub use integration::{
+    CommitPreview, IntegrationAction, IntegrationError, IntegrationOutcome, IntegrationPreview,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkout {
     pub path: PathBuf,
@@ -246,10 +257,7 @@ impl Repository {
 }
 
 fn is_ancestor(root: &Path, head: &str, target: &str) -> Result<bool, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dunce::simplified(root))
-        .args(["merge-base", "--is-ancestor", head, target])
+    let output = git_command(root, &["merge-base", "--is-ancestor", head, target])
         .output()
         .map_err(|e| e.to_string())?;
     match output.status.code() {
@@ -260,17 +268,23 @@ fn is_ancestor(root: &Path, head: &str, target: &str) -> Result<bool, String> {
 }
 
 fn run(directory: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dunce::simplified(directory))
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let output = git_command(directory, args)
         .output()
         .map_err(|e| format!("Cannot run Git: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
     String::from_utf8(output.stdout).map_err(|_| "Git returned a non-Unicode path".to_owned())
+}
+
+pub(super) fn git_command(directory: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(dunce::simplified(directory))
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
 }
 
 #[cfg(test)]

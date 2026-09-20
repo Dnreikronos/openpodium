@@ -159,3 +159,131 @@ fn canonicalized_paths_support_discovery_creation_and_cleanup() {
     repo.remove(&checkout, true, "main", false).unwrap();
     assert!(!checkout.path.exists());
 }
+
+#[test]
+fn collision_report_handles_ignored_renamed_and_deleted_paths() {
+    let (directory, repo) = repository();
+    std::fs::write(directory.path().join("shared"), "base\n").unwrap();
+    std::fs::write(directory.path().join("removed"), "base\n").unwrap();
+    std::fs::write(directory.path().join(".gitignore"), "generated\n").unwrap();
+    run(directory.path(), &["add", "."]).unwrap();
+    run(
+        directory.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "files"],
+    )
+    .unwrap();
+
+    let parent = tempfile::tempdir().unwrap();
+    let left = repo.create("left", "left", parent.path()).unwrap();
+    let right = repo.create("right", "right", parent.path()).unwrap();
+    std::fs::write(left.path.join("shared"), "left\n").unwrap();
+    std::fs::rename(left.path.join("removed"), left.path.join("renamed")).unwrap();
+    std::fs::write(left.path.join("generated"), "ignored\n").unwrap();
+    std::fs::write(right.path.join("shared"), "right\n").unwrap();
+    std::fs::remove_file(right.path.join("removed")).unwrap();
+
+    let report = repo
+        .collision_report(&[left.clone(), right.clone()])
+        .unwrap();
+    let paths = report
+        .collisions
+        .iter()
+        .map(|collision| collision.path.display())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["removed", "shared"]);
+    assert!(
+        report
+            .inventories
+            .iter()
+            .flat_map(|inventory| &inventory.paths)
+            .all(|change| change.path.display() != "generated")
+    );
+    assert_eq!(
+        report.severity_for(&left.path),
+        Some(CollisionSeverity::Warning)
+    );
+}
+
+#[test]
+fn previews_reject_stale_state_and_integrate_explicit_choices() {
+    let (directory, repo) = repository();
+    std::fs::write(directory.path().join("file"), "base\n").unwrap();
+    run(directory.path(), &["add", "file"]).unwrap();
+    run(
+        directory.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "base"],
+    )
+    .unwrap();
+    let target = repo.checkouts().unwrap().remove(0);
+    let parent = tempfile::tempdir().unwrap();
+    let source = repo.create("source", "source", parent.path()).unwrap();
+    std::fs::write(source.path.join("source-file"), "source\n").unwrap();
+    run(&source.path, &["add", "source-file"]).unwrap();
+    run(
+        &source.path,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "source"],
+    )
+    .unwrap();
+
+    let preview = repo.preview_integration(&source, &target).unwrap();
+    assert_eq!(preview.commits.len(), 1);
+    assert!(preview.blocker(IntegrationAction::Merge).is_none());
+    std::fs::write(directory.path().join("untracked"), "changed\n").unwrap();
+    let error = repo
+        .integrate(&preview, IntegrationAction::Merge)
+        .unwrap_err();
+    assert!(error.message.contains("stale"));
+    std::fs::remove_file(directory.path().join("untracked")).unwrap();
+
+    let preview = repo.preview_integration(&source, &target).unwrap();
+    let outcome = repo
+        .integrate(&preview, IntegrationAction::CherryPick)
+        .unwrap();
+    assert_eq!(outcome.checkout, target.path);
+    assert!(directory.path().join("source-file").exists());
+
+    let preview = repo
+        .preview_integration(&source, &repo.checkouts().unwrap()[0])
+        .unwrap();
+    let outcome = repo
+        .integrate(&preview, IntegrationAction::LeaveAlone)
+        .unwrap();
+    assert!(outcome.message.contains("unchanged"));
+}
+
+#[test]
+fn failed_merge_keeps_recoverable_git_state() {
+    let (directory, repo) = repository();
+    std::fs::write(directory.path().join("shared"), "base\n").unwrap();
+    run(directory.path(), &["add", "shared"]).unwrap();
+    run(
+        directory.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "base"],
+    )
+    .unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let source = repo.create("source", "source", parent.path()).unwrap();
+    std::fs::write(source.path.join("shared"), "source\n").unwrap();
+    run(&source.path, &["add", "shared"]).unwrap();
+    run(
+        &source.path,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "source"],
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("shared"), "target\n").unwrap();
+    run(directory.path(), &["add", "shared"]).unwrap();
+    run(
+        directory.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "target"],
+    )
+    .unwrap();
+    let target = repo.checkouts().unwrap().remove(0);
+    let preview = repo.preview_integration(&source, &target).unwrap();
+    assert_eq!(preview.likely_conflicts[0].display(), "shared");
+    let error = repo
+        .integrate(&preview, IntegrationAction::Merge)
+        .unwrap_err();
+    assert!(error.guidance.contains("git merge --abort"));
+    assert!(directory.path().join(".git/MERGE_HEAD").exists());
+    run(directory.path(), &["merge", "--abort"]).unwrap();
+}
