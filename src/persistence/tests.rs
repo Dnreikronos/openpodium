@@ -11,11 +11,15 @@ use crate::domain::{
     Connection as DomainConnection, ConnectionId, ConnectionKind, Content, DeliveryMechanism,
     DiffComparison, DomainCommand, DomainEvent, EnvironmentKind, EnvironmentProfile,
     EnvironmentProfileId, Freehand, Handoff, HandoffId, HandoffMessageId, HandoffOrigin,
-    HandoffPayload,
-    HandoffProgress, HandoffResponse, HandoffResponseStatus, Name, Node, NodeGroup, NodeGroupId,
-    NodeId, NodeTarget, NormalizedPoint, PortalConfig, ProjectPath, Role, RoleColor, RoleIcon,
-    RoleId, Shape, ShapeKind, SshEnvironment, StrokeWidth, Task, TaskId, TaskState, ThreadColor,
-    Timestamp, Workspace, WorkspaceId,
+    HandoffPayload, HandoffProgress, HandoffResponse, HandoffResponseStatus, Name, Node, NodeGroup,
+    NodeGroupId, NodeId, NodeTarget, NormalizedPoint, PortalConfig, ProjectPath, Role, RoleColor,
+    RoleIcon, RoleId, Routine, RoutineApproval, RoutineAttempt, RoutineAttemptId, RoutineCheckout,
+    RoutineId, RoutineInterruptionReason, RoutineOccurrenceKey, RoutineOutputKey,
+    RoutineResourceKey, RoutineRetryPolicy, RoutineRun, RoutineRunId, RoutineRunPin, RoutineStep,
+    RoutineStepClaims, RoutineStepId, RoutineStepState, RoutineTransition, RoutineTrigger,
+    RoutineTriggerId, RoutineTriggerKind, RoutineVersion, RoutineVersionId, Shape, ShapeKind,
+    SshEnvironment, StrokeWidth, Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace,
+    WorkspaceDirectory, WorkspaceId,
 };
 
 use super::codec::{EVENT_FORMAT_VERSION, decode_event, decode_workspace};
@@ -1328,4 +1332,266 @@ fn database_path(temp: &TempDir) -> PathBuf {
 
 fn migration_backup_path(database: &Path) -> PathBuf {
     database.with_file_name("journal.sqlite.backup-v0-before-v3")
+}
+
+// Routine persistence. A recovered run must make the same decisions the live
+// one did, so the pinned version, the attempt history, and the reservations it
+// holds all have to survive a close and reopen.
+
+fn routine_fixture() -> (Routine, RoutineVersion) {
+    let step = RoutineStep::new(
+        RoutineStepId::new(1),
+        Name::new("Investigate").unwrap(),
+        AgentId::new(1),
+        Content::new("Look into it").unwrap(),
+        [],
+        [],
+        [RoutineOutputKey::new("finding").unwrap()],
+        RoutineApproval::Required,
+        RoutineRetryPolicy::new(3).unwrap(),
+        RoutineStepClaims::new(
+            crate::domain::RoutineCheckoutClaim::AgentDefault,
+            [RoutineResourceKey::new("database").unwrap()],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let version = RoutineVersion::new(
+        RoutineVersionId::new(1),
+        RoutineId::new(1),
+        1,
+        Vec::new(),
+        vec![step],
+        Some(Content::new("{\"template\":true}").unwrap()),
+        Timestamp::from_unix_millis(5),
+    )
+    .unwrap();
+    let trigger = RoutineTrigger::new(
+        RoutineTriggerId::new(1),
+        RoutineId::new(1),
+        Name::new("Hourly").unwrap(),
+        RoutineTriggerKind::Schedule(
+            crate::domain::RoutineSchedule::new(
+                crate::domain::RoutineCadence::Hourly { minute: 15 },
+                -180,
+                Some(Name::new("America/Sao_Paulo").unwrap()),
+                Some(Timestamp::from_unix_millis(9_000)),
+            )
+            .unwrap(),
+        ),
+        true,
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let routine = Routine::restore(
+        RoutineId::new(1),
+        Name::new("Nightly").unwrap(),
+        None,
+        vec![version.clone()],
+        [trigger],
+    )
+    .unwrap();
+    (routine, version)
+}
+
+#[test]
+fn routines_and_runs_survive_close_and_reopen() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    let workspace_id = test_workspace().id();
+    let (routine, version) = routine_fixture();
+
+    {
+        let mut journal = Journal::open(&path).unwrap();
+        let mut workspace = test_workspace();
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddAgent(Agent::new(
+                AgentId::new(1),
+                Name::new("Builder").unwrap(),
+                None,
+            )),
+            10,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddRoutine(routine),
+            11,
+        );
+
+        let checkout = RoutineCheckout::new(WorkspaceDirectory::new("/tmp/project").unwrap());
+        let pin = RoutineRunPin::new(
+            version,
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([(RoutineStepId::new(1), AgentId::new(1))]),
+            std::collections::BTreeMap::from([(RoutineStepId::new(1), checkout.clone())]),
+            std::collections::BTreeMap::from([(checkout.clone(), "abc123".to_owned())]),
+        )
+        .unwrap();
+        let run = RoutineRun::start(
+            RoutineRunId::new(1),
+            Some(RoutineTriggerId::new(1)),
+            Some(RoutineOccurrenceKey::new("sched-1-9000").unwrap()),
+            pin,
+            Timestamp::from_unix_millis(12),
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::StartRoutineRun {
+                run,
+                firing: Some(crate::domain::RoutineTriggerFiring::new(
+                    RoutineOccurrenceKey::new("sched-1-9000").unwrap(),
+                    Timestamp::from_unix_millis(12),
+                )),
+                next_occurrence: Some(Timestamp::from_unix_millis(12_600)),
+            },
+            12,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AdvanceRoutineRun {
+                run_id: RoutineRunId::new(1),
+                transition: RoutineTransition::RecordApproval {
+                    step_id: RoutineStepId::new(1),
+                    record: crate::domain::RoutineApprovalRecord::new(
+                        crate::domain::RoutineApprovalDecision::Approved,
+                        Timestamp::from_unix_millis(13),
+                        None,
+                    ),
+                },
+            },
+            13,
+        );
+
+        let task = Task::new(
+            TaskId::new(1),
+            Name::new("Investigate").unwrap(),
+            Content::new("Look into it").unwrap(),
+            Some(AgentId::new(1)),
+            None,
+        );
+        let handoff = Handoff::tracked(
+            HandoffId::new(1),
+            HandoffMessageId::new("routine-1-1-1").unwrap(),
+            HandoffOrigin::Routine {
+                run_id: RoutineRunId::new(1),
+                step_id: RoutineStepId::new(1),
+            },
+            AgentId::new(1),
+            HandoffPayload::Task(TaskId::new(1)),
+            None,
+            Timestamp::from_unix_millis(14),
+            None,
+        )
+        .unwrap();
+        let attempt = RoutineAttempt::new(
+            RoutineAttemptId::new(1),
+            1,
+            TaskId::new(1),
+            HandoffId::new(1),
+            AgentId::new(1),
+            checkout,
+            [RoutineResourceKey::new("database").unwrap()],
+            Timestamp::from_unix_millis(14),
+        )
+        .unwrap();
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::DispatchRoutineStep {
+                run_id: RoutineRunId::new(1),
+                step_id: RoutineStepId::new(1),
+                attempt,
+                task,
+                handoff,
+            },
+            14,
+        );
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AdvanceRoutineRun {
+                run_id: RoutineRunId::new(1),
+                transition: RoutineTransition::InterruptStep {
+                    step_id: RoutineStepId::new(1),
+                    reason: RoutineInterruptionReason::DispatchOutcomeUnknown,
+                    detected_at: Timestamp::from_unix_millis(15),
+                },
+            },
+            15,
+        );
+    }
+
+    let journal = Journal::open(&path).unwrap();
+    let recovered = journal.recover(workspace_id).unwrap().unwrap();
+    let routine = recovered.routine(RoutineId::new(1)).unwrap();
+    assert_eq!(routine.latest_version().number(), 1);
+    assert_eq!(
+        routine
+            .latest_version()
+            .step(RoutineStepId::new(1))
+            .unwrap()
+            .retry()
+            .max_attempts(),
+        3
+    );
+    let trigger = routine.trigger(RoutineTriggerId::new(1)).unwrap();
+    assert_eq!(trigger.schedule().unwrap().offset_minutes(), -180);
+    assert_eq!(
+        trigger.schedule().unwrap().next_occurrence(),
+        Some(Timestamp::from_unix_millis(12_600))
+    );
+    assert_eq!(
+        trigger.last_firing().unwrap().occurrence().as_str(),
+        "sched-1-9000",
+        "a consumed occurrence stays consumed across a restart"
+    );
+
+    let run = recovered.routine_run(RoutineRunId::new(1)).unwrap();
+    assert_eq!(run.pin().revisions().values().next().unwrap(), "abc123");
+    assert!(run.pin().template().is_some());
+    let step = run.step(RoutineStepId::new(1)).unwrap();
+    assert_eq!(step.state(), RoutineStepState::Interrupted);
+    assert_eq!(step.attempts().len(), 1);
+    assert_eq!(step.attempts()[0].task_id(), TaskId::new(1));
+    assert!(step.approval().is_some());
+    assert_eq!(
+        run.held_reservations().len(),
+        3,
+        "an interrupted step still holds its agent, checkout, and named resource"
+    );
+    assert_eq!(
+        recovered.handoff(HandoffId::new(1)).unwrap().origin(),
+        HandoffOrigin::Routine {
+            run_id: RoutineRunId::new(1),
+            step_id: RoutineStepId::new(1),
+        }
+    );
+}
+
+#[test]
+fn a_database_without_routines_still_recovers() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    let workspace_id = test_workspace().id();
+    {
+        let mut journal = Journal::open(&path).unwrap();
+        let mut workspace = test_workspace();
+        persist(
+            &mut journal,
+            &mut workspace,
+            DomainCommand::AddRole(test_role()),
+            42,
+        );
+    }
+
+    let journal = Journal::open(&path).unwrap();
+    let recovered = journal.recover(workspace_id).unwrap().unwrap();
+    assert_eq!(recovered.routines().count(), 0);
+    assert_eq!(recovered.routine_runs().count(), 0);
+    assert!(recovered.held_routine_reservations().is_empty());
 }

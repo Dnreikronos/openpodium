@@ -26,7 +26,7 @@ use crate::domain::{
 use super::PersistenceError;
 
 pub(crate) const EVENT_FORMAT_VERSION: u32 = 12;
-pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 10;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 11;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
     serde_json::to_vec(&StoredEvent::from(event)).map_err(|source| {
@@ -957,6 +957,10 @@ struct StoredWorkspace {
     groups: Vec<NodeGroupV1>,
     #[serde(default)]
     connections: Vec<ConnectionV1>,
+    #[serde(default)]
+    routines: Vec<RoutineV1>,
+    #[serde(default)]
+    routine_runs: Vec<RoutineRunV1>,
 }
 
 impl From<&Workspace> for StoredWorkspace {
@@ -997,6 +1001,8 @@ impl From<&Workspace> for StoredWorkspace {
             nodes: workspace.nodes().map(NodeV1::from).collect(),
             groups: workspace.groups().map(NodeGroupV1::from).collect(),
             connections: workspace.connections().map(ConnectionV1::from).collect(),
+            routines: workspace.routines().map(RoutineV1::from).collect(),
+            routine_runs: workspace.routine_runs().map(RoutineRunV1::from).collect(),
         }
     }
 }
@@ -1114,6 +1120,21 @@ impl StoredWorkspace {
             let agent_id = agent.id();
             apply_snapshot_command(&mut workspace, DomainCommand::AddAgent(agent))?;
             restore_agent_state(&mut workspace, agent_id, state)?;
+        }
+
+        if format_version < 11 && (!self.routines.is_empty() || !self.routine_runs.is_empty()) {
+            return Err("routines require snapshot format version 11".to_owned());
+        }
+        for routine in self.routines {
+            apply_snapshot_command(
+                &mut workspace,
+                DomainCommand::AddRoutine(routine.into_domain()?),
+            )?;
+        }
+        for run in self.routine_runs {
+            workspace
+                .restore_routine_run(run.into_domain()?)
+                .map_err(|error| error.to_string())?;
         }
 
         let mut pending_tasks = self.tasks;

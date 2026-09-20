@@ -1438,6 +1438,40 @@ impl Workspace {
         Ok(())
     }
 
+    /// Reinstates a run from a snapshot. The run's own invariants were checked
+    /// when it was created and are rechecked by `RoutineRun::restore`; this
+    /// only revalidates the references that tie it to this workspace.
+    pub(crate) fn restore_routine_run(&mut self, run: RoutineRun) -> Result<(), DomainError> {
+        self.ensure_absent(EntityRef::RoutineRun(run.id()))?;
+        let routine = self
+            .routines
+            .get(&run.routine_id())
+            .ok_or(DomainError::EntityNotFound(EntityRef::Routine(
+                run.routine_id(),
+            )))?;
+        if routine.version(run.version_id()) != Some(run.pin().version()) {
+            return Err(DomainError::RoutineRunMismatch {
+                run_id: run.id(),
+                routine_id: run.routine_id(),
+            });
+        }
+        for step in run.pin().version().steps() {
+            let agent_id = run
+                .pin()
+                .agent(step.id())
+                .ok_or(DomainError::InvalidRoutine(
+                    super::RoutineError::UnpinnedStepBinding { step_id: step.id() },
+                ))?;
+            self.ensure_reference(
+                EntityRef::RoutineRun(run.id()),
+                "agent",
+                EntityRef::Agent(agent_id),
+            )?;
+        }
+        self.routine_runs.insert(run.id(), run);
+        Ok(())
+    }
+
     /// Steps may only bind agents and floors this workspace actually has.
     fn validate_routine_version(&self, version: &RoutineVersion) -> Result<(), DomainError> {
         for step in version.steps() {
