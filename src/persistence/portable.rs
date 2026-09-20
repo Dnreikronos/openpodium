@@ -350,6 +350,10 @@ pub struct ImportPreview {
 pub struct PortableImport {
     pub commands: Vec<DomainCommand>,
     pub preview: ImportPreview,
+    /// The agent each symbolic document identifier became. Callers that must
+    /// keep a durable binding to an instantiated arrangement — a routine run,
+    /// for one — need this to follow the fresh identifiers.
+    pub agents: BTreeMap<String, AgentId>,
 }
 
 pub fn export_template(
@@ -536,7 +540,7 @@ pub fn import_template_with_mappings(
     validate_template(document)?;
     let preview = preview_template_import(document, workspace)?;
     ensure_launchers_resolved(&preview, workspace, launcher_mappings)?;
-    let commands = build_commands(
+    let (commands, agents) = build_commands(
         workspace,
         &document.template.roles,
         &document.template.agents,
@@ -548,7 +552,11 @@ pub fn import_template_with_mappings(
         path_mappings,
         None,
     )?;
-    Ok(PortableImport { commands, preview })
+    Ok(PortableImport {
+        commands,
+        preview,
+        agents,
+    })
 }
 
 pub fn import_workspace_archive(
@@ -568,7 +576,7 @@ pub fn import_workspace_archive_with_mappings(
     validate_archive(archive)?;
     let preview = preview_workspace_archive_import(archive, workspace)?;
     ensure_launchers_resolved(&preview, workspace, launcher_mappings)?;
-    let commands = build_commands(
+    let (commands, agents) = build_commands(
         workspace,
         &archive.archive.roles,
         &archive.archive.agents,
@@ -580,7 +588,11 @@ pub fn import_workspace_archive_with_mappings(
         path_mappings,
         Some(&archive.archive.settings),
     )?;
-    Ok(PortableImport { commands, preview })
+    Ok(PortableImport {
+        commands,
+        preview,
+        agents,
+    })
 }
 
 fn encode<T: Serialize>(document: &T) -> Result<String, PortableError> {
@@ -963,7 +975,7 @@ fn build_commands(
     launcher_mappings: &BTreeMap<String, crate::domain::CommandPresetId>,
     path_mappings: &BTreeMap<String, String>,
     settings: Option<&PortableSettingsV1>,
-) -> Result<Vec<DomainCommand>, PortableError> {
+) -> Result<(Vec<DomainCommand>, BTreeMap<String, AgentId>), PortableError> {
     let mut commands = Vec::new();
     let mut role_ids = IdAllocator::new(workspace.roles().map(|role| role.id().get()));
     let mut agent_ids = IdAllocator::new(workspace.agents().map(|agent| agent.id().get()));
@@ -1221,7 +1233,7 @@ fn build_commands(
         before: workspace.canvas_layout(),
         after: combined,
     });
-    Ok(commands)
+    Ok((commands, agent_map))
 }
 
 fn append_task_order(

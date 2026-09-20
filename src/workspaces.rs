@@ -224,6 +224,41 @@ impl WorkspaceManager {
         self.execute_import(workspace_id, plan, occurred_at)
     }
 
+    /// Instantiates a stored template and reports which agent each symbolic
+    /// identifier became. A routine run uses this to rebuild a saved
+    /// arrangement with fresh entity identifiers while keeping its step
+    /// bindings pointed at the agents the instantiation created.
+    pub fn instantiate_template(
+        &mut self,
+        workspace_id: WorkspaceId,
+        payload: &str,
+        destination_origin: PointV1,
+        occurred_at: Timestamp,
+    ) -> Result<TemplateInstantiation, WorkspaceError> {
+        let plan = {
+            let workspace = self
+                .workspace(workspace_id)
+                .ok_or(WorkspaceError::UnknownWorkspace { workspace_id })?;
+            let document = decode_template(payload).map_err(WorkspaceError::from)?;
+            import_template_with_mappings(
+                &document,
+                workspace,
+                destination_origin,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .map_err(WorkspaceError::from)?
+        };
+        validate_import_paths(
+            self.workspace(workspace_id).expect("workspace was checked"),
+            &plan.preview,
+            &BTreeMap::new(),
+        )?;
+        let agents = plan.agents.clone();
+        let events = self.execute_import(workspace_id, plan, occurred_at)?;
+        Ok(TemplateInstantiation { events, agents })
+    }
+
     fn execute_import(
         &mut self,
         workspace_id: WorkspaceId,
@@ -322,6 +357,14 @@ impl WorkspaceManager {
         self.recent.retain(|candidate| *candidate != workspace_id);
         self.recent.insert(0, workspace_id);
     }
+}
+
+/// What a template instantiation produced.
+#[derive(Debug, Clone)]
+pub struct TemplateInstantiation {
+    pub events: Vec<TimelineEvent>,
+    /// Symbolic template identifier to the agent it became.
+    pub agents: BTreeMap<String, crate::domain::AgentId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
