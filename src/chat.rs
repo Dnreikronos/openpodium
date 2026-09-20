@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use iced::widget::{button, column, container, image, markdown, row, scrollable, text, text_input};
-use iced::{Color, ContentFit, Element, Fill};
+use iced::{Color, ContentFit, Element, Fill, Task};
 use openpodium::domain::{
     AgentId, ChatAttachment, ChatAttachmentId, ChatMessageId, ChatThreadId, NodeTarget, Workspace,
     WorkspaceId,
@@ -42,6 +42,7 @@ pub struct UiState {
     new_thread_colors: BTreeMap<(WorkspaceId, AgentId), String>,
     attachment_paths: BTreeMap<(WorkspaceId, ChatThreadId), String>,
     rendered_messages: BTreeMap<(WorkspaceId, ChatMessageId), markdown::Content>,
+    highlighted_messages: BTreeMap<WorkspaceId, ChatMessageId>,
 }
 
 impl UiState {
@@ -153,6 +154,34 @@ impl UiState {
     pub fn clear_attachment_path(&mut self, workspace_id: WorkspaceId, thread_id: ChatThreadId) {
         self.attachment_paths.remove(&(workspace_id, thread_id));
     }
+
+    pub fn reveal_message(
+        &mut self,
+        workspace: &Workspace,
+        agent_id: AgentId,
+        thread_id: ChatThreadId,
+        message_id: ChatMessageId,
+    ) -> Option<Task<Message>> {
+        let thread = workspace.chat_thread(thread_id)?;
+        if thread.agent_id() != agent_id {
+            return None;
+        }
+        let index = thread
+            .messages()
+            .iter()
+            .position(|message| message.id() == message_id)?;
+        self.set_surface(workspace.id(), agent_id, Surface::Chat);
+        self.select_thread(workspace.id(), agent_id, thread_id);
+        self.highlighted_messages.insert(workspace.id(), message_id);
+        let denominator = thread.messages().len().saturating_sub(1).max(1) as f32;
+        Some(iced::widget::operation::snap_to(
+            message_scroll_id(workspace.id(), thread_id),
+            iced::widget::operation::RelativeOffset {
+                x: 0.0,
+                y: index as f32 / denominator,
+            },
+        ))
+    }
 }
 
 pub fn conversation_panel<'a>(
@@ -242,6 +271,9 @@ pub fn conversation_panel<'a>(
                 .map_or_else(|| format!("Agent {id}"), |agent| agent.name().to_string()),
         };
         let mut body = column![text(author).size(12)].spacing(6);
+        if state.highlighted_messages.get(&workspace_id) == Some(&message.id()) {
+            body = body.push(text("› Search match").size(12));
+        }
         if let Some(rendered) = state.rendered_messages.get(&(workspace_id, message.id())) {
             body = body.push(view(rendered).map(Message::Rich));
         } else {
@@ -258,7 +290,11 @@ pub fn conversation_panel<'a>(
         messages = messages.push(container(body).padding(10));
     }
     panel = panel
-        .push(scrollable(messages).height(260))
+        .push(
+            scrollable(messages)
+                .id(message_scroll_id(workspace_id, thread_id))
+                .height(260),
+        )
         .push(text_input("Write a prompt…", thread.draft().text()).on_input(Message::DraftChanged));
 
     let connected = connected_targets(workspace, agent_id);
@@ -301,6 +337,10 @@ pub fn conversation_panel<'a>(
         )
         .push(button("Send prompt").on_press(Message::Submit))
         .into()
+}
+
+fn message_scroll_id(workspace_id: WorkspaceId, thread_id: ChatThreadId) -> String {
+    format!("chat-messages-{}-{}", workspace_id.get(), thread_id.get())
 }
 
 fn connected_targets(workspace: &Workspace, agent_id: AgentId) -> Vec<NodeTarget> {

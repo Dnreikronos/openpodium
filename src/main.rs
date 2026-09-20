@@ -1,6 +1,7 @@
 mod app;
 mod canvas;
 mod chat;
+mod navigation_panel;
 mod notifications;
 mod terminal;
 mod timeline_panel;

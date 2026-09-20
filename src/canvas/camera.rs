@@ -86,6 +86,26 @@ impl Camera {
         (self.zoom * 100.0).round() as u16
     }
 
+    pub(crate) fn center_on(self, x: f64, y: f64) -> Self {
+        if !x.is_finite() || !y.is_finite() {
+            return self;
+        }
+        Self {
+            position: WorldPoint::new(x, y),
+            ..self
+        }
+    }
+
+    pub(crate) fn zoom_centered(self, factor: f64) -> Self {
+        if !factor.is_finite() || factor <= 0.0 {
+            return self;
+        }
+        Self {
+            zoom: (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM),
+            ..self
+        }
+    }
+
     pub(crate) fn world_to_screen(self, point: WorldPoint, viewport: ViewportSize) -> ScreenPoint {
         let center = viewport.center();
 
