@@ -190,18 +190,30 @@ impl BrowserBackend {
             .spawn()
             .map_err(BrowserError::Launch)?;
 
+        // Every exit from the probe has to account for the child: until
+        // ownership reaches `self`, dropping it here would leave a headless
+        // browser running that nothing can reap.
         let deadline = Instant::now() + STARTUP_TIMEOUT;
-        while Instant::now() < deadline {
-            if let Some(endpoint) = debug_websocket_url(port)? {
+        let endpoint = loop {
+            match debug_websocket_url(port) {
+                Ok(Some(endpoint)) => break Ok(endpoint),
+                Ok(None) if Instant::now() >= deadline => break Err(BrowserError::StartupTimeout),
+                Ok(None) => thread::sleep(Duration::from_millis(25)),
+                Err(error) => break Err(error),
+            }
+        };
+        match endpoint {
+            Ok(endpoint) => {
                 self.process = Some(child);
                 self.user_data_dir = Some(user_data_dir);
-                return Ok(endpoint);
+                Ok(endpoint)
             }
-            thread::sleep(Duration::from_millis(25));
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(error)
+            }
         }
-        let _ = child.kill();
-        let _ = child.wait();
-        Err(BrowserError::StartupTimeout)
     }
 
     fn connect_socket(&mut self, endpoint: &str) -> Result<(), BrowserError> {
