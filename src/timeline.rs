@@ -201,6 +201,11 @@ pub fn recovery_actions(state: TaskState) -> Vec<RecoveryAction> {
 
 fn project_event(workspace: &Workspace, event: &TimelineEvent) -> TimelineItem {
     let (task_id, title, detail) = match event.event() {
+        DomainEvent::FloorsChanged { .. } => (
+            None,
+            "Worktree floors updated".to_owned(),
+            "Floor inventory or selection changed".to_owned(),
+        ),
         DomainEvent::WorkspaceSettingsChanged { to, .. } => (
             None,
             "Workspace settings updated".to_owned(),

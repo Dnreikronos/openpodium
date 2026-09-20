@@ -1,3 +1,7 @@
+#[path = "floors.rs"]
+mod floors;
+pub use floors::*;
+
 use std::collections::BTreeMap;
 
 use super::{
@@ -52,6 +56,7 @@ impl WorkspaceSettings {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workspace {
     id: WorkspaceId,
+    floors: Floors,
     settings: WorkspaceSettings,
     environment_profiles: BTreeMap<EnvironmentProfileId, EnvironmentProfile>,
     command_presets: BTreeMap<CommandPresetId, CommandPreset>,
@@ -70,6 +75,7 @@ impl Workspace {
     pub fn new(id: WorkspaceId, name: Name) -> Self {
         Self {
             id,
+            floors: Floors::default(),
             settings: WorkspaceSettings::new(name, None, None, None),
             environment_profiles: BTreeMap::new(),
             command_presets: BTreeMap::new(),
@@ -153,11 +159,55 @@ impl Workspace {
         self.connections.values()
     }
 
-    pub fn canvas_layout(&self) -> CanvasLayout {
+    pub fn floors(&self) -> &Floors {
+        &self.floors
+    }
+
+    pub fn active_directory(&self) -> Option<&WorkspaceDirectory> {
+        match self.floors.active {
+            Some(id) => self.floors.entries.get(&id).and_then(|floor| {
+                (floor.lifecycle == FloorLifecycle::Available).then_some(&floor.directory)
+            }),
+            None => self.settings.working_directory(),
+        }
+    }
+
+    pub fn node_directory(&self, id: NodeId) -> Option<&WorkspaceDirectory> {
+        match self.floors.node_floors.get(&id) {
+            Some(id) => self.floors.entries.get(id).and_then(|floor| {
+                (floor.lifecycle == FloorLifecycle::Available).then_some(&floor.directory)
+            }),
+            None => self.settings.working_directory(),
+        }
+    }
+
+    pub fn all_canvas_layout(&self) -> CanvasLayout {
         CanvasLayout::new(
             self.nodes.values().cloned().collect(),
             self.groups.values().cloned().collect(),
             self.connections.values().cloned().collect(),
+        )
+    }
+
+    pub fn canvas_layout(&self) -> CanvasLayout {
+        CanvasLayout::new(
+            self.nodes
+                .values()
+                .filter(|n| self.floors.contains_node(n.id()))
+                .cloned()
+                .collect(),
+            self.groups
+                .values()
+                .filter(|g| g.members().all(|id| self.floors.contains_node(id)))
+                .cloned()
+                .collect(),
+            self.connections
+                .values()
+                .filter(|c| {
+                    self.floors.contains_node(c.source()) && self.floors.contains_node(c.target())
+                })
+                .cloned()
+                .collect(),
         )
     }
 
@@ -192,6 +242,9 @@ impl Workspace {
     pub fn execute(&mut self, command: DomainCommand) -> Result<DomainEvent, DomainError> {
         let event =
             match command {
+                DomainCommand::ReplaceFloors { before, after } => {
+                    DomainEvent::FloorsChanged { before, after }
+                }
                 DomainCommand::UpdateWorkspaceSettings(settings) => {
                     if settings == self.settings {
                         return Err(DomainError::UnchangedWorkspaceSettings);
@@ -431,6 +484,32 @@ impl Workspace {
 
     pub fn apply(&mut self, event: &DomainEvent) -> Result<(), DomainError> {
         match event {
+            DomainEvent::FloorsChanged { before, after } => {
+                if &self.floors != before {
+                    return Err(DomainError::FloorConflict);
+                }
+                if after
+                    .active
+                    .is_some_and(|id| !after.entries.contains_key(&id))
+                    || after.node_floors.iter().any(|(node, floor)| {
+                        !self.nodes.contains_key(node) || !after.entries.contains_key(floor)
+                    })
+                {
+                    return Err(DomainError::FloorConflict);
+                }
+                for floor in after.entries.values() {
+                    if let Some(owner) = floor.owner {
+                        let exists = match owner {
+                            FloorOwner::Agent(id) => self.agents.contains_key(&id),
+                            FloorOwner::Task(id) => self.tasks.contains_key(&id),
+                        };
+                        if !exists {
+                            return Err(DomainError::FloorConflict);
+                        }
+                    }
+                }
+                self.floors = after.clone();
+            }
             DomainEvent::WorkspaceSettingsChanged { from, to } => {
                 if &self.settings != from {
                     return Err(DomainError::WorkspaceSettingsConflict);
@@ -828,6 +907,9 @@ impl Workspace {
                 self.ensure_absent(EntityRef::Node(node.id()))?;
                 self.ensure_reference(EntityRef::Node(node.id()), "target", node.target().into())?;
                 self.nodes.insert(node.id(), node.clone());
+                if let Some(floor) = self.floors.active {
+                    self.floors.node_floors.insert(node.id(), floor);
+                }
             }
             DomainEvent::AgentNodeAdded { agent, node } => {
                 self.ensure_absent(EntityRef::Agent(agent.id()))?;
@@ -862,30 +944,71 @@ impl Workspace {
                 }
                 self.agents.insert(agent.id(), agent.clone());
                 self.nodes.insert(node.id(), node.clone());
+                if let Some(floor) = self.floors.active {
+                    self.floors.node_floors.insert(node.id(), floor);
+                }
             }
             DomainEvent::CanvasReplaced { before, after } => {
                 if &self.canvas_layout() != before {
                     return Err(DomainError::CanvasConflict);
                 }
                 self.validate_canvas(after)?;
-                self.nodes = after
+                let mut combined = self.all_canvas_layout();
+                let removed: std::collections::BTreeSet<_> =
+                    before.nodes().iter().map(Node::id).collect();
+                let groups: std::collections::BTreeSet<_> =
+                    before.groups().iter().map(NodeGroup::id).collect();
+                let connections: std::collections::BTreeSet<_> =
+                    before.connections().iter().map(Connection::id).collect();
+                let mut nodes = combined
+                    .nodes()
+                    .iter()
+                    .filter(|n| !removed.contains(&n.id()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                nodes.extend_from_slice(after.nodes());
+                let mut all_groups = combined
+                    .groups()
+                    .iter()
+                    .filter(|g| !groups.contains(&g.id()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                all_groups.extend_from_slice(after.groups());
+                let mut all_connections = combined
+                    .connections()
+                    .iter()
+                    .filter(|c| !connections.contains(&c.id()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                all_connections.extend_from_slice(after.connections());
+                combined = CanvasLayout::new(nodes, all_groups, all_connections);
+                self.validate_canvas(&combined)?;
+                self.nodes = combined
                     .nodes()
                     .iter()
                     .cloned()
-                    .map(|node| (node.id(), node))
+                    .map(|n| (n.id(), n))
                     .collect();
-                self.groups = after
+                self.groups = combined
                     .groups()
                     .iter()
                     .cloned()
-                    .map(|group| (group.id(), group))
+                    .map(|g| (g.id(), g))
                     .collect();
-                self.connections = after
+                self.connections = combined
                     .connections()
                     .iter()
                     .cloned()
-                    .map(|connection| (connection.id(), connection))
+                    .map(|c| (c.id(), c))
                     .collect();
+                self.floors
+                    .node_floors
+                    .retain(|node, _| !removed.contains(node));
+                if let Some(floor) = self.floors.active {
+                    for node in after.nodes() {
+                        self.floors.node_floors.insert(node.id(), floor);
+                    }
+                }
             }
             DomainEvent::AgentStateChanged { agent_id, from, to } => {
                 let agent = self

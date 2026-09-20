@@ -10,6 +10,7 @@ repository = "https://github.com/Dnreikronos/openpodium"
 [dependencies]
 alacritty_terminal = { version = "0.26.0", default-features = false }
 blake3 = "1.8.2"
+dunce = "1.0.5"
 getrandom = "0.3.3"
 iced = { version = "0.14.0", features = ["advanced", "canvas", "highlighter", "image-without-codecs", "markdown", "tokio"] }
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }

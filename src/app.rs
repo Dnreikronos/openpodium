@@ -1,3 +1,5 @@
+mod floors;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -59,6 +61,7 @@ enum EnvironmentDraftKind {
 }
 
 struct OpenPodium {
+    floor_ui: floors::UiState,
     camera: Camera,
     canvas_selection: Vec<NodeId>,
     canvas_preview: Option<CanvasLayout>,
@@ -146,6 +149,7 @@ impl Default for OpenPodium {
                 None => Default::default(),
             };
         let mut state = Self {
+            floor_ui: floors::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
@@ -196,6 +200,7 @@ impl Default for OpenPodium {
 
 #[derive(Clone)]
 enum Message {
+    Floor(floors::Message),
     OrchestrationTick,
     Canvas(canvas::Message),
     Chat(chat::Message),
@@ -293,6 +298,7 @@ pub(crate) fn run() -> iced::Result {
 
 fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
+        Message::Floor(message) => return floors::update(state, message),
         Message::OrchestrationTick => {
             run_orchestration_tick(state);
             return refresh_timelines(state);
@@ -517,6 +523,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         text_input("Workspace instructions", &state.instructions)
             .on_input(Message::InstructionsChanged),
         button("Save settings").on_press(Message::SaveSettings),
+        floors::view(state),
         text("Add agent").size(18),
         row![
             button("Codex").on_press(Message::AddAgent(AgentProgram::Codex)),
@@ -1144,6 +1151,20 @@ fn navigate_to_task(state: &mut OpenPodium, target: NavigationTarget) {
         .and_then(|workspaces| workspaces.workspace(target.workspace_id))
         .and_then(|workspace| timeline::navigation_target(workspace, target.task_id))
         .and_then(|target| target.node_id);
+    if let Some(node) = current_node {
+        let floor = state
+            .workspaces
+            .as_ref()
+            .and_then(|m| m.workspace(target.workspace_id))
+            .and_then(|w| w.floors().node_floors.get(&node).copied());
+        if let Some(manager) = state.workspaces.as_mut()
+            && let Err(error) = manager.switch_floor(target.workspace_id, floor, now())
+        {
+            state.notice = Some(error);
+            return;
+        }
+        state.reset_canvas_session();
+    }
     state.canvas_selection = current_node.into_iter().collect();
     state.focused_terminal = None;
     state.canvas_revision = state.canvas_revision.wrapping_add(1);
@@ -1249,7 +1270,7 @@ fn delivery_target(
         .workspace(request.workspace_id())
         .ok_or_else(|| format!("workspace {} is not loaded", request.workspace_id()))?;
     let node_id = workspace
-        .canvas_layout()
+        .all_canvas_layout()
         .nodes()
         .iter()
         .find(|node| node.target() == NodeTarget::Agent(request.recipient_agent_id()))
@@ -1931,7 +1952,7 @@ fn preview_agent(state: &mut OpenPodium, program: AgentProgram) {
                 preset,
                 role,
                 profile,
-                PathBuf::from(workspace.settings().working_directory()?.as_str()),
+                PathBuf::from(workspace.active_directory()?.as_str()),
             ))
         })
     else {
@@ -2287,6 +2308,24 @@ fn clear_role_draft(state: &mut OpenPodium) {
 }
 
 fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
+    if floors::is_busy(state) {
+        state.notice =
+            Some("Wait for the Git operation to finish before adding an agent".to_owned());
+        return Task::none();
+    }
+    if let Some(workspace) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        && workspace.floors().active.is_some()
+        && (workspace.active_directory().is_none() || state.selected_environment.is_some())
+    {
+        state.notice = Some(
+            "Choose an available floor and the local environment to run an isolated agent"
+                .to_owned(),
+        );
+        return Task::none();
+    }
     let Some((workspace_id, agent_id, node_id, before, node, environment_id, role_id)) = state
         .workspaces
         .as_ref()
@@ -2369,6 +2408,11 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
 }
 
 fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
+    if floors::is_busy(state) {
+        state.notice =
+            Some("Wait for the Git operation to finish before starting a terminal".to_owned());
+        return Task::none();
+    }
     let Some((workspace_id, agent_id, program, preset, role, profile, working_directory, size)) =
         state
             .workspaces
@@ -2380,7 +2424,7 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
                     return None;
                 };
                 let agent = workspace.agent(agent_id)?;
-                let working_directory = workspace.settings().working_directory()?.as_str();
+                let working_directory = workspace.node_directory(node_id)?.as_str();
                 let profile = agent
                     .environment_id()
                     .and_then(|environment_id| workspace.environment_profile(environment_id))
@@ -2663,10 +2707,16 @@ fn apply_canvas_action(state: &mut OpenPodium, action: CanvasAction) {
         state.notice = Some("Create or select a workspace first".to_owned());
         return;
     };
+    let all = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .map(Workspace::all_canvas_layout)
+        .unwrap_or_else(|| before.clone());
     let mut selection = state.canvas_selection.clone();
     let after = match action {
         CanvasAction::Duplicate => {
-            let (after, duplicated) = canvas::editor::duplicate(&before, &selection);
+            let (after, duplicated) = canvas::editor::duplicate(&before, &selection, &all);
             selection = duplicated;
             after
         }
@@ -2674,9 +2724,9 @@ fn apply_canvas_action(state: &mut OpenPodium, action: CanvasAction) {
             selection.clear();
             canvas::editor::remove(&before, &state.canvas_selection)
         }
-        CanvasAction::Group => canvas::editor::group(&before, &selection),
+        CanvasAction::Group => canvas::editor::group(&before, &selection, &all),
         CanvasAction::Ungroup => canvas::editor::ungroup(&before, &selection),
-        CanvasAction::Connect => match canvas::editor::connect(&before, &selection) {
+        CanvasAction::Connect => match canvas::editor::connect(&before, &selection, &all) {
             Ok(after) => after,
             Err(error) => {
                 state.notice = Some(error.to_owned());
@@ -2739,7 +2789,6 @@ fn persist_canvas(
         return Err(());
     };
     state.canvas_preview = None;
-    let runtime_layout = after.clone();
     match state
         .workspaces
         .as_mut()
@@ -2750,6 +2799,12 @@ fn persist_canvas(
             now(),
         ) {
         Ok(_) => {
+            let runtime_layout = state
+                .workspaces
+                .as_ref()
+                .and_then(|m| m.workspace(workspace_id))
+                .expect("workspace was just updated")
+                .all_canvas_layout();
             synchronize_terminals(state, &runtime_layout);
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
             Ok(())
@@ -3129,6 +3184,40 @@ mod tests {
                 Timestamp::from_unix_millis(5),
             )
             .unwrap();
+        let before = workspaces.workspace(first_id).unwrap().floors().clone();
+        let mut after = before.clone();
+        after.entries.insert(
+            1,
+            openpodium::domain::Floor {
+                name: Name::new("Background floor").unwrap(),
+                directory: WorkspaceDirectory::new(first.to_str().unwrap()).unwrap(),
+                repository: WorkspaceDirectory::new(first.to_str().unwrap()).unwrap(),
+                branch: Some("background".to_owned()),
+                base_revision: "base".to_owned(),
+                base_branch: Some("main".to_owned()),
+                managed: false,
+                ownership_token: None,
+                owner: None,
+                dirty: false,
+                lifecycle: openpodium::domain::FloorLifecycle::Available,
+            },
+        );
+        after.node_floors.insert(NodeId::new(7), 1);
+        workspaces
+            .execute(
+                first_id,
+                DomainCommand::ReplaceFloors { before, after },
+                Timestamp::from_unix_millis(6),
+            )
+            .unwrap();
+        assert!(
+            workspaces
+                .workspace(first_id)
+                .unwrap()
+                .canvas_layout()
+                .nodes()
+                .is_empty()
+        );
         workspaces
             .switch(second_id, Timestamp::from_unix_millis(6))
             .unwrap();
@@ -3168,6 +3257,24 @@ mod tests {
                 node_id: NodeId::new(7),
             }
         );
+        workspaces
+            .switch(first_id, Timestamp::from_unix_millis(10))
+            .unwrap();
+        let key = TerminalKey {
+            workspace_id: first_id,
+            node_id: NodeId::new(7),
+        };
+        let mut terminals = BTreeMap::new();
+        terminals.insert(
+            key,
+            Session::starting(terminal::GridSize::for_node(400.0, 300.0), 1),
+        );
+        let mut state = test_state(workspaces, terminals);
+        persist_canvas(&mut state, CanvasLayout::default(), CanvasLayout::default()).unwrap();
+        assert!(
+            state.terminals.contains_key(&key),
+            "saving the main canvas must preserve hidden floor terminals"
+        );
     }
 
     #[test]
@@ -3181,6 +3288,7 @@ mod tests {
             .create_workspace(&project, Timestamp::from_unix_millis(1))
             .unwrap();
         let mut state = OpenPodium {
+            floor_ui: floors::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
@@ -3596,6 +3704,7 @@ mod tests {
         terminals: BTreeMap<TerminalKey, Session>,
     ) -> OpenPodium {
         OpenPodium {
+            floor_ui: floors::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
