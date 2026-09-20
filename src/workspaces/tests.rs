@@ -2,7 +2,11 @@ use std::fs;
 
 use tempfile::TempDir;
 
-use crate::domain::{Agent, AgentId, AgentState, DomainCommand, Name, Timestamp, WorkspaceId};
+use crate::domain::{
+    Agent, AgentId, AgentState, CanvasNodeContent, CanvasPoint, CanvasSize, Content, DomainCommand,
+    Name, Node, NodeId, NodeTarget, ProjectPath, Role, RoleId, Timestamp, WorkspaceId,
+};
+use crate::persistence::PointV1;
 
 use super::{WorkspaceError, WorkspaceManager, WorkspaceSettingsInput};
 
@@ -140,6 +144,145 @@ fn switching_workspaces_preserves_running_agents() {
     );
     assert_eq!(manager.active_workspace_id(), Some(first_id));
     assert!(manager.workspace(WorkspaceId::new(999)).is_none());
+}
+
+#[test]
+fn template_import_preview_then_batch_import_allocates_fresh_ids() {
+    let temp = TempDir::new().unwrap();
+    let directory = temp.path().join("project");
+    fs::create_dir(&directory).unwrap();
+    let mut manager = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+    let workspace_id = manager.create_workspace(&directory, timestamp(1)).unwrap();
+    manager
+        .execute(
+            workspace_id,
+            DomainCommand::AddRole(Role::new(
+                RoleId::new(50),
+                Name::new("Builder").unwrap(),
+                Content::new("Build safely").unwrap(),
+            )),
+            timestamp(2),
+        )
+        .unwrap();
+    manager
+        .execute(
+            workspace_id,
+            DomainCommand::AddAgent(Agent::new(
+                AgentId::new(60),
+                Name::new("Ada").unwrap(),
+                Some(RoleId::new(50)),
+            )),
+            timestamp(3),
+        )
+        .unwrap();
+    manager
+        .execute(
+            workspace_id,
+            DomainCommand::AddNode(Node::new(
+                NodeId::new(70),
+                NodeTarget::Agent(AgentId::new(60)),
+                CanvasPoint::new(100.0, 200.0).unwrap(),
+                CanvasSize::new(240.0, 160.0).unwrap(),
+            )),
+            timestamp(4),
+        )
+        .unwrap();
+
+    let payload = manager
+        .export_template(workspace_id, &[NodeId::new(70)])
+        .unwrap();
+    let preview = manager
+        .preview_template_import(workspace_id, &payload)
+        .unwrap();
+    assert_eq!(preview.counts.roles, 1);
+    assert_eq!(preview.counts.agents, 1);
+
+    manager
+        .import_template(
+            workspace_id,
+            &payload,
+            None,
+            PointV1 { x: 500.0, y: 600.0 },
+            &std::collections::BTreeMap::new(),
+            timestamp(5),
+        )
+        .unwrap();
+
+    let workspace = manager.workspace(workspace_id).unwrap();
+    assert_eq!(workspace.roles().count(), 2);
+    assert_eq!(workspace.agents().count(), 2);
+    assert_eq!(workspace.all_canvas_layout().nodes().len(), 2);
+    assert!(workspace.agent(AgentId::new(61)).is_some());
+    assert!(workspace.node(NodeId::new(71)).is_some());
+    assert_eq!(
+        workspace.node(NodeId::new(71)).unwrap().position().x(),
+        500.0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn template_import_rejects_a_symlinked_destination_path_before_journaling() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let source_directory = temp.path().join("source");
+    let destination_directory = temp.path().join("destination");
+    let outside_directory = temp.path().join("outside");
+    fs::create_dir(&source_directory).unwrap();
+    fs::create_dir(&destination_directory).unwrap();
+    fs::create_dir(&outside_directory).unwrap();
+
+    let mut manager = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+    let source_id = manager
+        .create_workspace(&source_directory, timestamp(1))
+        .unwrap();
+    let destination_id = manager
+        .create_workspace(&destination_directory, timestamp(2))
+        .unwrap();
+    manager
+        .execute(
+            source_id,
+            DomainCommand::AddNode(Node::with_content(
+                NodeId::new(1),
+                CanvasNodeContent::Note {
+                    path: ProjectPath::new(".openpodium/notes/brief.md").unwrap(),
+                    title: Name::new("Brief").unwrap(),
+                },
+                CanvasPoint::new(0.0, 0.0).unwrap(),
+                CanvasSize::new(240.0, 160.0).unwrap(),
+            )),
+            timestamp(3),
+        )
+        .unwrap();
+    let payload = manager
+        .export_template(source_id, &[NodeId::new(1)])
+        .unwrap();
+    symlink(
+        &outside_directory,
+        destination_directory.join(".openpodium"),
+    )
+    .unwrap();
+
+    let error = manager
+        .import_template(
+            destination_id,
+            &payload,
+            None,
+            PointV1 { x: 0.0, y: 0.0 },
+            &std::collections::BTreeMap::new(),
+            timestamp(4),
+        )
+        .unwrap_err();
+    assert!(matches!(error, WorkspaceError::Portable(_)));
+    assert!(
+        manager
+            .workspace(destination_id)
+            .unwrap()
+            .all_canvas_layout()
+            .nodes()
+            .is_empty()
+    );
 }
 
 fn timestamp(value: u64) -> Timestamp {

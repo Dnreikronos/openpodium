@@ -95,6 +95,51 @@ fn failed_snapshot_write_rolls_back_event_and_memory() {
 }
 
 #[test]
+fn batch_import_rolls_back_every_command_and_memory_on_any_snapshot_failure() {
+    let temp = TempDir::new().unwrap();
+    let mut journal = Journal::open(database_path(&temp)).unwrap();
+    let mut workspace = test_workspace();
+    let before = workspace.clone();
+    journal
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER reject_snapshot_batch
+             BEFORE INSERT ON workspace_snapshots
+             BEGIN
+                 SELECT RAISE(ABORT, 'simulated interrupted batch');
+             END;",
+        )
+        .unwrap();
+
+    let error = journal
+        .execute_batch(
+            &mut workspace,
+            [
+                DomainCommand::AddRole(test_role()),
+                DomainCommand::AddAgent(Agent::new(
+                    AgentId::new(1),
+                    name("Ada"),
+                    Some(RoleId::new(1)),
+                )),
+            ],
+            timestamp(2),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistenceError::Database {
+            operation: "insert workspace snapshot",
+            ..
+        }
+    ));
+    assert_eq!(workspace, before);
+    assert_eq!(table_count(&journal, "journal_events"), 0);
+    assert_eq!(table_count(&journal, "workspace_snapshots"), 0);
+    assert_eq!(table_count(&journal, "workspace_registry"), 0);
+}
+
+#[test]
 fn timeline_returns_verified_events_in_journal_order() {
     let temp = TempDir::new().unwrap();
     let mut journal = Journal::open(database_path(&temp)).unwrap();

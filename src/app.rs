@@ -27,7 +27,8 @@ use openpodium::ipc::{
 use openpodium::navigation::{CommandRegistry, Shortcut};
 use openpodium::orchestration::{DeliveryRequest, Orchestrator};
 use openpodium::persistence::{
-    export_canvas_fragment, export_role, import_canvas_fragment, import_role,
+    ImportPreview, PointV1, export_canvas_fragment, export_role, import_canvas_fragment,
+    import_role,
 };
 use openpodium::runtime::{
     EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, ProcessSpec,
@@ -64,6 +65,22 @@ enum EnvironmentDraftKind {
     Ssh,
     Container,
     Custom,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PortableImportKind {
+    Template,
+    WorkspaceArchive,
+}
+
+#[derive(Debug, Clone)]
+struct PortableImportDraft {
+    kind: PortableImportKind,
+    workspace_id: WorkspaceId,
+    destination_floor: Option<u64>,
+    payload: String,
+    preview: ImportPreview,
+    launcher_mappings: BTreeMap<String, CommandPresetId>,
 }
 
 struct OpenPodium {
@@ -112,6 +129,7 @@ struct OpenPodium {
     role_icon: String,
     role_instructions: String,
     context_path: String,
+    portable_import: Option<PortableImportDraft>,
     notice: Option<String>,
 }
 
@@ -216,6 +234,7 @@ impl Default for OpenPodium {
             role_icon: RoleIcon::DEFAULT.to_owned(),
             role_instructions: String::new(),
             context_path: String::new(),
+            portable_import: None,
             notice,
         };
         state.load_active_settings();
@@ -242,6 +261,18 @@ enum Message {
     AddAgent(AgentProgram),
     PreviewAgent(AgentProgram),
     CanvasAction(CanvasAction),
+    SaveSelectionAsTemplate,
+    InstantiateTemplate,
+    TemplateImportRead(Option<String>),
+    ExportWorkspaceArchive,
+    ImportWorkspaceArchive,
+    WorkspaceArchiveImportRead(Option<String>),
+    MapPortableLauncher {
+        launcher_id: String,
+        preset_id: CommandPresetId,
+    },
+    ConfirmPortableImport,
+    CancelPortableImport,
     ContextPathChanged(String),
     AddContextNode(context_nodes::Kind),
     ContextScanCompleted(Result<context_nodes::ScanResult, String>),
@@ -352,6 +383,28 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             return Task::batch([timelines, floors, contexts, navigation]);
         }
         Message::Canvas(message) => return handle_canvas_message(state, message),
+        Message::SaveSelectionAsTemplate => return save_selection_as_template(state),
+        Message::InstantiateTemplate => {
+            return clipboard::read().map(Message::TemplateImportRead);
+        }
+        Message::TemplateImportRead(payload) => preview_template_from_clipboard(state, payload),
+        Message::ExportWorkspaceArchive => return export_workspace_archive_to_clipboard(state),
+        Message::ImportWorkspaceArchive => {
+            return clipboard::read().map(Message::WorkspaceArchiveImportRead);
+        }
+        Message::WorkspaceArchiveImportRead(payload) => {
+            preview_workspace_archive_from_clipboard(state, payload);
+        }
+        Message::MapPortableLauncher {
+            launcher_id,
+            preset_id,
+        } => {
+            if let Some(draft) = state.portable_import.as_mut() {
+                draft.launcher_mappings.insert(launcher_id, preset_id);
+            }
+        }
+        Message::ConfirmPortableImport => confirm_portable_import(state),
+        Message::CancelPortableImport => state.portable_import = None,
         Message::Chat(message) => return handle_chat_message(state, message),
         Message::Timeline(message) => return handle_timeline_message(state, message),
         Message::Navigation(message) => return navigation::update(state, message),
@@ -646,6 +699,16 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         ]
         .spacing(8),
         row![
+            button("Save selection as template").on_press(Message::SaveSelectionAsTemplate),
+            button("Instantiate template").on_press(Message::InstantiateTemplate),
+        ]
+        .spacing(8),
+        row![
+            button("Export workspace archive").on_press(Message::ExportWorkspaceArchive),
+            button("Import workspace archive").on_press(Message::ImportWorkspaceArchive),
+        ]
+        .spacing(8),
+        row![
             button("Group").on_press(Message::CanvasAction(CanvasAction::Group)),
             button("Ungroup").on_press(Message::CanvasAction(CanvasAction::Ungroup)),
             button("Connect").on_press(Message::CanvasAction(CanvasAction::Connect)),
@@ -711,6 +774,65 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     ]
     .spacing(12)
     .max_width(720);
+    if let Some(draft) = &state.portable_import {
+        let kind = match draft.kind {
+            PortableImportKind::Template => "template",
+            PortableImportKind::WorkspaceArchive => "workspace archive",
+        };
+        settings = settings
+            .push(text(format!(
+                "Import preview: {kind} · {} roles · {} agents · {} tasks · {} nodes",
+                draft.preview.counts.roles,
+                draft.preview.counts.agents,
+                draft.preview.counts.tasks,
+                draft.preview.counts.nodes,
+            )))
+            .push(text(if draft.preview.referenced_paths.is_empty() {
+                "No project paths referenced"
+            } else {
+                "Project paths will be revalidated at import time"
+            }))
+            .push(text(if draft.preview.unresolved_launchers.is_empty() {
+                "All launchers resolved"
+            } else {
+                "Custom launchers require an explicit mapping before import"
+            }));
+        let presets = state
+            .workspaces
+            .as_ref()
+            .and_then(WorkspaceManager::active_workspace)
+            .map(|workspace| {
+                workspace
+                    .command_presets()
+                    .map(|preset| (preset.id(), preset.name().as_str().to_owned()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for launcher_id in &draft.preview.unresolved_launchers {
+            settings = settings.push(text(format!("Resolve {launcher_id} with a custom preset:")));
+            for (preset_id, preset_name) in &presets {
+                let selected = draft.launcher_mappings.get(launcher_id) == Some(preset_id);
+                settings = settings.push(
+                    button(text(if selected {
+                        format!("✓ {preset_name}")
+                    } else {
+                        preset_name.clone()
+                    }))
+                    .on_press(Message::MapPortableLauncher {
+                        launcher_id: launcher_id.clone(),
+                        preset_id: *preset_id,
+                    }),
+                );
+            }
+        }
+        settings = settings.push(
+            row![
+                button("Confirm import").on_press(Message::ConfirmPortableImport),
+                button("Cancel").on_press(Message::CancelPortableImport),
+            ]
+            .spacing(8),
+        );
+    }
     if let Some(workspace) = state
         .workspaces
         .as_ref()
@@ -2373,6 +2495,190 @@ fn export_role_to_clipboard(state: &mut OpenPodium, role_id: RoleId) -> Task<Mes
     }
 }
 
+fn save_selection_as_template(state: &mut OpenPodium) -> Task<Message> {
+    let Some(workspace_id) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace_id)
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return Task::none();
+    };
+    let result = state
+        .workspaces
+        .as_ref()
+        .expect("active workspace came from the manager")
+        .export_template(workspace_id, &state.canvas_selection);
+    match result {
+        Ok(payload) => {
+            state.notice = Some("Template JSON copied to the clipboard".to_owned());
+            clipboard::write(payload)
+        }
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            Task::none()
+        }
+    }
+}
+
+fn export_workspace_archive_to_clipboard(state: &mut OpenPodium) -> Task<Message> {
+    let Some(workspace_id) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace_id)
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return Task::none();
+    };
+    let result = state
+        .workspaces
+        .as_ref()
+        .expect("active workspace came from the manager")
+        .export_workspace_archive(workspace_id);
+    match result {
+        Ok(payload) => {
+            state.notice = Some("Workspace archive JSON copied to the clipboard".to_owned());
+            clipboard::write(payload)
+        }
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            Task::none()
+        }
+    }
+}
+
+fn preview_template_from_clipboard(state: &mut OpenPodium, payload: Option<String>) {
+    let Some(payload) = payload else {
+        state.notice = Some("The clipboard does not contain text".to_owned());
+        return;
+    };
+    let Some(workspace_id) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace_id)
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+    let result = state
+        .workspaces
+        .as_ref()
+        .expect("active workspace came from the manager")
+        .preview_template_import(workspace_id, &payload);
+    state.portable_import = match result {
+        Ok(preview) => Some(PortableImportDraft {
+            kind: PortableImportKind::Template,
+            workspace_id,
+            destination_floor: state
+                .workspaces
+                .as_ref()
+                .and_then(|manager| manager.workspace(workspace_id))
+                .and_then(|workspace| workspace.floors().active),
+            payload,
+            preview,
+            launcher_mappings: BTreeMap::new(),
+        }),
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            None
+        }
+    };
+}
+
+fn preview_workspace_archive_from_clipboard(state: &mut OpenPodium, payload: Option<String>) {
+    let Some(payload) = payload else {
+        state.notice = Some("The clipboard does not contain text".to_owned());
+        return;
+    };
+    let Some(workspace_id) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace_id)
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return;
+    };
+    let result = state
+        .workspaces
+        .as_ref()
+        .expect("active workspace came from the manager")
+        .preview_workspace_archive_import(workspace_id, &payload);
+    state.portable_import = match result {
+        Ok(preview) => Some(PortableImportDraft {
+            kind: PortableImportKind::WorkspaceArchive,
+            workspace_id,
+            destination_floor: state
+                .workspaces
+                .as_ref()
+                .and_then(|manager| manager.workspace(workspace_id))
+                .and_then(|workspace| workspace.floors().active),
+            payload,
+            preview,
+            launcher_mappings: BTreeMap::new(),
+        }),
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            None
+        }
+    };
+}
+
+fn confirm_portable_import(state: &mut OpenPodium) {
+    let Some(draft) = state.portable_import.take() else {
+        return;
+    };
+    let Some(workspace_id) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace_id)
+    else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        state.portable_import = Some(draft);
+        return;
+    };
+    if workspace_id != draft.workspace_id {
+        state.notice = Some("The import destination changed; preview it again".to_owned());
+        return;
+    }
+    let camera = state.camera.position();
+    let origin = PointV1 {
+        x: camera.x as f32,
+        y: camera.y as f32,
+    };
+    let workspaces = state
+        .workspaces
+        .as_mut()
+        .expect("active workspace came from the manager");
+    let result = match draft.kind {
+        PortableImportKind::Template => workspaces.import_template(
+            workspace_id,
+            &draft.payload,
+            draft.destination_floor,
+            origin,
+            &draft.launcher_mappings,
+            now(),
+        ),
+        PortableImportKind::WorkspaceArchive => workspaces.import_workspace_archive(
+            workspace_id,
+            &draft.payload,
+            draft.destination_floor,
+            &draft.launcher_mappings,
+            now(),
+        ),
+    };
+    match result {
+        Ok(_) => {
+            state.reset_canvas_session();
+            state.navigation_ui.mark_stale(workspace_id);
+            state.notice = Some("Portable import committed".to_owned());
+        }
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            state.portable_import = Some(draft);
+        }
+    }
+}
+
 fn import_role_from_clipboard(state: &mut OpenPodium, payload: Option<&str>) {
     let Some(payload) = payload else {
         state.notice = Some("The clipboard does not contain text".to_owned());
@@ -3535,6 +3841,7 @@ mod tests {
             role_icon: RoleIcon::DEFAULT.to_owned(),
             role_instructions: String::new(),
             context_path: String::new(),
+            portable_import: None,
             notice: None,
         };
 
@@ -4098,6 +4405,7 @@ mod tests {
             role_icon: RoleIcon::DEFAULT.to_owned(),
             role_instructions: String::new(),
             context_path: String::new(),
+            portable_import: None,
             notice: None,
         }
     }
