@@ -11,12 +11,15 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::portal::{PortalAction, PortalElementRef};
+
 use super::store::{InsertResult, MessageStore, StoreError, StoredMessage};
 use super::{
     AgentCapabilities, AgentDescriptor, AuthenticationError, CapabilityIssuer, Credentials,
     ErrorCode, MAX_FRAME_BYTES, MESSAGE_STORE_FILE_NAME, MessageId, PROTOCOL_NAME,
-    PROTOCOL_VERSION, ProtocolCommand, ProtocolError, ProtocolRequest, ProtocolResponse,
-    ProtocolResult, SECRET_FILE_NAME, SUPPORTED_VERSIONS,
+    PROTOCOL_VERSION, PortalActionRequest, PortalDispatcher, PortalServiceError, ProtocolCommand,
+    ProtocolError, ProtocolRequest, ProtocolResponse, ProtocolResult, SECRET_FILE_NAME,
+    SUPPORTED_VERSIONS,
 };
 
 const WORKER_COUNT: usize = 4;
@@ -87,6 +90,7 @@ pub struct IpcService {
     issuer: Arc<CapabilityIssuer>,
     directory: Arc<RwLock<Directory>>,
     messages: Arc<Mutex<MessageStore>>,
+    portals: Arc<Mutex<PortalDispatcher>>,
     leased_messages: Mutex<BTreeSet<(u64, MessageId)>>,
     shutdown: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
@@ -113,6 +117,7 @@ impl IpcService {
         let messages = Arc::new(Mutex::new(MessageStore::open(
             data_directory.join(MESSAGE_STORE_FILE_NAME),
         )?));
+        let portals = Arc::new(Mutex::new(PortalDispatcher::open(data_directory)?));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (connection_sender, connection_receiver) =
             mpsc::sync_channel(CONNECTION_QUEUE_CAPACITY);
@@ -124,6 +129,7 @@ impl IpcService {
                 issuer: Arc::clone(&issuer),
                 directory: Arc::clone(&directory),
                 messages: Arc::clone(&messages),
+                portals: Arc::clone(&portals),
             };
             let receiver = Arc::clone(&connection_receiver);
             let worker_shutdown = Arc::clone(&shutdown);
@@ -151,6 +157,7 @@ impl IpcService {
             issuer,
             directory,
             messages,
+            portals,
             leased_messages: Mutex::new(BTreeSet::new()),
             shutdown,
             accept_thread: Some(accept_thread),
@@ -175,6 +182,36 @@ impl IpcService {
 
     pub fn remove_workspace(&self, workspace_id: u64) {
         write_lock(&self.directory).workspaces.remove(&workspace_id);
+    }
+
+    pub fn register_portal<B>(
+        &self,
+        portal_id: u64,
+        scope: super::PortalScope,
+        config: crate::portal::PortalConfig,
+        backend: B,
+    ) -> Result<(), PortalServiceError>
+    where
+        B: crate::portal::PortalBackend + Send + 'static,
+        B::Error: Send + Sync,
+    {
+        mutex_lock(&self.portals).register(portal_id, scope, config, backend)
+    }
+
+    pub fn attach_portal_agent(
+        &self,
+        portal_id: u64,
+        agent_id: u64,
+    ) -> Result<(), PortalServiceError> {
+        mutex_lock(&self.portals).attach_agent(portal_id, agent_id)
+    }
+
+    pub fn connect_portal(&self, portal_id: u64) -> Result<(), PortalServiceError> {
+        mutex_lock(&self.portals).connect(portal_id)
+    }
+
+    pub fn close_portal(&self, portal_id: u64) -> Result<(), PortalServiceError> {
+        mutex_lock(&self.portals).close(portal_id)
     }
 
     pub fn connection_info(&self, workspace_id: u64, agent_id: u64) -> Option<ConnectionInfo> {
@@ -239,6 +276,7 @@ struct ServerContext {
     issuer: Arc<CapabilityIssuer>,
     directory: Arc<RwLock<Directory>>,
     messages: Arc<Mutex<MessageStore>>,
+    portals: Arc<Mutex<PortalDispatcher>>,
 }
 
 fn accept_loop(
@@ -419,7 +457,7 @@ fn execute_command(
     context: &ServerContext,
 ) -> Result<ProtocolResult, ProtocolError> {
     if command.is_portal() {
-        return execute_portal_command(command);
+        return execute_portal_command(credentials, command, &context.portals);
     }
     if matches!(command, ProtocolCommand::ListAgents) {
         let directory = read_lock(&context.directory);
@@ -522,19 +560,109 @@ fn execute_command(
     })
 }
 
-fn execute_portal_command(command: ProtocolCommand) -> Result<ProtocolResult, ProtocolError> {
-    let operation = match command {
-        ProtocolCommand::ListPortals => "list connected portals",
-        ProtocolCommand::InspectPortal { .. } => "inspect a portal",
-        ProtocolCommand::ObservePortal { .. } => "observe a portal",
-        ProtocolCommand::RequestPortalAction { .. } => "request a portal action",
-        ProtocolCommand::GetPortalResult { .. } => "retrieve a portal result",
+fn execute_portal_command(
+    credentials: &Credentials,
+    command: ProtocolCommand,
+    portals: &Mutex<PortalDispatcher>,
+) -> Result<ProtocolResult, ProtocolError> {
+    let mut portals = mutex_lock(portals);
+    match command {
+        ProtocolCommand::ListPortals => portals
+            .list(credentials.workspace_id, credentials.agent_id)
+            .map(|portals| ProtocolResult::Portals { portals })
+            .map_err(portal_protocol_error),
+        ProtocolCommand::InspectPortal { portal_id } => portals
+            .inspect(credentials.workspace_id, credentials.agent_id, portal_id)
+            .map(|inspection| ProtocolResult::PortalCapabilities {
+                portal_id,
+                descriptor: inspection.descriptor,
+                capabilities: inspection.capabilities,
+            })
+            .map_err(portal_protocol_error),
+        ProtocolCommand::ObservePortal { portal_id } => portals
+            .observe(credentials.workspace_id, credentials.agent_id, portal_id)
+            .map(|result| ProtocolResult::PortalObservation(result.observation))
+            .map_err(portal_protocol_error),
+        ProtocolCommand::RequestPortalAction {
+            action_id,
+            portal_id,
+            action,
+        } => {
+            let action = portal_action(action)?;
+            portals
+                .request_action(
+                    credentials.workspace_id,
+                    credentials.agent_id,
+                    action_id,
+                    portal_id,
+                    action,
+                )
+                .map(ProtocolResult::PortalReceipt)
+                .map_err(portal_protocol_error)
+        }
+        ProtocolCommand::GetPortalResult { action_id } => portals
+            .result(credentials.workspace_id, credentials.agent_id, &action_id)
+            .map(ProtocolResult::PortalReceipt)
+            .map_err(portal_protocol_error),
         _ => unreachable!("portal dispatcher received a non-portal command"),
+    }
+}
+
+fn portal_action(action: PortalActionRequest) -> Result<PortalAction, ProtocolError> {
+    match action {
+        PortalActionRequest::Click {
+            element_id,
+            observation_revision,
+        } => PortalElementRef::new(observation_revision, element_id)
+            .map(PortalAction::Click)
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())),
+        PortalActionRequest::TypeText {
+            element_id,
+            observation_revision,
+            text,
+        } => PortalElementRef::new(observation_revision, element_id)
+            .map(|element| PortalAction::TypeText { element, text })
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())),
+        PortalActionRequest::Scroll {
+            element_id,
+            observation_revision,
+            delta_x,
+            delta_y,
+        } => element_id
+            .map(|element_id| PortalElementRef::new(observation_revision, element_id))
+            .transpose()
+            .map(|element| PortalAction::Scroll {
+                element,
+                delta_x,
+                delta_y,
+            })
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())),
+        PortalActionRequest::Navigate { target } => Ok(PortalAction::Navigate(target)),
+    }
+}
+
+fn portal_protocol_error(error: PortalServiceError) -> ProtocolError {
+    let code = match error {
+        PortalServiceError::WrongWorkspace { .. }
+        | PortalServiceError::AgentNotAttached { .. }
+        | PortalServiceError::NotConnected(_)
+        | PortalServiceError::UnknownPortal(_) => ErrorCode::PortalUnavailable,
+        PortalServiceError::ActionConflict(_) => ErrorCode::IdempotencyConflict,
+        PortalServiceError::UnknownAction(_) => ErrorCode::UnknownPortalAction,
+        PortalServiceError::Policy(crate::portal::PortalPolicyError::Denied(_)) => {
+            ErrorCode::PortalPolicyDenied
+        }
+        PortalServiceError::Journal(_)
+        | PortalServiceError::Backend(_)
+        | PortalServiceError::Session(_)
+        | PortalServiceError::MissingReceipt(_) => ErrorCode::ServiceUnavailable,
+        PortalServiceError::InvalidPortalId
+        | PortalServiceError::InvalidAgentId
+        | PortalServiceError::InvalidScope
+        | PortalServiceError::DuplicatePortal(_)
+        | PortalServiceError::Policy(_) => ErrorCode::InvalidRequest,
     };
-    Err(ProtocolError::new(
-        ErrorCode::PortalUnavailable,
-        format!("cannot {operation}; the portal dispatcher is not connected"),
-    ))
+    ProtocolError::new(code, error.to_string())
 }
 
 fn validate_capabilities(
@@ -774,6 +902,7 @@ pub enum ServiceError {
     },
     Authentication(AuthenticationError),
     Store(String),
+    Portal(String),
     Bind(io::Error),
     Configure(io::Error),
     Spawn {
@@ -792,6 +921,7 @@ impl Display for ServiceError {
             ),
             Self::Authentication(source) => source.fmt(formatter),
             Self::Store(message) => formatter.write_str(message),
+            Self::Portal(message) => formatter.write_str(message),
             Self::Bind(source) => write!(formatter, "failed to bind local IPC service: {source}"),
             Self::Configure(source) => {
                 write!(formatter, "failed to configure local IPC service: {source}")
@@ -811,7 +941,7 @@ impl Error for ServiceError {
             | Self::Configure(source)
             | Self::Spawn { source, .. } => Some(source),
             Self::Authentication(source) => Some(source),
-            Self::Store(_) => None,
+            Self::Store(_) | Self::Portal(_) => None,
         }
     }
 }
@@ -825,6 +955,12 @@ impl From<AuthenticationError> for ServiceError {
 impl From<StoreError> for ServiceError {
     fn from(value: StoreError) -> Self {
         Self::Store(value.to_string())
+    }
+}
+
+impl From<PortalServiceError> for ServiceError {
+    fn from(value: PortalServiceError) -> Self {
+        Self::Portal(value.to_string())
     }
 }
 

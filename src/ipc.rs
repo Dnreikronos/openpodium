@@ -3,6 +3,7 @@
 mod auth;
 mod cli;
 mod client;
+mod portal;
 mod protocol;
 mod server;
 mod store;
@@ -12,6 +13,9 @@ pub use cli::run_cli;
 pub use client::{
     AGENT_ID_ENV, AVAILABLE_ENV, CLI_ENV, ClientError, ConnectionConfig, ENDPOINT_ENV, IpcClient,
     TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
+};
+pub use portal::{
+    PortalDispatcher, PortalInspection, PortalObservationResult, PortalScope, PortalServiceError,
 };
 pub use protocol::{
     AgentCapabilities, AgentDescriptor, Credentials, ErrorCode, HandoffKind, MessageId,

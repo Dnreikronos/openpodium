@@ -482,6 +482,7 @@ pub enum PortalPolicyOutcome {
 pub struct PortalActionReceipt {
     pub action_id: MessageId,
     pub portal_id: u64,
+    pub duplicate: bool,
     pub state: PortalActionState,
     pub policy: PortalPolicyOutcome,
     pub created_at_ms: u64,
@@ -543,6 +544,7 @@ pub enum ProtocolResult {
     },
     PortalCapabilities {
         portal_id: u64,
+        descriptor: PortalDescriptor,
         capabilities: Vec<PortalCapability>,
     },
     PortalObservation(PortalObservation),

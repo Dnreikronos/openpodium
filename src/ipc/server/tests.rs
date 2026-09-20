@@ -66,7 +66,7 @@ fn agent_listing_is_scoped_to_the_authenticated_workspace() {
 }
 
 #[test]
-fn portal_commands_use_the_dedicated_dispatcher_boundary() {
+fn portal_listing_is_scoped_to_the_authenticated_agent() {
     let (_temp, service) = service();
     let response = round_trip(
         service.endpoint(),
@@ -80,7 +80,10 @@ fn portal_commands_use_the_dedicated_dispatcher_boundary() {
     );
 
     assert_eq!(response.version, Some(PROTOCOL_VERSION));
-    assert_eq!(response.error.unwrap().code, ErrorCode::PortalUnavailable);
+    assert!(matches!(
+        response.result,
+        Some(ProtocolResult::Portals { portals }) if portals.is_empty()
+    ));
     assert!(service.try_recv().is_none());
 }
 
