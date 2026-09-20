@@ -192,17 +192,17 @@ fn refresh(workspace: &crate::domain::Workspace) -> Result<Floors, String> {
             continue;
         }
         let path = encoded(&checkout.path)?;
-        let existing = after
-            .entries
-            .values_mut()
-            .find(|f| f.directory == path && f.lifecycle != FloorLifecycle::Removed);
+        let existing = after.entries.values_mut().find(|f| {
+            same_path(Path::new(f.directory.as_str()), &checkout.path)
+                && f.lifecycle != FloorLifecycle::Removed
+        });
         if let Some(floor) = existing {
             // A switched branch or replaced repository never inherits ownership.
             if floor.branch != checkout.branch
                 || (floor.managed
                     && checkout.path.is_dir()
                     && !repo.owns(&checkout, floor.ownership_token.as_deref())?)
-                || floor.repository.as_str() != encoded(&repo.common_directory)?.as_str()
+                || !same_path(Path::new(floor.repository.as_str()), &repo.common_directory)
             {
                 floor.managed = false;
                 floor.ownership_token = None;
@@ -329,7 +329,7 @@ fn remove(
         }
     }
     let repo = floor_repository(workspace)?;
-    if encoded(&repo.common_directory)? != floor.repository {
+    if !same_path(&repo.common_directory, Path::new(floor.repository.as_str())) {
         return Err("The workspace repository changed".to_owned());
     }
     let checkout = Checkout {
@@ -383,6 +383,13 @@ fn encoded(path: &Path) -> Result<WorkspaceDirectory, String> {
             .ok_or("Worktree paths must be valid Unicode")?,
     )
     .map_err(|e| e.to_string())
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (dunce::canonicalize(left), dunce::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => dunce::simplified(left) == dunce::simplified(right),
+    }
 }
 
 #[cfg(test)]

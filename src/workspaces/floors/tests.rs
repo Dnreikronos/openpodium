@@ -270,6 +270,15 @@ fn missing_floor_preserves_canvas_but_has_no_launch_directory() {
     assert!(workspace.node_directory(NodeId::new(1)).is_none());
 }
 
+#[cfg(windows)]
+#[test]
+fn floor_identity_ignores_windows_separator_spelling() {
+    let directory = tempfile::tempdir().unwrap();
+    let canonical = dunce::canonicalize(directory.path()).unwrap();
+    let alternate = std::path::PathBuf::from(canonical.to_string_lossy().replace('\\', "/"));
+    assert!(same_path(&canonical, &alternate));
+}
+
 #[test]
 fn task_floor_recovers_by_replaying_events_after_an_older_snapshot() {
     let (_project, storage, mut manager, id) = setup();
