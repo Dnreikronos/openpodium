@@ -24,7 +24,15 @@ pub struct AppiumBackend {
     session_id: Option<String>,
     viewport: PortalViewport,
     element_revision: u64,
-    element_selectors: BTreeMap<String, String>,
+    element_bindings: BTreeMap<String, ElementBinding>,
+}
+
+/// An observed element, addressed by its position in the source tree and
+/// pinned to the identity it carried when it was observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ElementBinding {
+    path: String,
+    identity: String,
 }
 
 impl AppiumBackend {
@@ -38,7 +46,7 @@ impl AppiumBackend {
             session_id: None,
             viewport: PortalViewport::new(1_080, 1_920).expect("default viewport is non-zero"),
             element_revision: 0,
-            element_selectors: BTreeMap::new(),
+            element_bindings: BTreeMap::new(),
         })
     }
 
@@ -104,15 +112,29 @@ impl AppiumBackend {
         )
     }
 
+    /// Resolves an observed token to a live element, refusing when the tree
+    /// moved underneath it. The stored path is positional, so an insertion or
+    /// a reorder would otherwise point it at a different widget.
     fn resolve_element(&self, element_id: &str) -> Result<String, AppiumError> {
-        let selector = self
-            .element_selectors
+        let binding = self
+            .element_bindings
             .get(element_id)
             .ok_or_else(|| AppiumError::InvalidElementId(element_id.to_owned()))?;
+        let identity = self
+            .current_identities()?
+            .remove(&binding.path)
+            .ok_or_else(|| AppiumError::ElementUnavailable(element_id.to_owned()))?;
+        if identity != binding.identity {
+            return Err(AppiumError::ElementChanged {
+                element_id: element_id.to_owned(),
+                observed: binding.identity.clone(),
+                found: identity,
+            });
+        }
         let response = self.request(
             "POST",
             &self.session_path("/element")?,
-            Some(json!({"using": "xpath", "value": selector})),
+            Some(json!({"using": "xpath", "value": &binding.path})),
         )?;
         response
             .pointer("/value/element-6066-11e4-a52e-4f735466cecf")
@@ -122,6 +144,23 @@ impl AppiumBackend {
             .ok_or_else(|| {
                 AppiumError::Protocol("element lookup returned no element ID".to_owned())
             })
+    }
+
+    fn current_identities(&self) -> Result<BTreeMap<String, String>, AppiumError> {
+        let (bindings, _) = appium_elements(&self.page_source()?)?;
+        Ok(bindings
+            .into_values()
+            .map(|binding| (binding.path, binding.identity))
+            .collect())
+    }
+
+    fn page_source(&self) -> Result<String, AppiumError> {
+        let source = self.request("GET", &self.session_path("/source")?, None)?;
+        source
+            .get("value")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| AppiumError::Protocol("source response has no value".to_owned()))
     }
 
     fn touch_actions(&self, actions: Vec<Value>) -> Result<(), AppiumError> {
@@ -226,7 +265,7 @@ impl PortalBackend for AppiumBackend {
         })();
         if result.is_err() {
             self.session_id = None;
-            self.element_selectors.clear();
+            self.element_bindings.clear();
             session.disconnect();
         }
         result
@@ -235,14 +274,10 @@ impl PortalBackend for AppiumBackend {
     fn observe(&mut self, session: &mut PortalSession) -> Result<PortalObservation, Self::Error> {
         let revision = session.observe().map_err(AppiumError::Session)?;
         let frame = self.capture_screenshot(revision)?;
-        let source = self.request("GET", &self.session_path("/source")?, None)?;
-        let source = source
-            .get("value")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppiumError::Protocol("source response has no value".to_owned()))?;
-        let (element_selectors, elements) = appium_elements(source)?;
+        let source = self.page_source()?;
+        let (element_bindings, elements) = appium_elements(&source)?;
         self.element_revision = revision;
-        self.element_selectors = element_selectors;
+        self.element_bindings = element_bindings;
         let accessibility = PortalAccessibilitySnapshot::new(
             revision,
             json!({"format": "appium-elements-v1", "source": source, "elements": elements})
@@ -381,7 +416,7 @@ impl PortalBackend for AppiumBackend {
             self.request("DELETE", &self.session_path("")?, None)?;
             self.session_id = None;
         }
-        self.element_selectors.clear();
+        self.element_bindings.clear();
         session.closed();
         Ok(())
     }
@@ -393,12 +428,27 @@ struct XmlPath {
     child_counts: BTreeMap<String, usize>,
 }
 
-fn appium_elements(source: &str) -> Result<(BTreeMap<String, String>, Vec<Value>), AppiumError> {
+/// Attributes a platform derives from what an element *is*, not from where it
+/// currently sits or what state it is in.
+const IDENTITY_ATTRIBUTES: [&str; 8] = [
+    "resource-id",
+    "content-desc",
+    "text",
+    "name",
+    "label",
+    "value",
+    "type",
+    "package",
+];
+
+fn appium_elements(
+    source: &str,
+) -> Result<(BTreeMap<String, ElementBinding>, Vec<Value>), AppiumError> {
     let mut reader = Reader::from_str(source);
     reader.config_mut().trim_text(true);
     let mut roots = BTreeMap::new();
     let mut stack = Vec::<XmlPath>::new();
-    let mut selectors = BTreeMap::new();
+    let mut bindings = BTreeMap::new();
     let mut elements = Vec::new();
     loop {
         match reader.read_event() {
@@ -407,7 +457,7 @@ fn appium_elements(source: &str) -> Result<(BTreeMap<String, String>, Vec<Value>
                     &node,
                     &mut roots,
                     &mut stack,
-                    &mut selectors,
+                    &mut bindings,
                     &mut elements,
                 )?;
                 stack.push(XmlPath {
@@ -416,13 +466,7 @@ fn appium_elements(source: &str) -> Result<(BTreeMap<String, String>, Vec<Value>
                 });
             }
             Ok(Event::Empty(node)) => {
-                record_appium_element(
-                    &node,
-                    &mut roots,
-                    &mut stack,
-                    &mut selectors,
-                    &mut elements,
-                )?;
+                record_appium_element(&node, &mut roots, &mut stack, &mut bindings, &mut elements)?;
             }
             Ok(Event::End(_)) => {
                 stack.pop();
@@ -436,14 +480,14 @@ fn appium_elements(source: &str) -> Result<(BTreeMap<String, String>, Vec<Value>
             }
         }
     }
-    Ok((selectors, elements))
+    Ok((bindings, elements))
 }
 
 fn record_appium_element(
     node: &BytesStart<'_>,
     roots: &mut BTreeMap<String, usize>,
     stack: &mut [XmlPath],
-    selectors: &mut BTreeMap<String, String>,
+    bindings: &mut BTreeMap<String, ElementBinding>,
     elements: &mut Vec<Value>,
 ) -> Result<String, AppiumError> {
     let role = node.name().as_ref().to_owned();
@@ -474,8 +518,14 @@ fn record_appium_element(
                 .into_owned();
             attributes.insert(key, value);
         }
-        let element_id = format!("appium-{}", selectors.len() + 1);
-        selectors.insert(element_id.clone(), path.clone());
+        let element_id = format!("appium-{}", bindings.len() + 1);
+        bindings.insert(
+            element_id.clone(),
+            ElementBinding {
+                path: path.clone(),
+                identity: element_identity(&role, &attributes),
+            },
+        );
         elements.push(json!({
             "element_id": element_id,
             "role": role,
@@ -484,6 +534,21 @@ fn record_appium_element(
         }));
     }
     Ok(path)
+}
+
+/// What the element claims to be, ignoring the state attributes a platform
+/// updates as the user interacts with it.
+fn element_identity(role: &str, attributes: &BTreeMap<String, String>) -> String {
+    let mut identity = String::from(role);
+    for name in IDENTITY_ATTRIBUTES {
+        if let Some(value) = attributes.get(name) {
+            identity.push('\u{1f}');
+            identity.push_str(name);
+            identity.push('=');
+            identity.push_str(value);
+        }
+    }
+    identity
 }
 
 impl Drop for AppiumBackend {
@@ -562,6 +627,12 @@ pub enum AppiumError {
         detail: String,
     },
     InvalidElementId(String),
+    ElementUnavailable(String),
+    ElementChanged {
+        element_id: String,
+        observed: String,
+        found: String,
+    },
     CoordinateOutsideViewport {
         x: u32,
         y: u32,
@@ -596,6 +667,17 @@ impl Display for AppiumError {
                 "Appium command failed with HTTP {status}: {detail}"
             ),
             Self::InvalidElementId(id) => write!(formatter, "invalid Appium element ID {id:?}"),
+            Self::ElementUnavailable(id) => {
+                write!(formatter, "observed element {id} is no longer on screen")
+            }
+            Self::ElementChanged {
+                element_id,
+                observed,
+                found,
+            } => write!(
+                formatter,
+                "element {element_id} changed since it was observed: {observed:?} became {found:?}"
+            ),
             Self::CoordinateOutsideViewport { x, y } => write!(
                 formatter,
                 "device coordinate ({x}, {y}) is outside the viewport"
@@ -751,6 +833,8 @@ mod tests {
                 r#"{"value":{"width":800,"height":600}}"#,
                 r#"{"value":"AQ=="}"#,
                 r#"{"value":"<hierarchy><android.widget.Button text=\"Submit\" resource-id=\"submit\"/></hierarchy>"}"#,
+                // Re-read before the click: the tree is unchanged.
+                r#"{"value":"<hierarchy><android.widget.Button text=\"Submit\" resource-id=\"submit\"/></hierarchy>"}"#,
                 r#"{"value":{"element-6066-11e4-a52e-4f735466cecf":"element-42"}}"#,
                 r#"{"value":null}"#,
                 r#"{"value":null}"#,
@@ -814,6 +898,69 @@ mod tests {
             requests
                 .iter()
                 .any(|request| request.contains("/element/element-42/click"))
+        );
+    }
+
+    #[test]
+    fn a_token_is_not_clicked_when_another_element_takes_its_place() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        let worker = thread::spawn(move || {
+            for response in [
+                r#"{"value":{"sessionId":"session-1"}}"#,
+                r#"{"value":{"width":800,"height":600}}"#,
+                r#"{"value":"AQ=="}"#,
+                r#"{"value":"<hierarchy><android.widget.Button text=\"Cancel\" resource-id=\"cancel\"/></hierarchy>"}"#,
+                // A Delete button is inserted ahead of Cancel, so the observed
+                // path now addresses a different widget.
+                r#"{"value":"<hierarchy><android.widget.Button text=\"Delete\" resource-id=\"delete\"/><android.widget.Button text=\"Cancel\" resource-id=\"cancel\"/></hierarchy>"}"#,
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                captured_requests.lock().unwrap().push(request);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+                stream.flush().unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+        });
+        let mut backend = AppiumBackend::with_address(PortalTargetKind::Android, address).unwrap();
+        let config = PortalConfig::new(
+            PortalTarget::new(PortalTargetKind::Android, "emulator-5554").unwrap(),
+            PortalPresentation::default(),
+        );
+        let mut session = PortalSession::new(1);
+
+        backend.connect(&config, &mut session).unwrap();
+        let observation = backend.observe(&mut session).unwrap();
+        let error = backend
+            .execute(
+                &mut session,
+                &PortalAction::Click(
+                    PortalElementRef::new(observation.revision(), "appium-1").unwrap(),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, AppiumError::ElementChanged { element_id, .. } if element_id == "appium-1"),
+            "unexpected error: {error}"
+        );
+        worker.join().unwrap();
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("/click")),
+            "a changed element must never be clicked"
         );
     }
 }
