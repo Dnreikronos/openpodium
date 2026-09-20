@@ -4,10 +4,12 @@ use std::fmt::{self, Display, Formatter};
 use super::{
     Agent, AgentId, AgentState, CanvasLayout, ChatAttachment, ChatAttachmentId, ChatDraft,
     ChatMessage, ChatMessageId, ChatThread, ChatThreadId, ChatValidationError, CommandPreset,
-    CommandPresetId, ConnectionId, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId,
-    HandoffMutationError, Name, Node, NodeGroupId, NodeId, NodeTarget, Role, RoleId, RoutineId,
-    RoutineRunId, RoutineTriggerId, RoutineVersionId, Task, TaskId, TaskState, ThreadColor,
-    TimelineEventId, Timestamp, WorkspaceId, WorkspaceSettings,
+    CommandPresetId, ConnectionId, Content, EnvironmentProfile, EnvironmentProfileId, Handoff,
+    HandoffId, HandoffMutationError, Name, Node, NodeGroupId, NodeId, NodeTarget, Role, RoleId,
+    Routine, RoutineAttempt, RoutineError, RoutineId, RoutineRun, RoutineRunId, RoutineStepId,
+    RoutineTransition, RoutineTrigger, RoutineTriggerFiring, RoutineTriggerId, RoutineVersion,
+    RoutineVersionId, Task, TaskId, TaskState, ThreadColor, TimelineEventId, Timestamp,
+    WorkspaceId, WorkspaceSettings,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +85,49 @@ pub enum DomainCommand {
     TransitionTask {
         task_id: TaskId,
         to: TaskState,
+    },
+    AddRoutine(Routine),
+    AddRoutineVersion {
+        routine_id: RoutineId,
+        version: RoutineVersion,
+    },
+    UpdateRoutine {
+        routine_id: RoutineId,
+        name: Name,
+        description: Option<Content>,
+    },
+    PutRoutineTrigger {
+        routine_id: RoutineId,
+        trigger: RoutineTrigger,
+    },
+    RemoveRoutineTrigger {
+        routine_id: RoutineId,
+        trigger_id: RoutineTriggerId,
+    },
+    /// Consumes the trigger occurrence and creates its run in one transaction.
+    StartRoutineRun {
+        run: RoutineRun,
+        firing: Option<RoutineTriggerFiring>,
+        next_occurrence: Option<Timestamp>,
+    },
+    /// Records missed schedule occurrences without starting runs for them.
+    SkipRoutineOccurrences {
+        routine_id: RoutineId,
+        trigger_id: RoutineTriggerId,
+        skipped: u32,
+        next_occurrence: Option<Timestamp>,
+    },
+    AdvanceRoutineRun {
+        run_id: RoutineRunId,
+        transition: RoutineTransition,
+    },
+    /// Records the attempt, its task, and its handoff before any dispatch.
+    DispatchRoutineStep {
+        run_id: RoutineRunId,
+        step_id: RoutineStepId,
+        attempt: RoutineAttempt,
+        task: Task,
+        handoff: Handoff,
     },
 }
 
@@ -179,6 +224,49 @@ pub enum DomainEvent {
         task_id: TaskId,
         from: TaskState,
         to: TaskState,
+    },
+    RoutineAdded(Routine),
+    RoutineVersionAdded {
+        routine_id: RoutineId,
+        version: RoutineVersion,
+    },
+    RoutineChanged {
+        routine_id: RoutineId,
+        from_name: Name,
+        to_name: Name,
+        from_description: Option<Content>,
+        to_description: Option<Content>,
+    },
+    RoutineTriggerChanged {
+        routine_id: RoutineId,
+        from: Option<RoutineTrigger>,
+        to: RoutineTrigger,
+    },
+    RoutineTriggerRemoved {
+        routine_id: RoutineId,
+        trigger: RoutineTrigger,
+    },
+    RoutineRunStarted {
+        run: RoutineRun,
+        firing: Option<RoutineTriggerFiring>,
+        next_occurrence: Option<Timestamp>,
+    },
+    RoutineOccurrencesSkipped {
+        routine_id: RoutineId,
+        trigger_id: RoutineTriggerId,
+        skipped: u32,
+        next_occurrence: Option<Timestamp>,
+    },
+    RoutineRunAdvanced {
+        run_id: RoutineRunId,
+        transition: RoutineTransition,
+    },
+    RoutineStepDispatched {
+        run_id: RoutineRunId,
+        step_id: RoutineStepId,
+        attempt: RoutineAttempt,
+        task: Task,
+        handoff: Handoff,
     },
 }
 
@@ -400,6 +488,30 @@ pub enum DomainError {
         expected: WorkspaceId,
         actual: WorkspaceId,
     },
+    UnchangedRoutine,
+    RoutineConflict(RoutineId),
+    RoutineTriggerConflict(RoutineTriggerId),
+    InvalidRoutine(RoutineError),
+    RoutineRunMismatch {
+        run_id: RoutineRunId,
+        routine_id: RoutineId,
+    },
+    RoutineStepTaskMismatch {
+        run_id: RoutineRunId,
+        step_id: RoutineStepId,
+    },
+    RoutineOccurrenceConsumed {
+        trigger_id: RoutineTriggerId,
+    },
+    RoutineRunAlreadyActive {
+        routine_id: RoutineId,
+        run_id: RoutineRunId,
+    },
+    RoutineReservationHeld {
+        run_id: RoutineRunId,
+        step_id: RoutineStepId,
+        detail: String,
+    },
 }
 
 impl Display for DomainError {
@@ -594,7 +706,47 @@ impl Display for DomainError {
                 formatter,
                 "timeline event {event_id} belongs to workspace {actual}, not workspace {expected}"
             ),
+            Self::UnchangedRoutine => formatter.write_str("routine is unchanged"),
+            Self::RoutineConflict(id) => write!(
+                formatter,
+                "routine {id} event does not match the current routine"
+            ),
+            Self::RoutineTriggerConflict(id) => write!(
+                formatter,
+                "routine trigger {id} event does not match the current trigger"
+            ),
+            Self::InvalidRoutine(error) => error.fmt(formatter),
+            Self::RoutineRunMismatch { run_id, routine_id } => write!(
+                formatter,
+                "routine run {run_id} does not belong to routine {routine_id}"
+            ),
+            Self::RoutineStepTaskMismatch { run_id, step_id } => write!(
+                formatter,
+                "the dispatch record for step {step_id} of run {run_id} does not match its task and handoff"
+            ),
+            Self::RoutineOccurrenceConsumed { trigger_id } => write!(
+                formatter,
+                "trigger {trigger_id} already consumed this occurrence"
+            ),
+            Self::RoutineRunAlreadyActive { routine_id, run_id } => write!(
+                formatter,
+                "routine {routine_id} already has active run {run_id}"
+            ),
+            Self::RoutineReservationHeld {
+                run_id,
+                step_id,
+                detail,
+            } => write!(
+                formatter,
+                "step {step_id} of run {run_id} cannot start while {detail} is held"
+            ),
         }
+    }
+}
+
+impl From<RoutineError> for DomainError {
+    fn from(error: RoutineError) -> Self {
+        Self::InvalidRoutine(error)
     }
 }
 

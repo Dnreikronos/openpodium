@@ -7,19 +7,25 @@ use crate::domain::{
     Connection, ConnectionId, ConnectionKind, ContainerEnvironment, Content, CustomEnvironment,
     DeliveryAttempt, DeliveryMechanism, DeliveryOutcome, DiffComparison, DomainCommand,
     DomainEvent, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Freehand, Handoff,
-    HandoffId, HandoffMessageId, HandoffPayload, HandoffProgress, HandoffResponse,
-    HandoffOrigin, HandoffResponseStatus, HandoffTermination, Name, Node, NodeGroup, NodeGroupId,
-    NodeId,
+    HandoffId, HandoffMessageId, HandoffOrigin, HandoffPayload, HandoffProgress, HandoffResponse,
+    HandoffResponseStatus, HandoffTermination, Name, Node, NodeGroup, NodeGroupId, NodeId,
     NodeTarget, NormalizedPoint, PortalConfig, PortalPresentation, PortalTarget, PortalTargetKind,
-    ProjectPath, Role, RoleColor, RoleIcon, RoleId, RoutineRunId, RoutineStepId, Shape,
-    ShapeKind, SshEnvironment, StrokeWidth,
+    ProjectPath, Role, RoleColor, RoleIcon, RoleId, Routine, RoutineApproval,
+    RoutineApprovalDecision, RoutineApprovalRecord, RoutineAttempt, RoutineAttemptId,
+    RoutineAttemptOutcome, RoutineBindingSource, RoutineCadence, RoutineCheckout,
+    RoutineCheckoutClaim, RoutineId, RoutineInputDeclaration, RoutineInputKey, RoutineInterruption,
+    RoutineInterruptionReason, RoutineOccurrenceKey, RoutineOutputKey, RoutineResourceKey,
+    RoutineRetryPolicy, RoutineRun, RoutineRunId, RoutineRunPin, RoutineRunState, RoutineSchedule,
+    RoutineStep, RoutineStepClaims, RoutineStepId, RoutineStepRun, RoutineStepState,
+    RoutineTransition, RoutineTrigger, RoutineTriggerFiring, RoutineTriggerId, RoutineTriggerKind,
+    RoutineValue, RoutineVersion, RoutineVersionId, Shape, ShapeKind, SshEnvironment, StrokeWidth,
     Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceDirectory, WorkspaceIcon,
     WorkspaceId, WorkspaceSettings,
 };
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 11;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 12;
 pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 10;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
@@ -112,6 +118,13 @@ pub(crate) fn decode_event(
             "domain event",
             sequence,
             "portal canvas nodes require event format version 11",
+        ));
+    }
+    if format_version < 12 && stored.requires_version_twelve() {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "routines, routine runs, and structured step outputs require event format version 12",
         ));
     }
     stored
@@ -275,6 +288,51 @@ enum StoredEvent {
         from: TaskStateV1,
         to: TaskStateV1,
     },
+    RoutineAdded {
+        routine: RoutineV1,
+    },
+    RoutineVersionAdded {
+        routine_id: u64,
+        version: RoutineVersionV1,
+    },
+    RoutineChanged {
+        routine_id: u64,
+        from_name: String,
+        to_name: String,
+        from_description: Option<String>,
+        to_description: Option<String>,
+    },
+    RoutineTriggerChanged {
+        routine_id: u64,
+        from: Option<RoutineTriggerV1>,
+        to: RoutineTriggerV1,
+    },
+    RoutineTriggerRemoved {
+        routine_id: u64,
+        trigger: RoutineTriggerV1,
+    },
+    RoutineRunStarted {
+        run: RoutineRunV1,
+        from_firing: Option<RoutineFiringV1>,
+        next_occurrence: Option<u64>,
+    },
+    RoutineOccurrencesSkipped {
+        routine_id: u64,
+        trigger_id: u64,
+        skipped: u32,
+        next_occurrence: Option<u64>,
+    },
+    RoutineRunAdvanced {
+        run_id: u64,
+        transition: RoutineTransitionV1,
+    },
+    RoutineStepDispatched {
+        run_id: u64,
+        step_id: u64,
+        attempt: RoutineAttemptV1,
+        task: TaskV1,
+        handoff: HandoffV1,
+    },
 }
 
 impl From<&DomainEvent> for StoredEvent {
@@ -423,11 +481,113 @@ impl From<&DomainEvent> for StoredEvent {
                 from: (*from).into(),
                 to: (*to).into(),
             },
+            DomainEvent::RoutineAdded(routine) => Self::RoutineAdded {
+                routine: RoutineV1::from(routine),
+            },
+            DomainEvent::RoutineVersionAdded {
+                routine_id,
+                version,
+            } => Self::RoutineVersionAdded {
+                routine_id: routine_id.get(),
+                version: RoutineVersionV1::from(version),
+            },
+            DomainEvent::RoutineChanged {
+                routine_id,
+                from_name,
+                to_name,
+                from_description,
+                to_description,
+            } => Self::RoutineChanged {
+                routine_id: routine_id.get(),
+                from_name: from_name.as_str().to_owned(),
+                to_name: to_name.as_str().to_owned(),
+                from_description: from_description
+                    .as_ref()
+                    .map(|value| value.as_str().to_owned()),
+                to_description: to_description
+                    .as_ref()
+                    .map(|value| value.as_str().to_owned()),
+            },
+            DomainEvent::RoutineTriggerChanged {
+                routine_id,
+                from,
+                to,
+            } => Self::RoutineTriggerChanged {
+                routine_id: routine_id.get(),
+                from: from.as_ref().map(RoutineTriggerV1::from),
+                to: RoutineTriggerV1::from(to),
+            },
+            DomainEvent::RoutineTriggerRemoved {
+                routine_id,
+                trigger,
+            } => Self::RoutineTriggerRemoved {
+                routine_id: routine_id.get(),
+                trigger: RoutineTriggerV1::from(trigger),
+            },
+            DomainEvent::RoutineRunStarted {
+                run,
+                firing,
+                next_occurrence,
+            } => Self::RoutineRunStarted {
+                run: RoutineRunV1::from(run),
+                from_firing: firing.as_ref().map(RoutineFiringV1::from),
+                next_occurrence: next_occurrence.map(Timestamp::as_unix_millis),
+            },
+            DomainEvent::RoutineOccurrencesSkipped {
+                routine_id,
+                trigger_id,
+                skipped,
+                next_occurrence,
+            } => Self::RoutineOccurrencesSkipped {
+                routine_id: routine_id.get(),
+                trigger_id: trigger_id.get(),
+                skipped: *skipped,
+                next_occurrence: next_occurrence.map(Timestamp::as_unix_millis),
+            },
+            DomainEvent::RoutineRunAdvanced { run_id, transition } => Self::RoutineRunAdvanced {
+                run_id: run_id.get(),
+                transition: RoutineTransitionV1::from(transition),
+            },
+            DomainEvent::RoutineStepDispatched {
+                run_id,
+                step_id,
+                attempt,
+                task,
+                handoff,
+            } => Self::RoutineStepDispatched {
+                run_id: run_id.get(),
+                step_id: step_id.get(),
+                attempt: RoutineAttemptV1::from(attempt),
+                task: TaskV1::from(task),
+                handoff: HandoffV1::from(handoff),
+            },
         }
     }
 }
 
 impl StoredEvent {
+    /// Routine records and the structured outputs a routine step returns.
+    fn requires_version_twelve(&self) -> bool {
+        match self {
+            Self::RoutineAdded { .. }
+            | Self::RoutineVersionAdded { .. }
+            | Self::RoutineChanged { .. }
+            | Self::RoutineTriggerChanged { .. }
+            | Self::RoutineTriggerRemoved { .. }
+            | Self::RoutineRunStarted { .. }
+            | Self::RoutineOccurrencesSkipped { .. }
+            | Self::RoutineRunAdvanced { .. }
+            | Self::RoutineStepDispatched { .. } => true,
+            Self::HandoffAdded { handoff } | Self::TaskHandoffAdded { handoff, .. } => {
+                handoff.uses_routine_fields()
+            }
+            Self::HandoffChanged { after, .. } => after.uses_routine_fields(),
+            Self::TaskCancelled { after, .. } => after.uses_routine_fields(),
+            Self::TaskResumed { handoff, .. } => handoff.uses_routine_fields(),
+            _ => false,
+        }
+    }
+
     fn requires_version_three(&self) -> bool {
         match self {
             Self::AgentAdded { agent } => agent.program != AgentProgramV1::Shell,
@@ -675,6 +835,94 @@ impl StoredEvent {
                 from: from.into(),
                 to: to.into(),
             }),
+            Self::RoutineAdded { routine } => Ok(DomainEvent::RoutineAdded(routine.into_domain()?)),
+            Self::RoutineVersionAdded {
+                routine_id,
+                version,
+            } => Ok(DomainEvent::RoutineVersionAdded {
+                routine_id: RoutineId::new(routine_id),
+                version: version.into_domain()?,
+            }),
+            Self::RoutineChanged {
+                routine_id,
+                from_name,
+                to_name,
+                from_description,
+                to_description,
+            } => Ok(DomainEvent::RoutineChanged {
+                routine_id: RoutineId::new(routine_id),
+                from_name: Name::new(from_name).map_err(|error| error.to_string())?,
+                to_name: Name::new(to_name).map_err(|error| error.to_string())?,
+                from_description: from_description
+                    .map(Content::new)
+                    .transpose()
+                    .map_err(|error| error.to_string())?,
+                to_description: to_description
+                    .map(Content::new)
+                    .transpose()
+                    .map_err(|error| error.to_string())?,
+            }),
+            Self::RoutineTriggerChanged {
+                routine_id,
+                from,
+                to,
+            } => Ok(DomainEvent::RoutineTriggerChanged {
+                routine_id: RoutineId::new(routine_id),
+                from: from.map(RoutineTriggerV1::into_domain).transpose()?,
+                to: to.into_domain()?,
+            }),
+            Self::RoutineTriggerRemoved {
+                routine_id,
+                trigger,
+            } => Ok(DomainEvent::RoutineTriggerRemoved {
+                routine_id: RoutineId::new(routine_id),
+                trigger: trigger.into_domain()?,
+            }),
+            Self::RoutineRunStarted {
+                run,
+                from_firing,
+                next_occurrence,
+            } => Ok(DomainEvent::RoutineRunStarted {
+                run: run.into_domain()?,
+                firing: from_firing.map(RoutineFiringV1::into_domain).transpose()?,
+                next_occurrence: next_occurrence.map(Timestamp::from_unix_millis),
+            }),
+            Self::RoutineOccurrencesSkipped {
+                routine_id,
+                trigger_id,
+                skipped,
+                next_occurrence,
+            } => Ok(DomainEvent::RoutineOccurrencesSkipped {
+                routine_id: RoutineId::new(routine_id),
+                trigger_id: RoutineTriggerId::new(trigger_id),
+                skipped,
+                next_occurrence: next_occurrence.map(Timestamp::from_unix_millis),
+            }),
+            Self::RoutineRunAdvanced { run_id, transition } => {
+                Ok(DomainEvent::RoutineRunAdvanced {
+                    run_id: RoutineRunId::new(run_id),
+                    transition: transition.into_domain()?,
+                })
+            }
+            Self::RoutineStepDispatched {
+                run_id,
+                step_id,
+                attempt,
+                task,
+                handoff,
+            } => {
+                let (task, state) = task.into_domain()?;
+                if state != TaskState::Queued {
+                    return Err("a dispatched routine step records a queued task".to_owned());
+                }
+                Ok(DomainEvent::RoutineStepDispatched {
+                    run_id: RoutineRunId::new(run_id),
+                    step_id: RoutineStepId::new(step_id),
+                    attempt: attempt.into_domain()?,
+                    task,
+                    handoff: handoff.into_domain()?,
+                })
+            }
         }
     }
 }
@@ -1711,6 +1959,11 @@ impl HandoffV1 {
         }
         restore_delivery_attempts(&mut handoff, follow_up_attempts)?;
         Ok(handoff)
+    }
+
+    /// Whether the record needs the routine-aware event format.
+    fn uses_routine_fields(&self) -> bool {
+        self.routine_origin.is_some()
     }
 
     fn has_orchestration_fields(&self) -> bool {
@@ -2771,6 +3024,1255 @@ impl FloorsV1 {
                 .map(|(n, f)| (NodeId::new(n), f))
                 .collect(),
             active: self.active,
+        })
+    }
+}
+
+// Routine records. Every field the scheduler reads when it decides what to run
+// next is stored, so a recovered run makes the same decisions the live one did.
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineV1 {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    versions: Vec<RoutineVersionV1>,
+    #[serde(default)]
+    triggers: Vec<RoutineTriggerV1>,
+}
+
+impl From<&Routine> for RoutineV1 {
+    fn from(routine: &Routine) -> Self {
+        Self {
+            id: routine.id().get(),
+            name: routine.name().as_str().to_owned(),
+            description: routine.description().map(|value| value.as_str().to_owned()),
+            versions: routine
+                .versions()
+                .iter()
+                .map(RoutineVersionV1::from)
+                .collect(),
+            triggers: routine.triggers().map(RoutineTriggerV1::from).collect(),
+        }
+    }
+}
+
+impl RoutineV1 {
+    fn into_domain(self) -> Result<Routine, String> {
+        let id = RoutineId::new(self.id);
+        let versions = self
+            .versions
+            .into_iter()
+            .map(RoutineVersionV1::into_domain)
+            .collect::<Result<Vec<_>, _>>()?;
+        let triggers = self
+            .triggers
+            .into_iter()
+            .map(RoutineTriggerV1::into_domain)
+            .collect::<Result<Vec<_>, _>>()?;
+        Routine::restore(
+            id,
+            Name::new(self.name).map_err(|error| error.to_string())?,
+            self.description
+                .map(Content::new)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+            versions,
+            triggers,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineVersionV1 {
+    id: u64,
+    routine_id: u64,
+    number: u32,
+    inputs: Vec<RoutineInputV1>,
+    steps: Vec<RoutineStepV1>,
+    #[serde(default)]
+    template: Option<String>,
+    created_at: u64,
+}
+
+impl From<&RoutineVersion> for RoutineVersionV1 {
+    fn from(version: &RoutineVersion) -> Self {
+        Self {
+            id: version.id().get(),
+            routine_id: version.routine_id().get(),
+            number: version.number(),
+            inputs: version.inputs().iter().map(RoutineInputV1::from).collect(),
+            steps: version.steps().iter().map(RoutineStepV1::from).collect(),
+            template: version.template().map(|value| value.as_str().to_owned()),
+            created_at: version.created_at().as_unix_millis(),
+        }
+    }
+}
+
+impl RoutineVersionV1 {
+    fn into_domain(self) -> Result<RoutineVersion, String> {
+        RoutineVersion::new(
+            RoutineVersionId::new(self.id),
+            RoutineId::new(self.routine_id),
+            self.number,
+            self.inputs
+                .into_iter()
+                .map(RoutineInputV1::into_domain)
+                .collect::<Result<_, _>>()?,
+            self.steps
+                .into_iter()
+                .map(RoutineStepV1::into_domain)
+                .collect::<Result<_, _>>()?,
+            self.template
+                .map(Content::new)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+            Timestamp::from_unix_millis(self.created_at),
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineInputV1 {
+    key: String,
+    label: String,
+    required: bool,
+    #[serde(default)]
+    default: Option<String>,
+}
+
+impl From<&RoutineInputDeclaration> for RoutineInputV1 {
+    fn from(input: &RoutineInputDeclaration) -> Self {
+        Self {
+            key: input.key().as_str().to_owned(),
+            label: input.label().as_str().to_owned(),
+            required: input.required(),
+            default: input.default().map(|value| value.as_str().to_owned()),
+        }
+    }
+}
+
+impl RoutineInputV1 {
+    fn into_domain(self) -> Result<RoutineInputDeclaration, String> {
+        Ok(RoutineInputDeclaration::new(
+            RoutineInputKey::new(self.key).map_err(|error| error.to_string())?,
+            Name::new(self.label).map_err(|error| error.to_string())?,
+            self.required,
+            self.default
+                .map(RoutineValue::new)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineStepV1 {
+    id: u64,
+    name: String,
+    agent_id: u64,
+    prompt: String,
+    #[serde(default)]
+    depends_on: Vec<u64>,
+    #[serde(default)]
+    bindings: Vec<RoutineBindingV1>,
+    #[serde(default)]
+    outputs: Vec<String>,
+    #[serde(default)]
+    approval_required: bool,
+    max_attempts: u32,
+    checkout: RoutineCheckoutClaimV1,
+    #[serde(default)]
+    resources: Vec<String>,
+}
+
+impl From<&RoutineStep> for RoutineStepV1 {
+    fn from(step: &RoutineStep) -> Self {
+        Self {
+            id: step.id().get(),
+            name: step.name().as_str().to_owned(),
+            agent_id: step.agent_id().get(),
+            prompt: step.prompt().as_str().to_owned(),
+            depends_on: step.depends_on().map(RoutineStepId::get).collect(),
+            bindings: step
+                .bindings()
+                .map(|(name, source)| RoutineBindingV1 {
+                    name: name.as_str().to_owned(),
+                    source: source.into(),
+                })
+                .collect(),
+            outputs: step.outputs().map(|key| key.as_str().to_owned()).collect(),
+            approval_required: step.approval() == RoutineApproval::Required,
+            max_attempts: step.retry().max_attempts(),
+            checkout: step.claims().checkout().into(),
+            resources: step
+                .claims()
+                .resources()
+                .map(|key| key.as_str().to_owned())
+                .collect(),
+        }
+    }
+}
+
+impl RoutineStepV1 {
+    fn into_domain(self) -> Result<RoutineStep, String> {
+        let bindings = self
+            .bindings
+            .into_iter()
+            .map(RoutineBindingV1::into_domain)
+            .collect::<Result<Vec<_>, String>>()?;
+        let outputs = self
+            .outputs
+            .into_iter()
+            .map(RoutineOutputKey::new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let resources = self
+            .resources
+            .into_iter()
+            .map(RoutineResourceKey::new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        RoutineStep::new(
+            RoutineStepId::new(self.id),
+            Name::new(self.name).map_err(|error| error.to_string())?,
+            AgentId::new(self.agent_id),
+            Content::new(self.prompt).map_err(|error| error.to_string())?,
+            self.depends_on.into_iter().map(RoutineStepId::new),
+            bindings,
+            outputs,
+            if self.approval_required {
+                RoutineApproval::Required
+            } else {
+                RoutineApproval::NotRequired
+            },
+            RoutineRetryPolicy::new(self.max_attempts).map_err(|error| error.to_string())?,
+            RoutineStepClaims::new(self.checkout.into(), resources)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineBindingV1 {
+    name: String,
+    source: RoutineBindingSourceV1,
+}
+
+impl RoutineBindingV1 {
+    fn into_domain(self) -> Result<(RoutineInputKey, RoutineBindingSource), String> {
+        Ok((
+            RoutineInputKey::new(self.name).map_err(|error| error.to_string())?,
+            self.source.into_domain()?,
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum RoutineBindingSourceV1 {
+    Input { key: String },
+    StepOutput { step_id: u64, key: String },
+    Literal { value: String },
+}
+
+impl From<&RoutineBindingSource> for RoutineBindingSourceV1 {
+    fn from(source: &RoutineBindingSource) -> Self {
+        match source {
+            RoutineBindingSource::Input(key) => Self::Input {
+                key: key.as_str().to_owned(),
+            },
+            RoutineBindingSource::StepOutput { step_id, key } => Self::StepOutput {
+                step_id: step_id.get(),
+                key: key.as_str().to_owned(),
+            },
+            RoutineBindingSource::Literal(value) => Self::Literal {
+                value: value.as_str().to_owned(),
+            },
+        }
+    }
+}
+
+impl RoutineBindingSourceV1 {
+    fn into_domain(self) -> Result<RoutineBindingSource, String> {
+        Ok(match self {
+            Self::Input { key } => RoutineBindingSource::Input(
+                RoutineInputKey::new(key).map_err(|error| error.to_string())?,
+            ),
+            Self::StepOutput { step_id, key } => RoutineBindingSource::StepOutput {
+                step_id: RoutineStepId::new(step_id),
+                key: RoutineOutputKey::new(key).map_err(|error| error.to_string())?,
+            },
+            Self::Literal { value } => RoutineBindingSource::Literal(
+                RoutineValue::new(value).map_err(|error| error.to_string())?,
+            ),
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum RoutineCheckoutClaimV1 {
+    AgentDefault,
+    Floor { floor: u64 },
+}
+
+impl From<RoutineCheckoutClaim> for RoutineCheckoutClaimV1 {
+    fn from(claim: RoutineCheckoutClaim) -> Self {
+        match claim {
+            RoutineCheckoutClaim::AgentDefault => Self::AgentDefault,
+            RoutineCheckoutClaim::Floor(floor) => Self::Floor { floor },
+        }
+    }
+}
+
+impl From<RoutineCheckoutClaimV1> for RoutineCheckoutClaim {
+    fn from(claim: RoutineCheckoutClaimV1) -> Self {
+        match claim {
+            RoutineCheckoutClaimV1::AgentDefault => Self::AgentDefault,
+            RoutineCheckoutClaimV1::Floor { floor } => Self::Floor(floor),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineTriggerV1 {
+    id: u64,
+    routine_id: u64,
+    name: String,
+    kind: RoutineTriggerKindV1,
+    enabled: bool,
+    #[serde(default)]
+    inputs: Vec<RoutineValueEntryV1>,
+    #[serde(default)]
+    last_firing: Option<RoutineFiringV1>,
+    #[serde(default)]
+    skipped_occurrences: u32,
+}
+
+impl From<&RoutineTrigger> for RoutineTriggerV1 {
+    fn from(trigger: &RoutineTrigger) -> Self {
+        Self {
+            id: trigger.id().get(),
+            routine_id: trigger.routine_id().get(),
+            name: trigger.name().as_str().to_owned(),
+            kind: trigger.kind().into(),
+            enabled: trigger.enabled(),
+            inputs: trigger
+                .inputs()
+                .iter()
+                .map(|(key, value)| RoutineValueEntryV1 {
+                    key: key.as_str().to_owned(),
+                    value: value.as_str().to_owned(),
+                })
+                .collect(),
+            last_firing: trigger.last_firing().map(RoutineFiringV1::from),
+            skipped_occurrences: trigger.skipped_occurrences(),
+        }
+    }
+}
+
+impl RoutineTriggerV1 {
+    fn into_domain(self) -> Result<RoutineTrigger, String> {
+        let inputs = self
+            .inputs
+            .into_iter()
+            .map(|entry| {
+                Ok((
+                    RoutineInputKey::new(entry.key)
+                        .map_err(|e: crate::domain::RoutineError| e.to_string())?,
+                    RoutineValue::new(entry.value).map_err(|e| e.to_string())?,
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        let last_firing = self
+            .last_firing
+            .map(RoutineFiringV1::into_domain)
+            .transpose()?;
+        Ok(RoutineTrigger::new(
+            RoutineTriggerId::new(self.id),
+            RoutineId::new(self.routine_id),
+            Name::new(self.name).map_err(|error| error.to_string())?,
+            self.kind.into_domain()?,
+            self.enabled,
+            inputs,
+        )
+        .map_err(|error| error.to_string())?
+        .with_history(last_firing, self.skipped_occurrences))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineValueEntryV1 {
+    key: String,
+    value: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum RoutineTriggerKindV1 {
+    Manual,
+    Filesystem {
+        patterns: Vec<String>,
+        debounce_ms: u64,
+    },
+    Git {
+        refs: Vec<String>,
+    },
+    Schedule {
+        cadence: RoutineCadenceV1,
+        offset_minutes: i32,
+        #[serde(default)]
+        timezone_label: Option<String>,
+        #[serde(default)]
+        next_occurrence: Option<u64>,
+    },
+}
+
+impl From<&RoutineTriggerKind> for RoutineTriggerKindV1 {
+    fn from(kind: &RoutineTriggerKind) -> Self {
+        match kind {
+            RoutineTriggerKind::Manual => Self::Manual,
+            RoutineTriggerKind::Filesystem {
+                patterns,
+                debounce_ms,
+            } => Self::Filesystem {
+                patterns: patterns.clone(),
+                debounce_ms: *debounce_ms,
+            },
+            RoutineTriggerKind::Git { refs } => Self::Git { refs: refs.clone() },
+            RoutineTriggerKind::Schedule(schedule) => Self::Schedule {
+                cadence: schedule.cadence().into(),
+                offset_minutes: schedule.offset_minutes(),
+                timezone_label: schedule
+                    .timezone_label()
+                    .map(|label| label.as_str().to_owned()),
+                next_occurrence: schedule.next_occurrence().map(Timestamp::as_unix_millis),
+            },
+        }
+    }
+}
+
+impl RoutineTriggerKindV1 {
+    fn into_domain(self) -> Result<RoutineTriggerKind, String> {
+        Ok(match self {
+            Self::Manual => RoutineTriggerKind::Manual,
+            Self::Filesystem {
+                patterns,
+                debounce_ms,
+            } => RoutineTriggerKind::Filesystem {
+                patterns,
+                debounce_ms,
+            },
+            Self::Git { refs } => RoutineTriggerKind::Git { refs },
+            Self::Schedule {
+                cadence,
+                offset_minutes,
+                timezone_label,
+                next_occurrence,
+            } => RoutineTriggerKind::Schedule(
+                RoutineSchedule::new(
+                    cadence.into(),
+                    offset_minutes,
+                    timezone_label
+                        .map(Name::new)
+                        .transpose()
+                        .map_err(|error| error.to_string())?,
+                    next_occurrence.map(Timestamp::from_unix_millis),
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum RoutineCadenceV1 {
+    Hourly {
+        minute: u32,
+    },
+    Daily {
+        hour: u32,
+        minute: u32,
+    },
+    Weekly {
+        weekday: u32,
+        hour: u32,
+        minute: u32,
+    },
+}
+
+impl From<RoutineCadence> for RoutineCadenceV1 {
+    fn from(cadence: RoutineCadence) -> Self {
+        match cadence {
+            RoutineCadence::Hourly { minute } => Self::Hourly { minute },
+            RoutineCadence::Daily { hour, minute } => Self::Daily { hour, minute },
+            RoutineCadence::Weekly {
+                weekday,
+                hour,
+                minute,
+            } => Self::Weekly {
+                weekday,
+                hour,
+                minute,
+            },
+        }
+    }
+}
+
+impl From<RoutineCadenceV1> for RoutineCadence {
+    fn from(cadence: RoutineCadenceV1) -> Self {
+        match cadence {
+            RoutineCadenceV1::Hourly { minute } => Self::Hourly { minute },
+            RoutineCadenceV1::Daily { hour, minute } => Self::Daily { hour, minute },
+            RoutineCadenceV1::Weekly {
+                weekday,
+                hour,
+                minute,
+            } => Self::Weekly {
+                weekday,
+                hour,
+                minute,
+            },
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineFiringV1 {
+    occurrence: String,
+    fired_at: u64,
+}
+
+impl From<&RoutineTriggerFiring> for RoutineFiringV1 {
+    fn from(firing: &RoutineTriggerFiring) -> Self {
+        Self {
+            occurrence: firing.occurrence().as_str().to_owned(),
+            fired_at: firing.fired_at().as_unix_millis(),
+        }
+    }
+}
+
+impl RoutineFiringV1 {
+    fn into_domain(self) -> Result<RoutineTriggerFiring, String> {
+        Ok(RoutineTriggerFiring::new(
+            RoutineOccurrenceKey::new(self.occurrence).map_err(|error| error.to_string())?,
+            Timestamp::from_unix_millis(self.fired_at),
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineRunV1 {
+    id: u64,
+    #[serde(default)]
+    trigger_id: Option<u64>,
+    #[serde(default)]
+    occurrence: Option<String>,
+    pin: RoutineRunPinV1,
+    state: RoutineRunStateV1,
+    started_at: u64,
+    #[serde(default)]
+    finished_at: Option<u64>,
+    steps: Vec<RoutineStepRunV1>,
+}
+
+impl From<&RoutineRun> for RoutineRunV1 {
+    fn from(run: &RoutineRun) -> Self {
+        Self {
+            id: run.id().get(),
+            trigger_id: run.trigger_id().map(RoutineTriggerId::get),
+            occurrence: run
+                .occurrence()
+                .map(|occurrence| occurrence.as_str().to_owned()),
+            pin: RoutineRunPinV1::from(run.pin()),
+            state: run.state().into(),
+            started_at: run.started_at().as_unix_millis(),
+            finished_at: run.finished_at().map(Timestamp::as_unix_millis),
+            steps: run.steps().map(RoutineStepRunV1::from).collect(),
+        }
+    }
+}
+
+impl RoutineRunV1 {
+    fn into_domain(self) -> Result<RoutineRun, String> {
+        RoutineRun::restore(
+            RoutineRunId::new(self.id),
+            self.trigger_id.map(RoutineTriggerId::new),
+            self.occurrence
+                .map(RoutineOccurrenceKey::new)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+            self.pin.into_domain()?,
+            self.state.into(),
+            Timestamp::from_unix_millis(self.started_at),
+            self.finished_at.map(Timestamp::from_unix_millis),
+            self.steps
+                .into_iter()
+                .map(RoutineStepRunV1::into_domain)
+                .collect::<Result<_, _>>()?,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineRunPinV1 {
+    version: RoutineVersionV1,
+    #[serde(default)]
+    inputs: Vec<RoutineValueEntryV1>,
+    agents: Vec<RoutineStepAgentV1>,
+    checkouts: Vec<RoutineStepCheckoutV1>,
+    #[serde(default)]
+    revisions: Vec<RoutineRevisionV1>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineStepAgentV1 {
+    step_id: u64,
+    agent_id: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineStepCheckoutV1 {
+    step_id: u64,
+    checkout: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineRevisionV1 {
+    checkout: String,
+    revision: String,
+}
+
+impl From<&RoutineRunPin> for RoutineRunPinV1 {
+    fn from(pin: &RoutineRunPin) -> Self {
+        Self {
+            version: RoutineVersionV1::from(pin.version()),
+            inputs: pin
+                .inputs()
+                .iter()
+                .map(|(key, value)| RoutineValueEntryV1 {
+                    key: key.as_str().to_owned(),
+                    value: value.as_str().to_owned(),
+                })
+                .collect(),
+            agents: pin
+                .agents()
+                .map(|(step_id, agent_id)| RoutineStepAgentV1 {
+                    step_id: step_id.get(),
+                    agent_id: agent_id.get(),
+                })
+                .collect(),
+            checkouts: pin
+                .checkouts()
+                .map(|(step_id, checkout)| RoutineStepCheckoutV1 {
+                    step_id: step_id.get(),
+                    checkout: checkout.as_str().to_owned(),
+                })
+                .collect(),
+            revisions: pin
+                .revisions()
+                .iter()
+                .map(|(checkout, revision)| RoutineRevisionV1 {
+                    checkout: checkout.as_str().to_owned(),
+                    revision: revision.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl RoutineRunPinV1 {
+    fn into_domain(self) -> Result<RoutineRunPin, String> {
+        let inputs = self
+            .inputs
+            .into_iter()
+            .map(|entry| {
+                Ok((
+                    RoutineInputKey::new(entry.key)
+                        .map_err(|e: crate::domain::RoutineError| e.to_string())?,
+                    RoutineValue::new(entry.value).map_err(|e| e.to_string())?,
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        let agents = self
+            .agents
+            .into_iter()
+            .map(|entry| {
+                (
+                    RoutineStepId::new(entry.step_id),
+                    AgentId::new(entry.agent_id),
+                )
+            })
+            .collect();
+        let checkouts = self
+            .checkouts
+            .into_iter()
+            .map(|entry| {
+                Ok((
+                    RoutineStepId::new(entry.step_id),
+                    routine_checkout(entry.checkout)?,
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        let revisions = self
+            .revisions
+            .into_iter()
+            .map(|entry| Ok((routine_checkout(entry.checkout)?, entry.revision)))
+            .collect::<Result<_, String>>()?;
+        RoutineRunPin::new(
+            self.version.into_domain()?,
+            inputs,
+            agents,
+            checkouts,
+            revisions,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+fn routine_checkout(value: String) -> Result<RoutineCheckout, String> {
+    WorkspaceDirectory::new(value)
+        .map(RoutineCheckout::new)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineStepRunV1 {
+    step_id: u64,
+    state: RoutineStepStateV1,
+    #[serde(default)]
+    attempts: Vec<RoutineAttemptV1>,
+    #[serde(default)]
+    outputs: Vec<RoutineValueEntryV1>,
+    #[serde(default)]
+    approval: Option<RoutineApprovalV1>,
+    #[serde(default)]
+    interruption: Option<RoutineInterruptionV1>,
+    #[serde(default)]
+    failure: Option<String>,
+}
+
+impl From<&RoutineStepRun> for RoutineStepRunV1 {
+    fn from(step: &RoutineStepRun) -> Self {
+        Self {
+            step_id: step.step_id().get(),
+            state: step.state().into(),
+            attempts: step.attempts().iter().map(RoutineAttemptV1::from).collect(),
+            outputs: step
+                .outputs()
+                .iter()
+                .map(|(key, value)| RoutineValueEntryV1 {
+                    key: key.as_str().to_owned(),
+                    value: value.as_str().to_owned(),
+                })
+                .collect(),
+            approval: step.approval().map(RoutineApprovalV1::from),
+            interruption: step.interruption().map(RoutineInterruptionV1::from),
+            failure: step.failure().map(|value| value.as_str().to_owned()),
+        }
+    }
+}
+
+impl RoutineStepRunV1 {
+    fn into_domain(self) -> Result<RoutineStepRun, String> {
+        let outputs = self
+            .outputs
+            .into_iter()
+            .map(|entry| {
+                Ok((
+                    RoutineOutputKey::new(entry.key)
+                        .map_err(|e: crate::domain::RoutineError| e.to_string())?,
+                    RoutineValue::new(entry.value).map_err(|e| e.to_string())?,
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        RoutineStepRun::restore(
+            RoutineStepId::new(self.step_id),
+            self.state.into(),
+            self.attempts
+                .into_iter()
+                .map(RoutineAttemptV1::into_domain)
+                .collect::<Result<_, _>>()?,
+            outputs,
+            self.approval
+                .map(RoutineApprovalV1::into_domain)
+                .transpose()?,
+            self.interruption.map(RoutineInterruptionV1::into_domain),
+            self.failure
+                .map(Content::new)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineAttemptV1 {
+    id: u64,
+    ordinal: u32,
+    task_id: u64,
+    handoff_id: u64,
+    agent_id: u64,
+    checkout: String,
+    #[serde(default)]
+    resources: Vec<String>,
+    started_at: u64,
+    #[serde(default)]
+    outcome: Option<RoutineAttemptOutcomeV1>,
+    #[serde(default)]
+    finished_at: Option<u64>,
+}
+
+impl From<&RoutineAttempt> for RoutineAttemptV1 {
+    fn from(attempt: &RoutineAttempt) -> Self {
+        Self {
+            id: attempt.id().get(),
+            ordinal: attempt.ordinal(),
+            task_id: attempt.task_id().get(),
+            handoff_id: attempt.handoff_id().get(),
+            agent_id: attempt.agent_id().get(),
+            checkout: attempt.checkout().as_str().to_owned(),
+            resources: attempt
+                .resources()
+                .map(|key| key.as_str().to_owned())
+                .collect(),
+            started_at: attempt.started_at().as_unix_millis(),
+            outcome: attempt.outcome().map(RoutineAttemptOutcomeV1::from),
+            finished_at: attempt.finished_at().map(Timestamp::as_unix_millis),
+        }
+    }
+}
+
+impl RoutineAttemptV1 {
+    fn into_domain(self) -> Result<RoutineAttempt, String> {
+        let resources = self
+            .resources
+            .into_iter()
+            .map(RoutineResourceKey::new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let attempt = RoutineAttempt::new(
+            RoutineAttemptId::new(self.id),
+            self.ordinal,
+            TaskId::new(self.task_id),
+            HandoffId::new(self.handoff_id),
+            AgentId::new(self.agent_id),
+            routine_checkout(self.checkout)?,
+            resources,
+            Timestamp::from_unix_millis(self.started_at),
+        )
+        .map_err(|error| error.to_string())?;
+        match (self.outcome, self.finished_at) {
+            (Some(outcome), Some(finished_at)) => attempt
+                .with_outcome(outcome.into(), Timestamp::from_unix_millis(finished_at))
+                .map_err(|error| error.to_string()),
+            (None, None) => Ok(attempt),
+            _ => Err("routine attempt outcome and finish time must be stored together".to_owned()),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RoutineAttemptOutcomeV1 {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl From<RoutineAttemptOutcome> for RoutineAttemptOutcomeV1 {
+    fn from(outcome: RoutineAttemptOutcome) -> Self {
+        match outcome {
+            RoutineAttemptOutcome::Completed => Self::Completed,
+            RoutineAttemptOutcome::Failed => Self::Failed,
+            RoutineAttemptOutcome::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+impl From<RoutineAttemptOutcomeV1> for RoutineAttemptOutcome {
+    fn from(outcome: RoutineAttemptOutcomeV1) -> Self {
+        match outcome {
+            RoutineAttemptOutcomeV1::Completed => Self::Completed,
+            RoutineAttemptOutcomeV1::Failed => Self::Failed,
+            RoutineAttemptOutcomeV1::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineApprovalV1 {
+    approved: bool,
+    decided_at: u64,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+impl From<&RoutineApprovalRecord> for RoutineApprovalV1 {
+    fn from(record: &RoutineApprovalRecord) -> Self {
+        Self {
+            approved: record.decision() == RoutineApprovalDecision::Approved,
+            decided_at: record.decided_at().as_unix_millis(),
+            note: record.note().map(|note| note.as_str().to_owned()),
+        }
+    }
+}
+
+impl RoutineApprovalV1 {
+    fn into_domain(self) -> Result<RoutineApprovalRecord, String> {
+        Ok(RoutineApprovalRecord::new(
+            if self.approved {
+                RoutineApprovalDecision::Approved
+            } else {
+                RoutineApprovalDecision::Rejected
+            },
+            Timestamp::from_unix_millis(self.decided_at),
+            self.note
+                .map(Content::new)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineInterruptionV1 {
+    reason: RoutineInterruptionReasonV1,
+    detected_at: u64,
+}
+
+impl From<&RoutineInterruption> for RoutineInterruptionV1 {
+    fn from(interruption: &RoutineInterruption) -> Self {
+        Self {
+            reason: match interruption.reason() {
+                RoutineInterruptionReason::DispatchOutcomeUnknown => {
+                    RoutineInterruptionReasonV1::DispatchOutcomeUnknown
+                }
+                RoutineInterruptionReason::ShutdownUnconfirmed => {
+                    RoutineInterruptionReasonV1::ShutdownUnconfirmed
+                }
+            },
+            detected_at: interruption.detected_at().as_unix_millis(),
+        }
+    }
+}
+
+impl RoutineInterruptionV1 {
+    fn into_domain(self) -> RoutineInterruption {
+        RoutineInterruption::new(
+            match self.reason {
+                RoutineInterruptionReasonV1::DispatchOutcomeUnknown => {
+                    RoutineInterruptionReason::DispatchOutcomeUnknown
+                }
+                RoutineInterruptionReasonV1::ShutdownUnconfirmed => {
+                    RoutineInterruptionReason::ShutdownUnconfirmed
+                }
+            },
+            Timestamp::from_unix_millis(self.detected_at),
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RoutineInterruptionReasonV1 {
+    DispatchOutcomeUnknown,
+    ShutdownUnconfirmed,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RoutineRunStateV1 {
+    Running,
+    Cancelling,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl From<RoutineRunState> for RoutineRunStateV1 {
+    fn from(state: RoutineRunState) -> Self {
+        match state {
+            RoutineRunState::Running => Self::Running,
+            RoutineRunState::Cancelling => Self::Cancelling,
+            RoutineRunState::Completed => Self::Completed,
+            RoutineRunState::Failed => Self::Failed,
+            RoutineRunState::Cancelled => Self::Cancelled,
+            RoutineRunState::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+impl From<RoutineRunStateV1> for RoutineRunState {
+    fn from(state: RoutineRunStateV1) -> Self {
+        match state {
+            RoutineRunStateV1::Running => Self::Running,
+            RoutineRunStateV1::Cancelling => Self::Cancelling,
+            RoutineRunStateV1::Completed => Self::Completed,
+            RoutineRunStateV1::Failed => Self::Failed,
+            RoutineRunStateV1::Cancelled => Self::Cancelled,
+            RoutineRunStateV1::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RoutineStepStateV1 {
+    Pending,
+    AwaitingApproval,
+    Dispatched,
+    Completed,
+    Failed,
+    Cancelled,
+    Skipped,
+    Interrupted,
+}
+
+impl From<RoutineStepState> for RoutineStepStateV1 {
+    fn from(state: RoutineStepState) -> Self {
+        match state {
+            RoutineStepState::Pending => Self::Pending,
+            RoutineStepState::AwaitingApproval => Self::AwaitingApproval,
+            RoutineStepState::Dispatched => Self::Dispatched,
+            RoutineStepState::Completed => Self::Completed,
+            RoutineStepState::Failed => Self::Failed,
+            RoutineStepState::Cancelled => Self::Cancelled,
+            RoutineStepState::Skipped => Self::Skipped,
+            RoutineStepState::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+impl From<RoutineStepStateV1> for RoutineStepState {
+    fn from(state: RoutineStepStateV1) -> Self {
+        match state {
+            RoutineStepStateV1::Pending => Self::Pending,
+            RoutineStepStateV1::AwaitingApproval => Self::AwaitingApproval,
+            RoutineStepStateV1::Dispatched => Self::Dispatched,
+            RoutineStepStateV1::Completed => Self::Completed,
+            RoutineStepStateV1::Failed => Self::Failed,
+            RoutineStepStateV1::Cancelled => Self::Cancelled,
+            RoutineStepStateV1::Skipped => Self::Skipped,
+            RoutineStepStateV1::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum RoutineTransitionV1 {
+    AwaitApproval {
+        step_id: u64,
+    },
+    RecordApproval {
+        step_id: u64,
+        record: RoutineApprovalV1,
+    },
+    CompleteStep {
+        step_id: u64,
+        outputs: Vec<RoutineValueEntryV1>,
+        finished_at: u64,
+    },
+    FailStep {
+        step_id: u64,
+        reason: String,
+        finished_at: u64,
+    },
+    InterruptStep {
+        step_id: u64,
+        reason: RoutineInterruptionReasonV1,
+        detected_at: u64,
+    },
+    ResolveInterruption {
+        step_id: u64,
+        finished_at: u64,
+    },
+    CancelStep {
+        step_id: u64,
+        finished_at: u64,
+    },
+    RequestCancellation {
+        at: u64,
+    },
+    Settle {
+        at: u64,
+    },
+}
+
+impl From<&RoutineTransition> for RoutineTransitionV1 {
+    fn from(transition: &RoutineTransition) -> Self {
+        match transition {
+            RoutineTransition::AwaitApproval { step_id } => Self::AwaitApproval {
+                step_id: step_id.get(),
+            },
+            RoutineTransition::RecordApproval { step_id, record } => Self::RecordApproval {
+                step_id: step_id.get(),
+                record: RoutineApprovalV1::from(record),
+            },
+            RoutineTransition::CompleteStep {
+                step_id,
+                outputs,
+                finished_at,
+            } => Self::CompleteStep {
+                step_id: step_id.get(),
+                outputs: outputs
+                    .iter()
+                    .map(|(key, value)| RoutineValueEntryV1 {
+                        key: key.as_str().to_owned(),
+                        value: value.as_str().to_owned(),
+                    })
+                    .collect(),
+                finished_at: finished_at.as_unix_millis(),
+            },
+            RoutineTransition::FailStep {
+                step_id,
+                reason,
+                finished_at,
+            } => Self::FailStep {
+                step_id: step_id.get(),
+                reason: reason.as_str().to_owned(),
+                finished_at: finished_at.as_unix_millis(),
+            },
+            RoutineTransition::InterruptStep {
+                step_id,
+                reason,
+                detected_at,
+            } => Self::InterruptStep {
+                step_id: step_id.get(),
+                reason: match reason {
+                    RoutineInterruptionReason::DispatchOutcomeUnknown => {
+                        RoutineInterruptionReasonV1::DispatchOutcomeUnknown
+                    }
+                    RoutineInterruptionReason::ShutdownUnconfirmed => {
+                        RoutineInterruptionReasonV1::ShutdownUnconfirmed
+                    }
+                },
+                detected_at: detected_at.as_unix_millis(),
+            },
+            RoutineTransition::ResolveInterruption {
+                step_id,
+                finished_at,
+            } => Self::ResolveInterruption {
+                step_id: step_id.get(),
+                finished_at: finished_at.as_unix_millis(),
+            },
+            RoutineTransition::CancelStep {
+                step_id,
+                finished_at,
+            } => Self::CancelStep {
+                step_id: step_id.get(),
+                finished_at: finished_at.as_unix_millis(),
+            },
+            RoutineTransition::RequestCancellation { at } => Self::RequestCancellation {
+                at: at.as_unix_millis(),
+            },
+            RoutineTransition::Settle { at } => Self::Settle {
+                at: at.as_unix_millis(),
+            },
+        }
+    }
+}
+
+impl RoutineTransitionV1 {
+    fn into_domain(self) -> Result<RoutineTransition, String> {
+        Ok(match self {
+            Self::AwaitApproval { step_id } => RoutineTransition::AwaitApproval {
+                step_id: RoutineStepId::new(step_id),
+            },
+            Self::RecordApproval { step_id, record } => RoutineTransition::RecordApproval {
+                step_id: RoutineStepId::new(step_id),
+                record: record.into_domain()?,
+            },
+            Self::CompleteStep {
+                step_id,
+                outputs,
+                finished_at,
+            } => RoutineTransition::CompleteStep {
+                step_id: RoutineStepId::new(step_id),
+                outputs: outputs
+                    .into_iter()
+                    .map(|entry| {
+                        Ok((
+                            RoutineOutputKey::new(entry.key)
+                                .map_err(|e: crate::domain::RoutineError| e.to_string())?,
+                            RoutineValue::new(entry.value).map_err(|e| e.to_string())?,
+                        ))
+                    })
+                    .collect::<Result<_, String>>()?,
+                finished_at: Timestamp::from_unix_millis(finished_at),
+            },
+            Self::FailStep {
+                step_id,
+                reason,
+                finished_at,
+            } => RoutineTransition::FailStep {
+                step_id: RoutineStepId::new(step_id),
+                reason: Content::new(reason).map_err(|error| error.to_string())?,
+                finished_at: Timestamp::from_unix_millis(finished_at),
+            },
+            Self::InterruptStep {
+                step_id,
+                reason,
+                detected_at,
+            } => RoutineTransition::InterruptStep {
+                step_id: RoutineStepId::new(step_id),
+                reason: match reason {
+                    RoutineInterruptionReasonV1::DispatchOutcomeUnknown => {
+                        RoutineInterruptionReason::DispatchOutcomeUnknown
+                    }
+                    RoutineInterruptionReasonV1::ShutdownUnconfirmed => {
+                        RoutineInterruptionReason::ShutdownUnconfirmed
+                    }
+                },
+                detected_at: Timestamp::from_unix_millis(detected_at),
+            },
+            Self::ResolveInterruption {
+                step_id,
+                finished_at,
+            } => RoutineTransition::ResolveInterruption {
+                step_id: RoutineStepId::new(step_id),
+                finished_at: Timestamp::from_unix_millis(finished_at),
+            },
+            Self::CancelStep {
+                step_id,
+                finished_at,
+            } => RoutineTransition::CancelStep {
+                step_id: RoutineStepId::new(step_id),
+                finished_at: Timestamp::from_unix_millis(finished_at),
+            },
+            Self::RequestCancellation { at } => RoutineTransition::RequestCancellation {
+                at: Timestamp::from_unix_millis(at),
+            },
+            Self::Settle { at } => RoutineTransition::Settle {
+                at: Timestamp::from_unix_millis(at),
+            },
         })
     }
 }

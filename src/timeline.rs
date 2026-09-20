@@ -339,6 +339,76 @@ fn project_event(workspace: &Workspace, event: &TimelineEvent) -> TimelineItem {
             "Task state changed".to_owned(),
             format!("{}: {from} → {to}", task_label(workspace, *task_id)),
         ),
+        DomainEvent::RoutineAdded(routine) => (
+            None,
+            "Routine added".to_owned(),
+            routine.name().as_str().to_owned(),
+        ),
+        DomainEvent::RoutineVersionAdded {
+            routine_id,
+            version,
+        } => (
+            None,
+            "Routine version saved".to_owned(),
+            format!(
+                "{} version {}",
+                routine_label(workspace, *routine_id),
+                version.number()
+            ),
+        ),
+        DomainEvent::RoutineChanged { to_name, .. } => (
+            None,
+            "Routine updated".to_owned(),
+            to_name.as_str().to_owned(),
+        ),
+        DomainEvent::RoutineTriggerChanged { to, .. } => (
+            None,
+            if to.enabled() {
+                "Routine trigger enabled".to_owned()
+            } else {
+                "Routine trigger disabled".to_owned()
+            },
+            format!("{} ({})", to.name(), to.kind().label()),
+        ),
+        DomainEvent::RoutineTriggerRemoved { trigger, .. } => (
+            None,
+            "Routine trigger removed".to_owned(),
+            trigger.name().as_str().to_owned(),
+        ),
+        DomainEvent::RoutineRunStarted { run, .. } => (
+            None,
+            "Routine run started".to_owned(),
+            format!(
+                "{} version {} as run {}",
+                routine_label(workspace, run.routine_id()),
+                run.pin().version().number(),
+                run.id()
+            ),
+        ),
+        DomainEvent::RoutineOccurrencesSkipped {
+            trigger_id,
+            skipped,
+            ..
+        } => (
+            None,
+            "Scheduled runs skipped".to_owned(),
+            format!(
+                "Trigger {trigger_id} missed {skipped} occurrence(s) while OpenPodium was closed"
+            ),
+        ),
+        DomainEvent::RoutineRunAdvanced { run_id, transition } => {
+            routine_transition(workspace, *run_id, transition)
+        }
+        DomainEvent::RoutineStepDispatched {
+            run_id,
+            step_id,
+            task,
+            ..
+        } => (
+            Some(task.id()),
+            "Routine step dispatched".to_owned(),
+            format!("Run {run_id} step {step_id}: {}", task.title()),
+        ),
     };
     let attention = match event.event() {
         DomainEvent::TaskStateChanged {
@@ -349,6 +419,17 @@ fn project_event(workspace: &Workspace, event: &TimelineEvent) -> TimelineItem {
             to: TaskState::Completed,
             ..
         } => AttentionLevel::Informational,
+        // A step that needs a decision, failed, or was interrupted is waiting
+        // on the user; nothing moves it forward on its own.
+        DomainEvent::RoutineRunAdvanced { transition, .. } => match transition {
+            crate::domain::RoutineTransition::AwaitApproval { .. }
+            | crate::domain::RoutineTransition::FailStep { .. }
+            | crate::domain::RoutineTransition::InterruptStep { .. } => AttentionLevel::Urgent,
+            crate::domain::RoutineTransition::CompleteStep { .. }
+            | crate::domain::RoutineTransition::Settle { .. } => AttentionLevel::Informational,
+            _ => AttentionLevel::None,
+        },
+        DomainEvent::RoutineOccurrencesSkipped { .. } => AttentionLevel::Urgent,
         _ => AttentionLevel::None,
     };
     TimelineItem {
@@ -377,6 +458,95 @@ fn task_added(workspace: &Workspace, task: &Task) -> (Option<TaskId>, String, St
             )
         ),
     )
+}
+
+fn routine_label(workspace: &Workspace, routine_id: crate::domain::RoutineId) -> String {
+    workspace.routine(routine_id).map_or_else(
+        || format!("Routine {routine_id}"),
+        |routine| routine.name().as_str().to_owned(),
+    )
+}
+
+/// Renders a run transition, attributing it to the task the step dispatched so
+/// the timeline filter keeps routine work grouped with its task history.
+fn routine_transition(
+    workspace: &Workspace,
+    run_id: crate::domain::RoutineRunId,
+    transition: &crate::domain::RoutineTransition,
+) -> (Option<TaskId>, String, String) {
+    use crate::domain::RoutineTransition as Transition;
+    let step_id = match transition {
+        Transition::AwaitApproval { step_id }
+        | Transition::RecordApproval { step_id, .. }
+        | Transition::CompleteStep { step_id, .. }
+        | Transition::FailStep { step_id, .. }
+        | Transition::InterruptStep { step_id, .. }
+        | Transition::ResolveInterruption { step_id, .. }
+        | Transition::CancelStep { step_id, .. } => Some(*step_id),
+        Transition::RequestCancellation { .. } | Transition::Settle { .. } => None,
+    };
+    let task_id = step_id.and_then(|step_id| {
+        workspace
+            .routine_run(run_id)?
+            .step(step_id)?
+            .attempts()
+            .last()
+            .map(crate::domain::RoutineAttempt::task_id)
+    });
+    let (title, detail) = match transition {
+        Transition::AwaitApproval { step_id } => (
+            "Routine step awaiting approval",
+            format!("Run {run_id} step {step_id}"),
+        ),
+        Transition::RecordApproval { step_id, record } => (
+            match record.decision() {
+                crate::domain::RoutineApprovalDecision::Approved => "Routine step approved",
+                crate::domain::RoutineApprovalDecision::Rejected => "Routine step rejected",
+            },
+            format!("Run {run_id} step {step_id}"),
+        ),
+        Transition::CompleteStep {
+            step_id, outputs, ..
+        } => (
+            "Routine step completed",
+            format!("Run {run_id} step {step_id}: {} output(s)", outputs.len()),
+        ),
+        Transition::FailStep {
+            step_id, reason, ..
+        } => (
+            "Routine step failed",
+            format!(
+                "Run {run_id} step {step_id}: {reason}",
+                reason = reason.as_str()
+            ),
+        ),
+        Transition::InterruptStep {
+            step_id, reason, ..
+        } => (
+            "Routine step interrupted",
+            format!("Run {run_id} step {step_id}: {reason}"),
+        ),
+        Transition::ResolveInterruption { step_id, .. } => (
+            "Routine interruption resolved",
+            format!("Run {run_id} step {step_id}"),
+        ),
+        Transition::CancelStep { step_id, .. } => (
+            "Routine step cancelled",
+            format!("Run {run_id} step {step_id}"),
+        ),
+        Transition::RequestCancellation { .. } => (
+            "Routine run cancelling",
+            format!("Run {run_id} stopped dispatching further steps"),
+        ),
+        Transition::Settle { .. } => (
+            "Routine run finished",
+            workspace.routine_run(run_id).map_or_else(
+                || format!("Run {run_id}"),
+                |run| format!("Run {run_id} is {}", run.state()),
+            ),
+        ),
+    };
+    (task_id, title.to_owned(), detail)
 }
 
 fn origin_label(workspace: &Workspace, handoff: &Handoff) -> String {
