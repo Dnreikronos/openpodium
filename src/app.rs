@@ -4322,7 +4322,7 @@ mod tests {
         let handoff = openpodium::domain::Handoff::tracked(
             openpodium::domain::HandoffId::new(1),
             openpodium::domain::HandoffMessageId::new("inspect-1").unwrap(),
-            AgentId::new(1),
+            openpodium::domain::HandoffOrigin::Agent(AgentId::new(1)),
             AgentId::new(2),
             openpodium::domain::HandoffPayload::Task(task_id),
             None,

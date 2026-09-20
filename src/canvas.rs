@@ -123,12 +123,16 @@ impl CanvasDocument {
                         title: format!("Handoff {handoff_id}"),
                         subtitle: workspace.handoff(*handoff_id).map_or_else(
                             || "Unavailable".to_owned(),
-                            |handoff| {
-                                format!(
-                                    "Agent {} → Agent {}",
-                                    handoff.source(),
-                                    handoff.recipient()
-                                )
+                            |handoff| match handoff.origin() {
+                                openpodium::domain::HandoffOrigin::Agent(source) => {
+                                    format!("Agent {source} → Agent {}", handoff.recipient())
+                                }
+                                openpodium::domain::HandoffOrigin::Routine { run_id, step_id } => {
+                                    format!(
+                                        "Run {run_id} step {step_id} → Agent {}",
+                                        handoff.recipient()
+                                    )
+                                }
                             },
                         ),
                         kind: NodeKind::Handoff,

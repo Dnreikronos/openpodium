@@ -379,6 +379,15 @@ fn task_added(workspace: &Workspace, task: &Task) -> (Option<TaskId>, String, St
     )
 }
 
+fn origin_label(workspace: &Workspace, handoff: &Handoff) -> String {
+    match handoff.origin() {
+        crate::domain::HandoffOrigin::Agent(agent_id) => agent_label(workspace, agent_id),
+        crate::domain::HandoffOrigin::Routine { run_id, step_id } => {
+            format!("Routine run {run_id} step {step_id}")
+        }
+    }
+}
+
 fn handoff_added(workspace: &Workspace, handoff: &Handoff) -> (Option<TaskId>, String, String) {
     let task_id = handoff_task_id(handoff);
     (
@@ -386,7 +395,7 @@ fn handoff_added(workspace: &Workspace, handoff: &Handoff) -> (Option<TaskId>, S
         "Handoff queued".to_owned(),
         format!(
             "{} → {}",
-            agent_label(workspace, handoff.source()),
+            origin_label(workspace, handoff),
             agent_label(workspace, handoff.recipient())
         ),
     )
@@ -512,7 +521,7 @@ mod tests {
     use super::*;
     use crate::domain::{
         Agent, CanvasPoint, CanvasSize, Content, DeliveryMechanism, DomainCommand, HandoffId,
-        HandoffMessageId, Name, Node, TimelineEventId,
+        HandoffMessageId, HandoffOrigin, Name, Node, TimelineEventId,
     };
 
     #[test]
@@ -552,7 +561,7 @@ mod tests {
         let handoff = Handoff::tracked(
             HandoffId::new(1),
             HandoffMessageId::new("task-1").unwrap(),
-            AgentId::new(1),
+            HandoffOrigin::Agent(AgentId::new(1)),
             AgentId::new(2),
             HandoffPayload::Task(task_id),
             None,
@@ -630,7 +639,7 @@ mod tests {
         let before = Handoff::tracked(
             HandoffId::new(1),
             HandoffMessageId::new("task-1").unwrap(),
-            AgentId::new(1),
+            HandoffOrigin::Agent(AgentId::new(1)),
             AgentId::new(2),
             HandoffPayload::Task(task_id),
             None,

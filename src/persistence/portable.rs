@@ -715,7 +715,7 @@ fn referenced_entities(
                     let handoff = workspace
                         .handoff(id)
                         .ok_or_else(|| PortableError::MissingReference(format!("handoff {id}")))?;
-                    pending.push(NodeTarget::Agent(handoff.source()));
+                    pending.extend(handoff.source().map(NodeTarget::Agent));
                     pending.push(NodeTarget::Agent(handoff.recipient()));
                     if let HandoffPayload::Task(task_id) = handoff.payload() {
                         pending.push(NodeTarget::Task(*task_id));
@@ -825,9 +825,17 @@ fn handoff_record(handoff: &Handoff) -> Result<HandoffV1, PortableError> {
             content: content.as_str().to_owned(),
         },
     };
+    // Routine-submitted handoffs are execution records, not reusable canvas
+    // structure, and callers filter them out before they reach this point.
+    let source = handoff.source().ok_or_else(|| {
+        PortableError::InvalidDocument(format!(
+            "handoff {} was submitted by a routine and cannot be exported",
+            handoff.id()
+        ))
+    })?;
     Ok(HandoffV1 {
         id: symbolic("handoff", handoff.id().get()),
-        source: symbolic("agent", handoff.source().get()),
+        source: symbolic("agent", source.get()),
         recipient: symbolic("agent", handoff.recipient().get()),
         payload,
     })

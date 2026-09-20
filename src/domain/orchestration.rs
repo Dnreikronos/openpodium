@@ -188,7 +188,7 @@ impl Handoff {
     pub fn tracked(
         id: HandoffId,
         message_id: HandoffMessageId,
-        source: super::AgentId,
+        origin: super::HandoffOrigin,
         recipient: super::AgentId,
         payload: super::HandoffPayload,
         parent: Option<HandoffId>,
@@ -200,7 +200,7 @@ impl Handoff {
         }
         Ok(Self {
             id,
-            source,
+            origin,
             recipient,
             payload,
             message_id: Some(message_id),
@@ -388,7 +388,7 @@ impl Handoff {
 
     pub(crate) fn validate_successor(&self, previous: &Self) -> Result<(), HandoffMutationError> {
         if self.id != previous.id
-            || self.source != previous.source
+            || self.origin != previous.origin
             || self.recipient != previous.recipient
             || self.payload != previous.payload
             || self.message_id != previous.message_id

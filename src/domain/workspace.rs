@@ -1184,17 +1184,34 @@ impl Workspace {
         pending_task: Option<&Task>,
     ) -> Result<(), DomainError> {
         self.ensure_absent(EntityRef::Handoff(handoff.id()))?;
-        if handoff.source() == handoff.recipient() {
-            return Err(DomainError::SameHandoffParticipant {
-                handoff_id: handoff.id(),
-                agent_id: handoff.source(),
-            });
+        match handoff.origin() {
+            super::HandoffOrigin::Agent(source) => {
+                if source == handoff.recipient() {
+                    return Err(DomainError::SameHandoffParticipant {
+                        handoff_id: handoff.id(),
+                        agent_id: source,
+                    });
+                }
+                self.ensure_reference(
+                    EntityRef::Handoff(handoff.id()),
+                    "source",
+                    EntityRef::Agent(source),
+                )?;
+            }
+            super::HandoffOrigin::Routine { run_id, step_id } => {
+                let run = self
+                    .routine_runs
+                    .get(&run_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::RoutineRun(run_id)))?;
+                if run.step(step_id).is_none() {
+                    return Err(DomainError::InvalidReference {
+                        entity: EntityRef::Handoff(handoff.id()),
+                        field: "origin",
+                        target: EntityRef::RoutineRun(run_id),
+                    });
+                }
+            }
         }
-        self.ensure_reference(
-            EntityRef::Handoff(handoff.id()),
-            "source",
-            EntityRef::Agent(handoff.source()),
-        )?;
         self.ensure_reference(
             EntityRef::Handoff(handoff.id()),
             "recipient",

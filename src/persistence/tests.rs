@@ -10,7 +10,8 @@ use crate::domain::{
     ChatMessage, ChatMessageId, ChatThread, ChatThreadId, CommandPreset, CommandPresetId,
     Connection as DomainConnection, ConnectionId, ConnectionKind, Content, DeliveryMechanism,
     DiffComparison, DomainCommand, DomainEvent, EnvironmentKind, EnvironmentProfile,
-    EnvironmentProfileId, Freehand, Handoff, HandoffId, HandoffMessageId, HandoffPayload,
+    EnvironmentProfileId, Freehand, Handoff, HandoffId, HandoffMessageId, HandoffOrigin,
+    HandoffPayload,
     HandoffProgress, HandoffResponse, HandoffResponseStatus, Name, Node, NodeGroup, NodeGroupId,
     NodeId, NodeTarget, NormalizedPoint, PortalConfig, ProjectPath, Role, RoleColor, RoleIcon,
     RoleId, Shape, ShapeKind, SshEnvironment, StrokeWidth, Task, TaskId, TaskState, ThreadColor,
@@ -342,7 +343,7 @@ fn typed_handoff_history_survives_restart() {
         let handoff = Handoff::tracked(
             HandoffId::new(1),
             HandoffMessageId::new("task-1").unwrap(),
-            AgentId::new(1),
+            HandoffOrigin::Agent(AgentId::new(1)),
             AgentId::new(2),
             HandoffPayload::Task(task.id()),
             None,

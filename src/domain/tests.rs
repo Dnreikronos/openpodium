@@ -627,7 +627,7 @@ fn typed_task_handoffs_record_atomic_delivery_progress_and_response() {
     let handoff = Handoff::tracked(
         HandoffId::new(1),
         HandoffMessageId::new("task-1").unwrap(),
-        AgentId::new(1),
+        HandoffOrigin::Agent(AgentId::new(1)),
         AgentId::new(2),
         HandoffPayload::Task(task.id()),
         None,
@@ -733,7 +733,7 @@ fn task_cancellation_does_not_mutate_the_handoff_when_the_transition_is_invalid(
     let handoff = Handoff::tracked(
         HandoffId::new(1),
         HandoffMessageId::new("task-1").unwrap(),
-        AgentId::new(1),
+        HandoffOrigin::Agent(AgentId::new(1)),
         AgentId::new(2),
         HandoffPayload::Task(task_id),
         None,
@@ -802,7 +802,7 @@ fn handoff_updates_reject_combined_transitions_and_bound_parent_chains() {
         let handoff = Handoff::tracked(
             id,
             HandoffMessageId::new(format!("question-{raw_id}")).unwrap(),
-            AgentId::new(source),
+            HandoffOrigin::Agent(AgentId::new(source)),
             AgentId::new(recipient),
             HandoffPayload::Question(content("Ask back")),
             parent,
@@ -819,7 +819,7 @@ fn handoff_updates_reject_combined_transitions_and_bound_parent_chains() {
     let too_deep = Handoff::tracked(
         HandoffId::new(17),
         HandoffMessageId::new("question-17").unwrap(),
-        AgentId::new(1),
+        HandoffOrigin::Agent(AgentId::new(1)),
         AgentId::new(2),
         HandoffPayload::Question(content("One too many")),
         parent,

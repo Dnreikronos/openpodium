@@ -4,7 +4,7 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::domain::{
     AgentId, AgentProgram, Content, DeliveryMechanism, DeliveryOutcome, DomainCommand, Handoff,
-    HandoffId, HandoffMessageId, HandoffPayload, HandoffProgress, HandoffResponse,
+    HandoffId, HandoffMessageId, HandoffOrigin, HandoffPayload, HandoffProgress, HandoffResponse,
     HandoffResponseStatus, HandoffTermination, Name, Task, TaskId, TaskState, Timestamp, Workspace,
     WorkspaceId,
 };
@@ -325,7 +325,7 @@ impl Orchestrator {
                 let handoff = Handoff::tracked(
                     handoff_id,
                     message_id.clone(),
-                    previous.source(),
+                    previous.origin(),
                     previous.recipient(),
                     HandoffPayload::Task(task_id),
                     None,
@@ -384,7 +384,7 @@ impl Orchestrator {
         let handoff = Handoff::tracked(
             retry_handoff_id,
             retry_message_id.clone(),
-            original_handoff.source(),
+            original_handoff.origin(),
             original_handoff.recipient(),
             HandoffPayload::Task(retry_task_id),
             None,
@@ -478,7 +478,7 @@ impl Orchestrator {
                 let handoff = Handoff::tracked(
                     handoff_id,
                     handoff_message_id.clone(),
-                    source,
+                    HandoffOrigin::Agent(source),
                     recipient,
                     payload.clone(),
                     parent,
@@ -492,7 +492,7 @@ impl Orchestrator {
                 let handoff = Handoff::tracked(
                     handoff_id,
                     handoff_message_id.clone(),
-                    source,
+                    HandoffOrigin::Agent(source),
                     recipient,
                     payload.clone(),
                     parent,
@@ -939,7 +939,7 @@ fn delivery_details(
         .find(|progress| progress.message_id() == message_id)
     {
         return Ok((
-            handoff.source(),
+            originating_agent(handoff)?,
             progress.reported_at(),
             prompt::progress(handoff, progress),
         ));
@@ -949,7 +949,7 @@ fn delivery_details(
         .filter(|response| response.message_id() == message_id)
     {
         return Ok((
-            handoff.source(),
+            originating_agent(handoff)?,
             response.responded_at(),
             prompt::response(handoff, response),
         ));
@@ -1021,16 +1021,29 @@ fn validate_routed_participants(
     from_recipient: bool,
 ) -> Result<(), OrchestrationError> {
     let (sender, recipient) = if from_recipient {
-        (handoff.recipient(), handoff.source())
+        (Some(handoff.recipient()), handoff.source())
     } else {
-        (handoff.source(), handoff.recipient())
+        (handoff.source(), Some(handoff.recipient()))
     };
-    if message.sender_agent_id != sender.get() || message.recipient_agent_id != recipient.get() {
+    if sender.map(AgentId::get) != Some(message.sender_agent_id)
+        || recipient.map(AgentId::get) != Some(message.recipient_agent_id)
+    {
         return Err(OrchestrationError::InvalidMessage(
             "routed message participants do not match the handoff".to_owned(),
         ));
     }
     Ok(())
+}
+
+/// The agent a back-channel message is delivered to. Routine-submitted work
+/// has none: nothing is pasted into a terminal for the scheduler.
+fn originating_agent(handoff: &Handoff) -> Result<AgentId, OrchestrationError> {
+    handoff.source().ok_or_else(|| {
+        OrchestrationError::InvalidMessage(format!(
+            "handoff {} was submitted by a routine and has no agent to notify",
+            handoff.id()
+        ))
+    })
 }
 
 fn response_status(status: ResponseStatus) -> HandoffResponseStatus {

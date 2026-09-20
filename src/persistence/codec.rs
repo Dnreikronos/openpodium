@@ -8,9 +8,11 @@ use crate::domain::{
     DeliveryAttempt, DeliveryMechanism, DeliveryOutcome, DiffComparison, DomainCommand,
     DomainEvent, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Freehand, Handoff,
     HandoffId, HandoffMessageId, HandoffPayload, HandoffProgress, HandoffResponse,
-    HandoffResponseStatus, HandoffTermination, Name, Node, NodeGroup, NodeGroupId, NodeId,
+    HandoffOrigin, HandoffResponseStatus, HandoffTermination, Name, Node, NodeGroup, NodeGroupId,
+    NodeId,
     NodeTarget, NormalizedPoint, PortalConfig, PortalPresentation, PortalTarget, PortalTargetKind,
-    ProjectPath, Role, RoleColor, RoleIcon, RoleId, Shape, ShapeKind, SshEnvironment, StrokeWidth,
+    ProjectPath, Role, RoleColor, RoleIcon, RoleId, RoutineRunId, RoutineStepId, Shape,
+    ShapeKind, SshEnvironment, StrokeWidth,
     Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceDirectory, WorkspaceIcon,
     WorkspaceId, WorkspaceSettings,
 };
@@ -1566,7 +1568,11 @@ impl TaskV1 {
 #[serde(deny_unknown_fields)]
 struct HandoffV1 {
     id: u64,
+    /// Zero when the routine scheduler submitted the handoff; `routine_origin`
+    /// then names the run and step instead of an agent.
     source: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routine_origin: Option<RoutineOriginV1>,
     recipient: u64,
     payload: HandoffPayloadV1,
     #[serde(default)]
@@ -1589,9 +1595,20 @@ struct HandoffV1 {
 
 impl From<&Handoff> for HandoffV1 {
     fn from(handoff: &Handoff) -> Self {
+        let (source, routine_origin) = match handoff.origin() {
+            HandoffOrigin::Agent(agent_id) => (agent_id.get(), None),
+            HandoffOrigin::Routine { run_id, step_id } => (
+                0,
+                Some(RoutineOriginV1 {
+                    run_id: run_id.get(),
+                    step_id: step_id.get(),
+                }),
+            ),
+        };
         Self {
             id: handoff.id().get(),
-            source: handoff.source().get(),
+            source,
+            routine_origin,
             recipient: handoff.recipient().get(),
             payload: HandoffPayloadV1::from(handoff.payload()),
             message_id: handoff
@@ -1619,7 +1636,13 @@ impl From<&Handoff> for HandoffV1 {
 impl HandoffV1 {
     fn into_domain(self) -> Result<Handoff, String> {
         let id = HandoffId::new(self.id);
-        let source = AgentId::new(self.source);
+        let origin = match self.routine_origin {
+            Some(origin) => HandoffOrigin::Routine {
+                run_id: RoutineRunId::new(origin.run_id),
+                step_id: RoutineStepId::new(origin.step_id),
+            },
+            None => HandoffOrigin::Agent(AgentId::new(self.source)),
+        };
         let recipient = AgentId::new(self.recipient);
         let payload = self.payload.into_domain()?;
         let Some(message_id) = self.message_id else {
@@ -1633,7 +1656,7 @@ impl HandoffV1 {
             {
                 return Err("legacy handoff contains orchestration fields".to_owned());
             }
-            return Ok(Handoff::new(id, source, recipient, payload));
+            return Ok(Handoff::with_origin(id, origin, recipient, payload));
         };
         let created_at = self
             .created_at
@@ -1644,7 +1667,7 @@ impl HandoffV1 {
         let mut handoff = Handoff::tracked(
             id,
             root_message_id.clone(),
-            source,
+            origin,
             recipient,
             payload,
             self.parent.map(HandoffId::new),
@@ -1888,6 +1911,13 @@ impl HandoffResponseV1 {
             Timestamp::from_unix_millis(self.responded_at),
         ))
     }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineOriginV1 {
+    run_id: u64,
+    step_id: u64,
 }
 
 #[derive(Serialize, Deserialize)]
