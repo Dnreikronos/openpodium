@@ -269,6 +269,11 @@ pub enum PortalAction {
         observation_revision: u64,
         text: String,
     },
+    Key {
+        observation_revision: u64,
+        key: PortalKeyInput,
+        shift: bool,
+    },
     Scroll {
         element: Option<PortalElementRef>,
         delta_x: i32,
@@ -282,6 +287,23 @@ pub enum PortalAction {
         delta_y: i32,
     },
     Navigate(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortalKeyInput {
+    Enter,
+    Tab,
+    Backspace,
+    Delete,
+    Escape,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Home,
+    End,
+    PageUp,
+    PageDown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

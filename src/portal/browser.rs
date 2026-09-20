@@ -11,8 +11,8 @@ use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
 use super::{
     PortalAccessibilitySnapshot, PortalAction, PortalBackend, PortalCapabilities, PortalConfig,
-    PortalElementRef, PortalFrame, PortalFrameEncoding, PortalObservation, PortalSession,
-    PortalSessionError,
+    PortalElementRef, PortalFrame, PortalFrameEncoding, PortalKeyInput, PortalObservation,
+    PortalSession, PortalSessionError,
 };
 
 const DEFAULT_VIEWPORT_WIDTH: u32 = 1280;
@@ -309,6 +309,16 @@ impl PortalBackend for BrowserBackend {
                 self.command("Input.insertText", json!({"text": text}))?;
                 Ok(())
             }
+            PortalAction::Key {
+                observation_revision,
+                key,
+                shift,
+            } => {
+                session
+                    .accepts_revision(*observation_revision)
+                    .map_err(BrowserError::Session)?;
+                self.dispatch_key(*key, *shift)
+            }
             PortalAction::Scroll {
                 element,
                 delta_x,
@@ -368,6 +378,24 @@ impl PortalBackend for BrowserBackend {
 }
 
 impl BrowserBackend {
+    fn dispatch_key(&mut self, key: PortalKeyInput, shift: bool) -> Result<(), BrowserError> {
+        let (key, code, virtual_key_code) = key_description(key);
+        for event_type in ["keyDown", "keyUp"] {
+            self.command(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": event_type,
+                    "key": key,
+                    "code": code,
+                    "windowsVirtualKeyCode": virtual_key_code,
+                    "nativeVirtualKeyCode": virtual_key_code,
+                    "modifiers": if shift { 8 } else { 0 }
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
     fn validate_coordinate(&self, x: u32, y: u32) -> Result<(), BrowserError> {
         if x >= self.viewport.width() || y >= self.viewport.height() {
             return Err(BrowserError::CoordinateOutsideViewport { x, y });
@@ -385,6 +413,24 @@ impl BrowserBackend {
         }
         let _ = self.user_data_dir.take();
         Ok(())
+    }
+}
+
+fn key_description(key: PortalKeyInput) -> (&'static str, &'static str, u16) {
+    match key {
+        PortalKeyInput::Enter => ("Enter", "Enter", 13),
+        PortalKeyInput::Tab => ("Tab", "Tab", 9),
+        PortalKeyInput::Backspace => ("Backspace", "Backspace", 8),
+        PortalKeyInput::Delete => ("Delete", "Delete", 46),
+        PortalKeyInput::Escape => ("Escape", "Escape", 27),
+        PortalKeyInput::ArrowUp => ("ArrowUp", "ArrowUp", 38),
+        PortalKeyInput::ArrowDown => ("ArrowDown", "ArrowDown", 40),
+        PortalKeyInput::ArrowLeft => ("ArrowLeft", "ArrowLeft", 37),
+        PortalKeyInput::ArrowRight => ("ArrowRight", "ArrowRight", 39),
+        PortalKeyInput::Home => ("Home", "Home", 36),
+        PortalKeyInput::End => ("End", "End", 35),
+        PortalKeyInput::PageUp => ("PageUp", "PageUp", 33),
+        PortalKeyInput::PageDown => ("PageDown", "PageDown", 34),
     }
 }
 
@@ -544,5 +590,17 @@ mod tests {
             Some("ws://127.0.0.1:1234/devtools/page/1")
         );
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn maps_navigation_keys_to_cdp_codes() {
+        assert_eq!(
+            key_description(PortalKeyInput::Backspace),
+            ("Backspace", "Backspace", 8)
+        );
+        assert_eq!(
+            key_description(PortalKeyInput::ArrowLeft),
+            ("ArrowLeft", "ArrowLeft", 37)
+        );
     }
 }

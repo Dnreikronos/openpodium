@@ -785,6 +785,7 @@ fn action_target<'a>(action: &'a PortalAction, current_target: &'a str) -> &'a s
         | PortalAction::ClickCoordinate { .. }
         | PortalAction::TypeText { .. }
         | PortalAction::TypeFocused { .. }
+        | PortalAction::Key { .. }
         | PortalAction::Scroll { .. }
         | PortalAction::ScrollCoordinate { .. } => current_target,
     }
@@ -797,6 +798,7 @@ fn operation_for(action: &PortalAction) -> PortalOperation {
         | PortalAction::ClickCoordinate { .. }
         | PortalAction::TypeText { .. }
         | PortalAction::TypeFocused { .. }
+        | PortalAction::Key { .. }
         | PortalAction::Scroll { .. }
         | PortalAction::ScrollCoordinate { .. } => PortalOperation::Input,
     }
