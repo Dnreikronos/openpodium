@@ -57,7 +57,13 @@ rate limit, synchronize directly connected canvas agents before observation,
 and close when the node, floor, workspace, or application goes away. Undo and
 imports restore only the durable configuration.
 
-Canvas pointer, scroll, keyboard, and text-composition forwarding still need
-to be connected to semantic or coordinate actions. A real Chromium smoke test
-also remains pending because no compatible executable is installed on the
-development machine.
+A real Chromium smoke test remains pending because no compatible executable is
+installed on the development machine.
+
+Coordinate clicks and wheel events now use the exact rendered-frame transform,
+including canvas zoom and letterboxing. Clicking a frame gives it text focus;
+ordinary text and IME commits are forwarded to the focused browser element.
+Frame capture and local input share one serialized queue so a capture cannot
+invalidate an action before dispatch. Enter, Tab, Backspace, Delete, Escape,
+arrow keys, and browser clipboard shortcuts still need explicit key-event
+mapping.

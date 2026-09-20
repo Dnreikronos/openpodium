@@ -10,12 +10,13 @@ use iced::keyboard::{self, Key, Modifiers};
 use iced::mouse;
 use iced::widget::canvas::{self, Action};
 use iced::{Element, Fill, Length, Point, Rectangle, Renderer, Size, Theme};
-use openpodium::domain::{CanvasLayout, Node, NodeId};
+use openpodium::domain::{CanvasLayout, CanvasNodeContent, Node, NodeId};
 use openpodium::navigation::Shortcut;
+use openpodium::portal::{PortalFrameTransform, PortalPoint, PortalRect};
 
 use crate::terminal::{self, BODY_PADDING, CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT};
 
-use super::{Camera, CanvasDocument, ScreenPoint, ViewportSize, editor, scene};
+use super::{Camera, CanvasDocument, ScreenPoint, ViewportSize, WorldPoint, editor, scene};
 
 const LINE_SCROLL_PIXELS: f64 = 48.0;
 const LINE_ZOOM_SENSITIVITY: f64 = 0.18 / LINE_SCROLL_PIXELS;
@@ -56,6 +57,25 @@ pub(crate) enum Message {
         column: usize,
         right_side: bool,
     },
+    PortalClicked {
+        node_id: NodeId,
+        observation_revision: u64,
+        x: u32,
+        y: u32,
+    },
+    PortalScrolled {
+        node_id: NodeId,
+        observation_revision: u64,
+        x: u32,
+        y: u32,
+        delta_x: i32,
+        delta_y: i32,
+    },
+    PortalText {
+        node_id: NodeId,
+        observation_revision: u64,
+        text: String,
+    },
 }
 
 pub(crate) fn view(
@@ -63,6 +83,7 @@ pub(crate) fn view(
     document: CanvasDocument,
     selection: Vec<NodeId>,
     focused_terminal: Option<NodeId>,
+    focused_portal: Option<NodeId>,
     application_shortcuts: Vec<Shortcut>,
     revision: u64,
 ) -> Element<'static, Message> {
@@ -71,6 +92,7 @@ pub(crate) fn view(
         document,
         selection,
         focused_terminal,
+        focused_portal,
         application_shortcuts,
         revision,
     })
@@ -129,20 +151,22 @@ impl Widget<Message, Theme, Renderer> for TerminalCanvas {
             tree, event, layout, cursor, renderer, clipboard, shell, viewport,
         );
         let state = tree.state.downcast_ref::<State>();
-        let input_method =
-            if self.surface.focused_terminal.is_some() && cursor.is_over(layout.bounds()) {
-                InputMethod::Enabled {
-                    cursor: self.surface.ime_cursor(layout.bounds()),
-                    purpose: input_method::Purpose::Normal,
-                    preedit: (!state.preedit.is_empty()).then_some(input_method::Preedit {
-                        content: state.preedit.as_str(),
-                        selection: None,
-                        text_size: None,
-                    }),
-                }
-            } else {
-                InputMethod::Disabled
-            };
+        let input_method = if (self.surface.focused_terminal.is_some()
+            || self.surface.focused_portal.is_some())
+            && cursor.is_over(layout.bounds())
+        {
+            InputMethod::Enabled {
+                cursor: self.surface.ime_cursor(layout.bounds()),
+                purpose: input_method::Purpose::Normal,
+                preedit: (!state.preedit.is_empty()).then_some(input_method::Preedit {
+                    content: state.preedit.as_str(),
+                    selection: None,
+                    text_size: None,
+                }),
+            }
+        } else {
+            InputMethod::Disabled
+        };
         shell.request_input_method(&input_method);
     }
 
@@ -179,6 +203,7 @@ struct Surface {
     document: CanvasDocument,
     selection: Vec<NodeId>,
     focused_terminal: Option<NodeId>,
+    focused_portal: Option<NodeId>,
     application_shortcuts: Vec<Shortcut>,
     revision: u64,
 }
@@ -255,32 +280,40 @@ impl canvas::Program<Message> for Surface {
                 state.modifiers = *modifiers;
                 if let Some(node_id) = self.focused_terminal {
                     self.handle_terminal_key(state, node_id, key, text.as_deref(), *modifiers)
+                } else if let Some(node_id) = self.focused_portal {
+                    self.handle_portal_key(node_id, key, text.as_deref(), *modifiers)
                 } else {
                     None
                 }
             }
             canvas::Event::InputMethod(input_method::Event::Preedit(text, _))
-                if self.focused_terminal.is_some() && cursor.is_over(bounds) =>
+                if (self.focused_terminal.is_some() || self.focused_portal.is_some())
+                    && cursor.is_over(bounds) =>
             {
                 state.preedit.clone_from(text);
                 state.geometry.clear();
                 Some(Action::request_redraw().and_capture())
             }
             canvas::Event::InputMethod(input_method::Event::Commit(text))
-                if self.focused_terminal.is_some() && cursor.is_over(bounds) =>
+                if (self.focused_terminal.is_some() || self.focused_portal.is_some())
+                    && cursor.is_over(bounds) =>
             {
                 state.preedit.clear();
                 state.geometry.clear();
-                Some(
-                    Action::publish(Message::TerminalInput {
-                        node_id: self.focused_terminal?,
-                        bytes: text.as_bytes().to_vec(),
-                    })
-                    .and_capture(),
-                )
+                if let Some(node_id) = self.focused_terminal {
+                    Some(
+                        Action::publish(Message::TerminalInput {
+                            node_id,
+                            bytes: text.as_bytes().to_vec(),
+                        })
+                        .and_capture(),
+                    )
+                } else {
+                    self.portal_text_action(self.focused_portal?, text.clone())
+                }
             }
             canvas::Event::InputMethod(input_method::Event::Closed)
-                if self.focused_terminal.is_some() =>
+                if self.focused_terminal.is_some() || self.focused_portal.is_some() =>
             {
                 state.preedit.clear();
                 state.geometry.clear();
@@ -331,6 +364,22 @@ impl canvas::Program<Message> for Surface {
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let anchor = cursor.position_in(bounds)?;
                 let (x, y, zoom_sensitivity) = scroll_delta(*delta);
+                if !(state.modifiers.command() || state.modifiers.control())
+                    && let Some((node_id, observation_revision, point)) =
+                        self.portal_point_at(anchor, bounds)
+                {
+                    return Some(
+                        Action::publish(Message::PortalScrolled {
+                            node_id,
+                            observation_revision,
+                            x: point.x().floor() as u32,
+                            y: point.y().floor() as u32,
+                            delta_x: saturating_i32(-x),
+                            delta_y: saturating_i32(-y),
+                        })
+                        .and_capture(),
+                    );
+                }
                 if !(state.modifiers.command() || state.modifiers.control())
                     && let Some((node_id, row, column, _)) = self.terminal_cell_at(anchor, bounds)
                 {
@@ -408,7 +457,9 @@ impl canvas::Program<Message> for Surface {
         let Some(position) = cursor.position_in(bounds) else {
             return mouse::Interaction::default();
         };
-        if self.resize_hit(position, bounds).is_some() {
+        if self.resize_hit(position, bounds).is_some()
+            || self.portal_point_at(position, bounds).is_some()
+        {
             mouse::Interaction::Pointer
         } else if self.terminal_cell_at(position, bounds).is_some() {
             mouse::Interaction::Text
@@ -438,7 +489,7 @@ impl Surface {
             return Rectangle::new(bounds.position(), Size::new(1.0, CELL_HEIGHT));
         };
         let top_left = self.camera.world_to_screen(
-            super::WorldPoint::new(
+            WorldPoint::new(
                 f64::from(node.position().x()),
                 f64::from(node.position().y()),
             ),
@@ -483,6 +534,19 @@ impl Surface {
                 preview: before,
             });
             return Some(Action::publish(Message::TerminalFocused(None)).and_capture());
+        }
+        if let Some((node_id, observation_revision, point)) = self.portal_point_at(position, bounds)
+        {
+            state.geometry.clear();
+            return Some(
+                Action::publish(Message::PortalClicked {
+                    node_id,
+                    observation_revision,
+                    x: point.x().floor() as u32,
+                    y: point.y().floor() as u32,
+                })
+                .and_capture(),
+            );
         }
         if let Some(node) = self.hit_node(position, bounds) {
             if let Some((node_id, row, column, right_side)) =
@@ -619,6 +683,87 @@ impl Surface {
         Some(Action::publish(Message::TerminalInput { node_id, bytes }).and_capture())
     }
 
+    fn handle_portal_key(
+        &self,
+        node_id: NodeId,
+        key: &Key,
+        text: Option<&str>,
+        modifiers: Modifiers,
+    ) -> Option<Action<Message>> {
+        if crate::navigation_panel::shortcut_from_key(key, modifiers)
+            .as_ref()
+            .is_some_and(|shortcut| self.application_shortcuts.contains(shortcut))
+        {
+            return Some(Action::capture());
+        }
+        if modifiers.command() || modifiers.control() || modifiers.alt() {
+            return None;
+        }
+        self.portal_text_action(node_id, text?.to_owned())
+    }
+
+    fn portal_text_action(&self, node_id: NodeId, text: String) -> Option<Action<Message>> {
+        if text.is_empty() {
+            return Some(Action::capture());
+        }
+        let observation_revision = self.document.portal_frame(node_id)?.revision();
+        Some(
+            Action::publish(Message::PortalText {
+                node_id,
+                observation_revision,
+                text,
+            })
+            .and_capture(),
+        )
+    }
+
+    fn portal_point_at(
+        &self,
+        position: Point,
+        bounds: Rectangle,
+    ) -> Option<(NodeId, u64, PortalPoint)> {
+        let node = self.hit_node(position, bounds)?;
+        let CanvasNodeContent::Portal(config) = node.content() else {
+            return None;
+        };
+        let portal_frame = self.document.portal_frame(node.id())?;
+        let top_left = self.camera.world_to_screen(
+            WorldPoint::new(
+                f64::from(node.position().x()),
+                f64::from(node.position().y()),
+            ),
+            viewport(bounds),
+        );
+        let zoom = self.camera.zoom() as f32;
+        let size = Size::new(node.size().width() * zoom, node.size().height() * zoom);
+        let header_height = (HEADER_HEIGHT * zoom).clamp(28.0, 60.0);
+        let body_padding = (12.0 * zoom).clamp(7.0, 16.0);
+        let body = PortalRect::new(
+            top_left.x + f64::from(body_padding),
+            top_left.y + f64::from(header_height + body_padding),
+            f64::from((size.width - body_padding * 2.0).max(1.0)),
+            f64::from((size.height - header_height - body_padding * 2.0).max(1.0)),
+        )?;
+        let transform = PortalFrameTransform::new(
+            body,
+            portal_frame.viewport(),
+            config.presentation().preserve_aspect_ratio(),
+        );
+        let point = transform.canvas_to_viewport(PortalPoint::new(
+            f64::from(position.x),
+            f64::from(position.y),
+        ))?;
+        let viewport = portal_frame.viewport();
+        Some((
+            node.id(),
+            portal_frame.revision(),
+            PortalPoint::new(
+                point.x().min(f64::from(viewport.width() - 1)),
+                point.y().min(f64::from(viewport.height() - 1)),
+            ),
+        ))
+    }
+
     fn hit_node(&self, position: Point, bounds: Rectangle) -> Option<&Node> {
         let world = self.camera.screen_to_world(
             ScreenPoint::new(f64::from(position.x), f64::from(position.y)),
@@ -645,7 +790,7 @@ impl Surface {
             .filter(|node| self.selection.contains(&node.id()))
             .filter(|node| {
                 let bottom_right = self.camera.world_to_screen(
-                    super::WorldPoint::new(
+                    WorldPoint::new(
                         f64::from(node.position().x() + node.size().width()),
                         f64::from(node.position().y() + node.size().height()),
                     ),
@@ -681,7 +826,7 @@ impl Surface {
             .find(|node| node.id() == node_id)?;
         let terminal = self.document.terminal(node_id)?;
         let top_left = self.camera.world_to_screen(
-            super::WorldPoint::new(
+            WorldPoint::new(
                 f64::from(node.position().x()),
                 f64::from(node.position().y()),
             ),
@@ -751,9 +896,76 @@ fn scroll_delta(delta: mouse::ScrollDelta) -> (f64, f64, f64) {
     }
 }
 
+fn saturating_i32(value: f64) -> i32 {
+    value
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use openpodium::domain::{
+        CanvasNodeContent, CanvasPoint, CanvasSize, Name, Node, Workspace, WorkspaceId,
+    };
+    use openpodium::portal::{PortalConfig, PortalFrame, PortalFrameEncoding, PortalViewport};
+
     use super::*;
+
+    #[test]
+    fn portal_pointer_mapping_tracks_canvas_zoom() {
+        let node_id = NodeId::new(1);
+        let node = Node::with_content(
+            node_id,
+            CanvasNodeContent::Portal(PortalConfig::browser("https://example.test").unwrap()),
+            CanvasPoint::new(-320.0, -210.0).unwrap(),
+            CanvasSize::new(640.0, 420.0).unwrap(),
+        );
+        let workspace = Workspace::new(WorkspaceId::new(1), Name::new("Test").unwrap());
+        let document = CanvasDocument::new(
+            &workspace,
+            CanvasLayout::new(vec![node], Vec::new(), Vec::new()),
+            BTreeMap::new(),
+        )
+        .with_portal_frames(BTreeMap::from([(
+            node_id,
+            PortalFrame::new(
+                7,
+                PortalViewport::new(1_280, 720).unwrap(),
+                PortalFrameEncoding::Png,
+                vec![1],
+            )
+            .unwrap(),
+        )]));
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1_000.0, 800.0));
+
+        for camera in [Camera::default(), Camera::default().zoom_centered(2.0)] {
+            let surface = Surface {
+                camera,
+                document: document.clone(),
+                selection: Vec::new(),
+                focused_terminal: None,
+                focused_portal: Some(node_id),
+                application_shortcuts: Vec::new(),
+                revision: 1,
+            };
+            let top_left =
+                camera.world_to_screen(WorldPoint::new(-320.0, -210.0), viewport(bounds));
+            let zoom = camera.zoom() as f32;
+            let header = (HEADER_HEIGHT * zoom).clamp(28.0, 60.0);
+            let padding = (12.0 * zoom).clamp(7.0, 16.0);
+            let body_height = 420.0 * zoom - header - padding * 2.0;
+            let body_center = Point::new(
+                top_left.x as f32 + 320.0 * zoom,
+                top_left.y as f32 + header + padding + body_height / 2.0,
+            );
+            let (_, revision, point) = surface.portal_point_at(body_center, bounds).unwrap();
+            assert_eq!(revision, 7);
+            assert!((point.x() - 640.0).abs() < 0.001);
+            assert!((point.y() - 360.0).abs() < 0.001);
+        }
+    }
 
     #[test]
     fn terminal_focus_keeps_escape_and_canvas_shortcuts_for_the_pty() {

@@ -31,7 +31,7 @@ use openpodium::persistence::{
     ImportPreview, PointV1, export_canvas_fragment, export_role, import_canvas_fragment,
     import_role,
 };
-use openpodium::portal::PortalFrame;
+use openpodium::portal::{PortalAction, PortalFrame};
 use openpodium::runtime::{
     EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, ProcessSpec,
     RuntimeError, check_agent_capability, check_environment, prepare_environment_process,
@@ -98,6 +98,7 @@ struct OpenPodium {
     terminals: BTreeMap<TerminalKey, Session>,
     portal_frames: BTreeMap<NodeId, PortalFrame>,
     focused_terminal: Option<NodeId>,
+    focused_portal: Option<NodeId>,
     terminal_generation: u64,
     chat_ui: chat::UiState,
     timeline_ui: timeline_panel::UiState,
@@ -205,6 +206,7 @@ impl Default for OpenPodium {
             terminals: BTreeMap::new(),
             portal_frames: BTreeMap::new(),
             focused_terminal: None,
+            focused_portal: None,
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),
             timeline_ui: timeline_panel::UiState::default(),
@@ -1178,6 +1180,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                 document,
                 state.canvas_selection.clone(),
                 state.focused_terminal,
+                state.focused_portal,
                 [
                     openpodium::navigation::CommandId::OpenPalette,
                     openpodium::navigation::CommandId::FocusCanvas,
@@ -1219,6 +1222,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
 impl OpenPodium {
     fn reset_canvas_session(&mut self) {
         self.focused_terminal = None;
+        self.focused_portal = None;
         self.portal_frames.clear();
         self.camera = Camera::default();
         self.canvas_selection.clear();
@@ -1610,6 +1614,7 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
         canvas::Message::SelectionChanged(selection) => {
             state.canvas_selection = selection;
             state.focused_terminal = None;
+            state.focused_portal = None;
             context_nodes::selection_changed(state);
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
         }
@@ -1630,6 +1635,7 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
         }
         canvas::Message::TerminalFocused(node_id) => {
             state.focused_terminal = node_id;
+            state.focused_portal = None;
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
         }
         canvas::Message::TerminalInput { node_id, bytes } => {
@@ -1680,6 +1686,7 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
             right_side,
         } => {
             state.focused_terminal = Some(node_id);
+            state.focused_portal = None;
             state.canvas_selection = vec![node_id];
             if let Some(session) =
                 active_terminal_key(state, node_id).and_then(|key| state.terminals.get_mut(&key))
@@ -1701,6 +1708,60 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
                 session.update_selection(row, column, right_side);
                 state.canvas_revision = state.canvas_revision.wrapping_add(1);
             }
+        }
+        canvas::Message::PortalClicked {
+            node_id,
+            observation_revision,
+            x,
+            y,
+        } => {
+            state.focused_terminal = None;
+            state.focused_portal = Some(node_id);
+            state.canvas_selection = vec![node_id];
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            return portals::execute(
+                state,
+                node_id,
+                PortalAction::ClickCoordinate {
+                    observation_revision,
+                    x,
+                    y,
+                },
+            );
+        }
+        canvas::Message::PortalScrolled {
+            node_id,
+            observation_revision,
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } => {
+            return portals::execute(
+                state,
+                node_id,
+                PortalAction::ScrollCoordinate {
+                    observation_revision,
+                    x,
+                    y,
+                    delta_x,
+                    delta_y,
+                },
+            );
+        }
+        canvas::Message::PortalText {
+            node_id,
+            observation_revision,
+            text,
+        } => {
+            return portals::execute(
+                state,
+                node_id,
+                PortalAction::TypeFocused {
+                    observation_revision,
+                    text,
+                },
+            );
         }
     }
     Task::none()
@@ -3897,6 +3958,7 @@ mod tests {
             terminals: BTreeMap::new(),
             portal_frames: BTreeMap::new(),
             focused_terminal: None,
+            focused_portal: None,
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),
             timeline_ui: timeline_panel::UiState::default(),
@@ -4463,6 +4525,7 @@ mod tests {
             terminals,
             portal_frames: BTreeMap::new(),
             focused_terminal: None,
+            focused_portal: None,
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),
             timeline_ui: timeline_panel::UiState::default(),

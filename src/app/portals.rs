@@ -7,7 +7,7 @@ use openpodium::domain::{
     WorkspaceId,
 };
 use openpodium::ipc::{PortalControl, PortalScope};
-use openpodium::portal::{BrowserBackend, PortalConfig, PortalFrame};
+use openpodium::portal::{BrowserBackend, PortalAction, PortalConfig, PortalFrame};
 
 use super::{Message as AppMessage, OpenPodium, canvas_coordinate, next_node_id, now};
 
@@ -20,7 +20,7 @@ pub(super) struct PortalKey {
 #[derive(Debug, Clone)]
 enum Phase {
     Connecting,
-    Connected { portal_id: u64, capture_busy: bool },
+    Connected { portal_id: u64, busy: bool },
     Disconnecting { portal_id: u64 },
 }
 
@@ -28,6 +28,7 @@ enum Phase {
 struct LivePortal {
     config: PortalConfig,
     phase: Phase,
+    pending_actions: Vec<PortalAction>,
 }
 
 pub(super) struct UiState {
@@ -66,6 +67,11 @@ pub(super) enum Message {
         portal_id: u64,
         result: Result<Option<PortalFrame>, String>,
     },
+    ActionCompleted {
+        key: PortalKey,
+        portal_id: u64,
+        result: Result<(), String>,
+    },
 }
 
 pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessage> {
@@ -88,6 +94,11 @@ pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessag
             portal_id,
             result,
         } => frame_captured(state, key, portal_id, result),
+        Message::ActionCompleted {
+            key,
+            portal_id,
+            result,
+        } => action_completed(state, key, portal_id, result),
     }
 }
 
@@ -131,7 +142,7 @@ pub(super) fn tick(state: &mut OpenPodium) -> Task<AppMessage> {
         let portal_id = match state.portal_ui.sessions.get(&key).map(|live| &live.phase) {
             Some(Phase::Connected {
                 portal_id,
-                capture_busy: false,
+                busy: false,
             }) => *portal_id,
             _ => continue,
         };
@@ -155,7 +166,7 @@ pub(super) fn tick(state: &mut OpenPodium) -> Task<AppMessage> {
         if let Some(live) = state.portal_ui.sessions.get_mut(&key) {
             live.phase = Phase::Connected {
                 portal_id,
-                capture_busy: true,
+                busy: true,
             };
         }
         tasks.push(Task::perform(
@@ -200,6 +211,37 @@ pub(super) fn sync_connections(state: &mut OpenPodium) {
             state.notice = Some(error.to_string());
         }
     }
+}
+
+pub(super) fn execute(
+    state: &mut OpenPodium,
+    node_id: NodeId,
+    action: PortalAction,
+) -> Task<AppMessage> {
+    let Some(workspace_id) = state
+        .workspaces
+        .as_ref()
+        .and_then(|manager| manager.active_workspace_id())
+    else {
+        return Task::none();
+    };
+    let key = PortalKey {
+        workspace_id,
+        node_id,
+    };
+    let Some(live) = state.portal_ui.sessions.get_mut(&key) else {
+        state.notice = Some("Connect the portal before interacting with it".to_owned());
+        return Task::none();
+    };
+    let (portal_id, busy) = match live.phase {
+        Phase::Connected { portal_id, busy } => (portal_id, busy),
+        Phase::Connecting | Phase::Disconnecting { .. } => return Task::none(),
+    };
+    if busy {
+        live.pending_actions.push(action);
+        return Task::none();
+    }
+    start_action(state, key, portal_id, action)
 }
 
 pub(super) fn shutdown(state: &mut OpenPodium) {
@@ -354,6 +396,7 @@ fn connect(state: &mut OpenPodium, node_id: NodeId) -> Task<AppMessage> {
         LivePortal {
             config: config.clone(),
             phase: Phase::Connecting,
+            pending_actions: Vec::new(),
         },
     );
     state.notice = Some("Connecting isolated Chromium".to_owned());
@@ -388,7 +431,7 @@ fn connected(
             }
             live.phase = Phase::Connected {
                 portal_id,
-                capture_busy: false,
+                busy: false,
             };
             state.notice = Some("Browser portal connected".to_owned());
         }
@@ -467,6 +510,9 @@ fn disconnected(
             == Some(key.workspace_id)
         {
             state.portal_frames.remove(&key.node_id);
+            if state.focused_portal == Some(key.node_id) {
+                state.focused_portal = None;
+            }
         }
         state.canvas_revision = state.canvas_revision.wrapping_add(1);
     }
@@ -505,7 +551,7 @@ fn frame_captured(
         Ok(frame) => {
             live.phase = Phase::Connected {
                 portal_id,
-                capture_busy: false,
+                busy: false,
             };
             if let Some(frame) = frame
                 && state.portal_frames.get(&key.node_id) != Some(&frame)
@@ -513,7 +559,17 @@ fn frame_captured(
                 state.portal_frames.insert(key.node_id, frame);
                 state.canvas_revision = state.canvas_revision.wrapping_add(1);
             }
-            Task::none()
+            let action = live.pending_actions.first().cloned().map(|action| {
+                live.pending_actions.remove(0);
+                let revision = state
+                    .portal_frames
+                    .get(&key.node_id)
+                    .map_or(0, PortalFrame::revision);
+                action_at_revision(action, revision)
+            });
+            action.map_or_else(Task::none, |action| {
+                start_action(state, key, portal_id, action)
+            })
         }
         Err(error) => {
             state.notice = Some(error);
@@ -523,6 +579,99 @@ fn frame_captured(
             };
             begin_disconnect(state, key, control).unwrap_or_else(Task::none)
         }
+    }
+}
+
+fn start_action(
+    state: &mut OpenPodium,
+    key: PortalKey,
+    portal_id: u64,
+    action: PortalAction,
+) -> Task<AppMessage> {
+    let Some(control) = state.ipc.as_ref().map(|ipc| ipc.portal_control()) else {
+        return Task::none();
+    };
+    let Some(live) = state.portal_ui.sessions.get_mut(&key) else {
+        return Task::none();
+    };
+    live.phase = Phase::Connected {
+        portal_id,
+        busy: true,
+    };
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                control
+                    .execute(portal_id, action)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+        },
+        move |result| {
+            AppMessage::Portal(Message::ActionCompleted {
+                key,
+                portal_id,
+                result,
+            })
+        },
+    )
+}
+
+fn action_completed(
+    state: &mut OpenPodium,
+    key: PortalKey,
+    portal_id: u64,
+    result: Result<(), String>,
+) -> Task<AppMessage> {
+    let Some(live) = state.portal_ui.sessions.get_mut(&key) else {
+        return Task::none();
+    };
+    if !matches!(live.phase, Phase::Connected { portal_id: current, .. } if current == portal_id) {
+        return Task::none();
+    }
+    live.phase = Phase::Connected {
+        portal_id,
+        busy: false,
+    };
+    if let Err(error) = result {
+        live.pending_actions.clear();
+        state.notice = Some(error);
+        return Task::none();
+    }
+    let Some(action) = live.pending_actions.first().cloned() else {
+        return Task::none();
+    };
+    live.pending_actions.remove(0);
+    start_action(state, key, portal_id, action)
+}
+
+fn action_at_revision(action: PortalAction, observation_revision: u64) -> PortalAction {
+    match action {
+        PortalAction::ClickCoordinate { x, y, .. } => PortalAction::ClickCoordinate {
+            observation_revision,
+            x,
+            y,
+        },
+        PortalAction::TypeFocused { text, .. } => PortalAction::TypeFocused {
+            observation_revision,
+            text,
+        },
+        PortalAction::ScrollCoordinate {
+            x,
+            y,
+            delta_x,
+            delta_y,
+            ..
+        } => PortalAction::ScrollCoordinate {
+            observation_revision,
+            x,
+            y,
+            delta_x,
+            delta_y,
+        },
+        action => action,
     }
 }
 
@@ -650,6 +799,27 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn queued_coordinate_input_uses_the_newest_frame_revision() {
+        let action = action_at_revision(
+            PortalAction::ClickCoordinate {
+                observation_revision: 1,
+                x: 10,
+                y: 20,
+            },
+            4,
+        );
+
+        assert_eq!(
+            action,
+            PortalAction::ClickCoordinate {
+                observation_revision: 4,
+                x: 10,
+                y: 20,
+            }
+        );
+    }
 
     #[test]
     fn only_directly_connected_agents_can_address_a_portal() {
