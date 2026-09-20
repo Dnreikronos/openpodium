@@ -63,7 +63,7 @@ A request envelope has this shape:
 ```json
 {
   "protocol": "openpodium-ipc",
-  "supported_versions": [3, 2, 1],
+  "supported_versions": [4, 3, 2, 1],
   "request_id": "request-7d3464d3",
   "credentials": {
     "workspace_id": 4,
@@ -171,6 +171,22 @@ whether a workspace, agent, or token component was wrong. Malformed or unknown
 requests, oversized frames, invalid identifiers, invisible recipients, and
 incompatible versions produce actionable errors.
 
+Version 4 adds structured outputs to `respond_to_handoff`. A routine step
+declares the outputs it must return, and the agent returns them as an
+`outputs` object of restricted keys and bounded values:
+
+```json
+{"type":"respond_to_handoff","message_id":"response-3","handoff_message_id":"routine-4-1-1","status":"completed","body":"Review complete.","outputs":{"finding":"the parser drops escapes"}}
+```
+
+A response without outputs stays on version 2, so existing clients are
+unaffected. The scheduler binds these values to dependent steps; it never reads
+a result out of terminal text.
+
+Work the routine scheduler dispatched has no peer agent. Its inbox record names
+the scheduler explicitly instead of reserving an agent identifier, and the
+routed peer of such a message is the scheduler rather than another agent.
+
 ## CLI
 
 The existing `openpodium` executable remains the desktop application without
@@ -192,7 +208,7 @@ openpodium ipc portal result --action <action-id>
 openpodium ipc task send --to <agent-id> --title <title> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]
 openpodium ipc question send --to <agent-id> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]
 openpodium ipc progress report --handoff <message-id> --body <text> [--message-id <id>]
-openpodium ipc respond --handoff <message-id> --status <completed|failed|blocked> --body <text> [--message-id <id>]
+openpodium ipc respond --handoff <message-id> --status <completed|failed|blocked> --body <text> [--output <key>=<value>]... [--message-id <id>]
 openpodium ipc cancel --handoff <message-id> --reason <text> [--message-id <id>]
 ```
 
