@@ -4,13 +4,14 @@ use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 
 use crate::domain::{
-    AgentId, Content, DomainCommand, Handoff, HandoffId, HandoffMessageId, HandoffOrigin,
-    HandoffPayload, HandoffResponseStatus, HandoffTermination, Routine, RoutineApprovalDecision,
-    RoutineApprovalRecord, RoutineAttempt, RoutineAttemptId, RoutineCheckout, RoutineCheckoutClaim,
-    RoutineError, RoutineId, RoutineInputKey, RoutineInterruptionReason, RoutineOccurrenceKey,
-    RoutineReservation, RoutineRun, RoutineRunId, RoutineRunPin, RoutineStep, RoutineStepId,
-    RoutineStepState, RoutineTransition, RoutineTriggerFiring, RoutineTriggerId, RoutineValue,
-    RoutineVersion, Task, TaskId, TaskState, Timestamp, Workspace, WorkspaceDirectory, WorkspaceId,
+    AgentId, Content, DeliveryOutcome, DomainCommand, Handoff, HandoffId, HandoffMessageId,
+    HandoffOrigin, HandoffPayload, HandoffResponseStatus, HandoffTermination, Routine,
+    RoutineApprovalDecision, RoutineApprovalRecord, RoutineAttempt, RoutineAttemptId,
+    RoutineCheckout, RoutineCheckoutClaim, RoutineError, RoutineId, RoutineInputKey,
+    RoutineInterruptionReason, RoutineOccurrenceKey, RoutineReservation, RoutineRun, RoutineRunId,
+    RoutineRunPin, RoutineStep, RoutineStepId, RoutineStepState, RoutineTransition,
+    RoutineTriggerFiring, RoutineTriggerId, RoutineValue, RoutineVersion, Task, TaskId, TaskState,
+    Timestamp, Workspace, WorkspaceDirectory, WorkspaceId,
 };
 use crate::orchestration::{OrchestrationError, Orchestrator};
 use crate::workspaces::{WorkspaceError, WorkspaceManager};
@@ -500,6 +501,19 @@ impl RoutineScheduler {
                         },
                     )));
                 }
+                // Delivery that ran out of retries never reaches the agent and
+                // never produces a response, so the step would otherwise sit
+                // dispatched forever holding claims nothing will release.
+                if let Some(failure) = terminal_delivery_failure(handoff) {
+                    return Ok(Some((
+                        current.id(),
+                        RoutineTransition::FailStep {
+                            step_id: step.step_id(),
+                            reason: failure,
+                            finished_at: now,
+                        },
+                    )));
+                }
             }
         }
         Ok(None)
@@ -902,6 +916,28 @@ fn output_mismatch(missing: &[String], undeclared: &[String]) -> String {
         ));
     }
     format!("the step completed but {}", parts.join("; and "))
+}
+
+/// The error from a delivery that exhausted its retries, if the handoff's own
+/// prompt can no longer be delivered. Progress and response messages travel on
+/// their own attempts and do not block the step.
+fn terminal_delivery_failure(handoff: &Handoff) -> Option<Content> {
+    let message_id = handoff.message_id()?;
+    if handoff.is_message_delivered(message_id) {
+        return None;
+    }
+    handoff
+        .delivery_attempts()
+        .iter()
+        .filter(|attempt| attempt.message_id() == message_id)
+        .find_map(|attempt| match attempt.outcome() {
+            DeliveryOutcome::Failed {
+                error,
+                retryable: false,
+                ..
+            } => Some(error.clone()),
+            _ => None,
+        })
 }
 
 fn handoff_start(handoff: &Handoff, fallback: Timestamp) -> Timestamp {

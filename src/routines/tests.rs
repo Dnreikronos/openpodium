@@ -1946,3 +1946,56 @@ fn an_undeclared_output_fails_the_step_instead_of_stalling_the_scheduler() {
     );
     assert_eq!(run.state(), RoutineRunState::Failed);
 }
+
+#[test]
+fn delivery_that_runs_out_of_retries_releases_the_step() {
+    let (_temp, mut manager, workspace_id) = manager();
+    let routine_id = simple_routine(&mut manager, workspace_id);
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+
+    // The recipient terminal never comes up, and the delivery window closes.
+    let request = orchestrator
+        .prepare_next(&mut manager, timestamp(22))
+        .unwrap()
+        .unwrap();
+    orchestrator
+        .finish_delivery(
+            &mut manager,
+            &request,
+            Err("recipient terminal is not running".to_owned()),
+            timestamp(40_000),
+        )
+        .unwrap();
+
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(40_001))
+        .unwrap();
+    let run = manager
+        .workspace(workspace_id)
+        .unwrap()
+        .routine_run(run_id)
+        .unwrap();
+    let step = run.step(RoutineStepId::new(1)).unwrap();
+    assert_eq!(
+        step.state(),
+        RoutineStepState::Failed,
+        "a prompt that can never be delivered must not hold the step forever"
+    );
+    assert!(
+        run.held_reservations().is_empty(),
+        "its claims are released"
+    );
+}
