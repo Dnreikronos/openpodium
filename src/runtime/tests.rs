@@ -11,7 +11,12 @@ use super::{
 };
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(not(windows))]
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+// A nested PowerShell cold start can exceed ten seconds on shared Windows CI
+// runners even after cmd.exe has accepted the terminal-size query.
+#[cfg(windows)]
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKING_DIRECTORY_MARKER: &str = ".openpodium-runtime-cwd";
 const WORKING_DIRECTORY_CONTENT: &str = "__OPENPODIUM_CWD__";
 

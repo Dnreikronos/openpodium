@@ -250,7 +250,12 @@ mod tests {
         assert!(!issuer.authenticates(&wrong_agent));
 
         let mut wrong_token = valid;
-        wrong_token.token.replace_range(..1, "0");
+        let replacement = if wrong_token.token.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        wrong_token.token.replace_range(..1, replacement);
         assert!(!issuer.authenticates(&wrong_token));
     }
 
