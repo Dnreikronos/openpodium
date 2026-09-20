@@ -5,8 +5,9 @@ use super::{
     Agent, AgentId, AgentState, CanvasLayout, ChatAttachment, ChatAttachmentId, ChatDraft,
     ChatMessage, ChatMessageId, ChatThread, ChatThreadId, ChatValidationError, CommandPreset,
     CommandPresetId, ConnectionId, EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId,
-    HandoffMutationError, Name, Node, NodeGroupId, NodeId, NodeTarget, Role, RoleId, Task, TaskId,
-    TaskState, ThreadColor, TimelineEventId, Timestamp, WorkspaceId, WorkspaceSettings,
+    HandoffMutationError, Name, Node, NodeGroupId, NodeId, NodeTarget, Role, RoleId, RoutineId,
+    RoutineRunId, RoutineTriggerId, RoutineVersionId, Task, TaskId, TaskState, ThreadColor,
+    TimelineEventId, Timestamp, WorkspaceId, WorkspaceSettings,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -237,6 +238,10 @@ pub enum EntityRef {
     NodeGroup(NodeGroupId),
     Connection(ConnectionId),
     TimelineEvent(TimelineEventId),
+    Routine(RoutineId),
+    RoutineVersion(RoutineVersionId),
+    RoutineTrigger(RoutineTriggerId),
+    RoutineRun(RoutineRunId),
 }
 
 impl Display for EntityRef {
@@ -256,6 +261,10 @@ impl Display for EntityRef {
             Self::NodeGroup(id) => write!(formatter, "node group {id}"),
             Self::Connection(id) => write!(formatter, "connection {id}"),
             Self::TimelineEvent(id) => write!(formatter, "timeline event {id}"),
+            Self::Routine(id) => write!(formatter, "routine {id}"),
+            Self::RoutineVersion(id) => write!(formatter, "routine version {id}"),
+            Self::RoutineTrigger(id) => write!(formatter, "routine trigger {id}"),
+            Self::RoutineRun(id) => write!(formatter, "routine run {id}"),
         }
     }
 }

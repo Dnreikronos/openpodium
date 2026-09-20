@@ -33,6 +33,9 @@ pub use chat::*;
 mod orchestration;
 pub use orchestration::*;
 
+mod routines;
+pub use routines::*;
+
 mod entities;
 pub use entities::*;
 

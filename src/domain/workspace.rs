@@ -2,15 +2,17 @@
 mod floors;
 pub use floors::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     Agent, AgentId, CanvasLayout, ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft,
     ChatMessage, ChatThread, ChatThreadId, CommandPreset, CommandPresetId, Connection,
     ConnectionId, ConnectionKind, Content, DomainCommand, DomainError, DomainEvent, EntityRef,
     EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffPayload,
-    MAX_HANDOFF_DEPTH, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId, Task,
-    TaskId, TaskState, TimelineEvent, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
+    MAX_HANDOFF_DEPTH, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId,
+    Routine, RoutineId, RoutineOccurrenceKey, RoutineReservation, RoutineRun, RoutineRunId,
+    RoutineTriggerId, Task, TaskId, TaskState, TimelineEvent, WorkspaceDirectory, WorkspaceIcon,
+    WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +71,8 @@ pub struct Workspace {
     nodes: BTreeMap<NodeId, Node>,
     groups: BTreeMap<NodeGroupId, NodeGroup>,
     connections: BTreeMap<ConnectionId, Connection>,
+    routines: BTreeMap<RoutineId, Routine>,
+    routine_runs: BTreeMap<RoutineRunId, RoutineRun>,
 }
 
 impl Workspace {
@@ -88,6 +92,8 @@ impl Workspace {
             nodes: BTreeMap::new(),
             groups: BTreeMap::new(),
             connections: BTreeMap::new(),
+            routines: BTreeMap::new(),
+            routine_runs: BTreeMap::new(),
         }
     }
 
@@ -157,6 +163,66 @@ impl Workspace {
 
     pub(crate) fn connections(&self) -> impl Iterator<Item = &Connection> {
         self.connections.values()
+    }
+
+    /// The largest task identifier in use, or zero. The routine scheduler
+    /// allocates from here without needing access to every task.
+    pub fn highest_task_id(&self) -> u64 {
+        self.tasks.keys().next_back().map_or(0, |id| id.get())
+    }
+
+    pub fn highest_handoff_id(&self) -> u64 {
+        self.handoffs.keys().next_back().map_or(0, |id| id.get())
+    }
+
+    pub fn routines(&self) -> impl Iterator<Item = &Routine> {
+        self.routines.values()
+    }
+
+    pub fn routine(&self, id: RoutineId) -> Option<&Routine> {
+        self.routines.get(&id)
+    }
+
+    pub fn routine_runs(&self) -> impl Iterator<Item = &RoutineRun> {
+        self.routine_runs.values()
+    }
+
+    pub fn routine_run(&self, id: RoutineRunId) -> Option<&RoutineRun> {
+        self.routine_runs.get(&id)
+    }
+
+    /// Runs that have not reached a terminal state, oldest first.
+    pub fn active_routine_runs(&self) -> impl Iterator<Item = &RoutineRun> {
+        self.routine_runs.values().filter(|run| run.is_active())
+    }
+
+    /// Every reservation currently held across all active runs. The scheduler
+    /// compares a candidate step's claims against this set before dispatching.
+    pub fn held_routine_reservations(&self) -> BTreeSet<RoutineReservation> {
+        self.routine_runs
+            .values()
+            .filter(|run| run.is_active())
+            .flat_map(RoutineRun::held_reservations)
+            .collect()
+    }
+
+    /// Whether the trigger already consumed this occurrence, in a run or in the
+    /// trigger's own firing record. Duplicate observations are common: a
+    /// filesystem watcher and a restart can both report the same change.
+    pub fn routine_occurrence_consumed(
+        &self,
+        trigger_id: RoutineTriggerId,
+        occurrence: &RoutineOccurrenceKey,
+    ) -> bool {
+        self.routine_runs.values().any(|run| {
+            run.trigger_id() == Some(trigger_id) && run.occurrence() == Some(occurrence)
+        }) || self.routines.values().any(|routine| {
+            routine.trigger(trigger_id).is_some_and(|trigger| {
+                trigger
+                    .last_firing()
+                    .is_some_and(|firing| firing.occurrence() == occurrence)
+            })
+        })
     }
 
     pub fn floors(&self) -> &Floors {
@@ -1211,6 +1277,16 @@ impl Workspace {
             EntityRef::NodeGroup(id) => self.groups.contains_key(&id),
             EntityRef::Connection(id) => self.connections.contains_key(&id),
             EntityRef::TimelineEvent(_) => false,
+            EntityRef::Routine(id) => self.routines.contains_key(&id),
+            EntityRef::RoutineVersion(id) => self
+                .routines
+                .values()
+                .any(|routine| routine.version(id).is_some()),
+            EntityRef::RoutineTrigger(id) => self
+                .routines
+                .values()
+                .any(|routine| routine.trigger(id).is_some()),
+            EntityRef::RoutineRun(id) => self.routine_runs.contains_key(&id),
         }
     }
 
