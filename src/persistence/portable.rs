@@ -426,12 +426,21 @@ pub fn decode_template(payload: &str) -> Result<TemplateDocumentV1, PortableErro
 }
 
 pub fn export_workspace_archive(workspace: &Workspace) -> Result<String, PortableError> {
-    let layout = workspace.all_canvas_layout();
+    // A handoff the routine scheduler submitted is an execution record of one
+    // run, not reusable workspace structure: it names a run and step that the
+    // destination has no counterpart for. The tasks it produced are ordinary
+    // tasks and still travel, so nothing a person authored is lost.
+    let handoffs: BTreeSet<_> = workspace
+        .handoffs()
+        .filter(|handoff| handoff.source().is_some())
+        .map(|handoff| handoff.id())
+        .collect();
+    let layout = without_handoff_nodes(&workspace.all_canvas_layout(), &handoffs);
     let references = ReferencedEntities {
         roles: workspace.roles().map(|role| role.id()).collect(),
         agents: workspace.agents().map(|agent| agent.id()).collect(),
         tasks: workspace.tasks().map(|task| task.id()).collect(),
-        handoffs: workspace.handoffs().map(|handoff| handoff.id()).collect(),
+        handoffs,
     };
     let body = build_body(workspace, &layout, references, None)?;
     let archive = WorkspaceArchiveV1 {
@@ -737,6 +746,44 @@ fn referenced_entities(
         }
     }
     Ok(references)
+}
+
+/// Drops canvas nodes that point at a handoff the export is not carrying, and
+/// the connections that touched them, so the document stays self-consistent.
+fn without_handoff_nodes(layout: &CanvasLayout, kept: &BTreeSet<HandoffId>) -> CanvasLayout {
+    let dropped: BTreeSet<NodeId> = layout
+        .nodes()
+        .iter()
+        .filter(
+            |node| matches!(node.reference(), Some(NodeTarget::Handoff(id)) if !kept.contains(&id)),
+        )
+        .map(Node::id)
+        .collect();
+    if dropped.is_empty() {
+        return layout.clone();
+    }
+    CanvasLayout::new(
+        layout
+            .nodes()
+            .iter()
+            .filter(|node| !dropped.contains(&node.id()))
+            .cloned()
+            .collect(),
+        layout
+            .groups()
+            .iter()
+            .filter(|group| group.members().all(|node| !dropped.contains(&node)))
+            .cloned()
+            .collect(),
+        layout
+            .connections()
+            .iter()
+            .filter(|connection| {
+                !dropped.contains(&connection.source()) && !dropped.contains(&connection.target())
+            })
+            .cloned()
+            .collect(),
+    )
 }
 
 fn build_body(

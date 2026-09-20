@@ -2173,3 +2173,39 @@ fn two_workspaces_sharing_a_checkout_do_not_both_dispatch() {
         "checkout exclusivity has to hold across workspaces, because a checkout is a path"
     );
 }
+
+#[test]
+fn a_workspace_with_a_routine_run_still_exports() {
+    let (_temp, mut manager, workspace_id) = manager();
+    let routine_id = simple_routine(&mut manager, workspace_id);
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+    assert!(
+        manager
+            .workspace(workspace_id)
+            .unwrap()
+            .handoffs()
+            .any(|handoff| handoff.source().is_none()),
+        "the run dispatched a routine-submitted handoff"
+    );
+
+    let archive = manager
+        .export_workspace_archive(workspace_id)
+        .expect("a running routine must not break workspace export");
+    assert!(
+        !archive.contains("routine-1-1-1"),
+        "the execution record of a run is not reusable workspace structure"
+    );
+}
