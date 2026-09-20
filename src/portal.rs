@@ -8,8 +8,13 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 mod browser;
+mod device;
 mod policy;
 pub use browser::{BrowserBackend, BrowserError};
+pub use device::{
+    DeviceAvailability, DeviceDiscovery, DeviceDiscoveryReport, DeviceKind, DiscoveredDevice,
+    ToolProbe,
+};
 pub use policy::{
     DEFAULT_GRANT_LIFETIME_MS, PendingApproval, PolicyDecision, PolicyRequest, PolicyRule,
     PortalGrant, PortalPolicy, PortalPolicyError,

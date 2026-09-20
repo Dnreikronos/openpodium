@@ -64,6 +64,12 @@ Coordinate clicks and wheel events now use the exact rendered-frame transform,
 including canvas zoom and letterboxing. Clicking a frame gives it text focus;
 ordinary text and IME commits are forwarded to the focused browser element.
 Frame capture and local input share one serialized queue so a capture cannot
-invalidate an action before dispatch. Enter, Tab, Backspace, Delete, Escape,
-arrow keys, and browser clipboard shortcuts still need explicit key-event
-mapping.
+invalidate an action before dispatch. Enter, Shift-Tab, Backspace, Delete,
+Escape, arrow keys, Home/End, and Page Up/Down use typed CDP key events. Browser
+clipboard shortcuts remain separate because clipboard access has its own policy.
+
+Device discovery now probes Appium, ADB, and Xcode independently. Recorded
+fixtures cover Android emulators and attached-device authorization states plus
+Apple simulators and attached devices. Missing host tools and unsupported Apple
+hosts produce explicit unavailable reasons. Appium session creation and device
+action execution remain to be implemented.
