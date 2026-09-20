@@ -1,6 +1,11 @@
+use std::fs;
 use std::path::Path;
 
+use crate::domain::ProjectPath;
+
 use super::git_command;
+
+const MAX_INDEXED_PROJECT_PATHS: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathDiff {
@@ -28,6 +33,77 @@ pub fn path_is_tracked(checkout: &Path, path: &str) -> Result<bool, String> {
         Some(1) => Ok(false),
         _ => Err(stderr(&output.stderr)),
     }
+}
+
+pub fn project_paths(checkout: &Path) -> Result<Vec<ProjectPath>, String> {
+    let output = git_command(
+        checkout,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ],
+    )
+    .output();
+    let mut paths = match output {
+        Ok(output) if output.status.success() => output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|bytes| !bytes.is_empty())
+            .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+            .filter_map(|path| ProjectPath::new(path.to_owned()).ok())
+            .collect::<Vec<_>>(),
+        Ok(_) | Err(_) => filesystem_project_paths(checkout)?,
+    };
+    paths.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    paths.dedup_by(|left, right| left.as_str() == right.as_str());
+    paths.truncate(MAX_INDEXED_PROJECT_PATHS);
+    Ok(paths)
+}
+
+fn filesystem_project_paths(checkout: &Path) -> Result<Vec<ProjectPath>, String> {
+    let mut pending = vec![checkout.to_owned()];
+    let mut paths = Vec::new();
+    while let Some(path) = pending.pop() {
+        let mut entries = fs::read_dir(&path)
+            .map_err(|error| format!("Cannot list {}: {error}", path.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries.into_iter().rev() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let entry_path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("Cannot inspect {}: {error}", entry_path.display()))?;
+            if file_type.is_dir() {
+                pending.push(entry_path);
+                continue;
+            }
+            let components = entry_path
+                .strip_prefix(checkout)
+                .map_err(|error| error.to_string())?
+                .components()
+                .map(|component| component.as_os_str().to_str())
+                .collect::<Option<Vec<_>>>();
+            let Some(components) = components else {
+                continue;
+            };
+            let relative = components.join("/");
+            if let Ok(path) = ProjectPath::new(relative) {
+                paths.push(path);
+                if paths.len() == MAX_INDEXED_PROJECT_PATHS {
+                    return Ok(paths);
+                }
+            }
+        }
+    }
+    Ok(paths)
 }
 
 pub fn path_diff(checkout: &Path, path: &str) -> Result<PathDiff, String> {
@@ -103,5 +179,31 @@ mod tests {
         let binary = path_diff(repository.path(), "tracked.bin").unwrap();
         assert!(binary.binary);
         assert!(binary.text.contains("Binary files"));
+
+        fs::write(repository.path().join("untracked.txt"), "new").unwrap();
+        fs::write(repository.path().join("ignored.txt"), "hidden").unwrap();
+        let paths = project_paths(repository.path()).unwrap();
+        assert!(paths.iter().any(|path| path.as_str() == "tracked.txt"));
+        assert!(paths.iter().any(|path| path.as_str() == "untracked.txt"));
+        assert!(!paths.iter().any(|path| path.as_str() == "ignored.txt"));
+    }
+
+    #[test]
+    fn indexes_files_outside_a_git_repository() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("nested")).unwrap();
+        fs::write(project.path().join("README.md"), "read me").unwrap();
+        fs::write(
+            project.path().join("nested").join("main.rs"),
+            "fn main() {}",
+        )
+        .unwrap();
+
+        let paths = project_paths(project.path()).unwrap();
+
+        assert_eq!(
+            paths.iter().map(|path| path.as_str()).collect::<Vec<_>>(),
+            vec!["README.md", "nested/main.rs"]
+        );
     }
 }

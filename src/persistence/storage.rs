@@ -14,7 +14,7 @@ use super::codec::{
     encode_event, encode_workspace,
 };
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MIGRATION_0_TO_1: &str = "
@@ -73,6 +73,13 @@ LIMIT 1;
 INSERT INTO application_state (singleton, active_workspace_id)
 SELECT 1, NULL
 WHERE NOT EXISTS (SELECT 1 FROM application_state);
+";
+
+const MIGRATION_2_TO_3: &str = "
+CREATE TABLE application_shortcuts (
+    command_id TEXT PRIMARY KEY,
+    shortcut   TEXT
+) STRICT;
 ";
 
 pub struct Journal {
@@ -250,6 +257,38 @@ impl Journal {
         value
             .map(|value| parse_workspace_id(&value, "active workspace"))
             .transpose()
+    }
+
+    pub fn shortcuts(&self) -> Result<Vec<(String, Option<String>)>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT command_id, shortcut
+                 FROM application_shortcuts
+                 ORDER BY command_id",
+            )
+            .map_err(|source| PersistenceError::database("prepare shortcuts", source))?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|source| PersistenceError::database("query shortcuts", source))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| PersistenceError::database("read shortcuts", source))
+    }
+
+    pub fn store_shortcut(
+        &mut self,
+        command_id: &str,
+        shortcut: Option<&str>,
+    ) -> Result<(), PersistenceError> {
+        self.connection
+            .execute(
+                "INSERT INTO application_shortcuts (command_id, shortcut)
+                 VALUES (?1, ?2)
+                 ON CONFLICT (command_id) DO UPDATE SET shortcut = excluded.shortcut",
+                params![command_id, shortcut],
+            )
+            .map_err(|source| PersistenceError::database("store shortcut", source))?;
+        Ok(())
     }
 
     pub fn activate_workspace(
@@ -610,6 +649,11 @@ fn migrate(connection: &mut Connection, path: &Path, from: u32) -> Result<(), Pe
                     .execute_batch(MIGRATION_1_TO_2)
                     .map_err(|source| {
                         PersistenceError::database("apply schema version 2", source)
+                    })?,
+                2 => transaction
+                    .execute_batch(MIGRATION_2_TO_3)
+                    .map_err(|source| {
+                        PersistenceError::database("apply schema version 3", source)
                     })?,
                 _ => {
                     return Err(PersistenceError::Configuration {
