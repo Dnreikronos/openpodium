@@ -607,7 +607,7 @@ impl RoutineScheduler {
         now: Timestamp,
     ) -> Result<Option<Plan>, RoutineSchedulerError> {
         let workspace = workspace(workspaces, workspace_id)?;
-        let held = workspace.held_routine_reservations();
+        let held = held_reservations(workspaces, workspace_id)?;
         // One dispatch per call, so a single allocation of each identifier is
         // enough; the caller re-reads the workspace before the next one.
         let next_task = next_task_id(workspace)?;
@@ -927,6 +927,31 @@ fn advance(
         at,
     )?;
     Ok(())
+}
+
+/// Claims that are unavailable to a step in `workspace_id`.
+///
+/// A checkout is a filesystem path, so a run in another workspace holding one
+/// is just as much of a conflict as a sibling step holding it. Agent and named
+/// resource claims are identifiers scoped to their own workspace, and treating
+/// them as global would invent conflicts between unrelated workspaces.
+fn held_reservations(
+    workspaces: &WorkspaceManager,
+    workspace_id: WorkspaceId,
+) -> Result<BTreeSet<RoutineReservation>, RoutineSchedulerError> {
+    let mut held = workspace(workspaces, workspace_id)?.held_routine_reservations();
+    for other in workspaces.recent_workspaces() {
+        if other.id() == workspace_id {
+            continue;
+        }
+        held.extend(
+            other
+                .held_routine_reservations()
+                .into_iter()
+                .filter(|claim| matches!(claim, RoutineReservation::Checkout(_))),
+        );
+    }
+    Ok(held)
 }
 
 /// The checkout an agent's terminal actually runs in.

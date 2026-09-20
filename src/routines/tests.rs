@@ -2101,3 +2101,75 @@ fn a_step_whose_agent_left_its_claimed_checkout_does_not_run() {
         "the reason names the checkout the agent actually uses"
     );
 }
+
+#[test]
+fn two_workspaces_sharing_a_checkout_do_not_both_dispatch() {
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let mut manager = WorkspaceManager::open(temp.path().join("openpodium.sqlite")).unwrap();
+
+    // Both workspaces open the same directory, so their checkouts are the same
+    // place on disk even though every identifier differs.
+    let mut ids = Vec::new();
+    for index in 0..2 {
+        let workspace_id = manager
+            .create_workspace(&project, timestamp(1 + index))
+            .unwrap();
+        manager
+            .execute(
+                workspace_id,
+                DomainCommand::AddAgent(Agent::with_program(
+                    AgentId::new(1),
+                    name("Builder"),
+                    None,
+                    AgentProgram::Codex,
+                )),
+                timestamp(3 + index),
+            )
+            .unwrap();
+        install(
+            &mut manager,
+            workspace_id,
+            version(
+                vec![step(1, 1, "Investigate", vec![], vec![], vec![])],
+                Vec::new(),
+            ),
+        );
+        ids.push(workspace_id);
+    }
+
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    for workspace_id in &ids {
+        scheduler
+            .start_run(
+                &mut manager,
+                *workspace_id,
+                RoutineId::new(1),
+                RunRequest::default(),
+                timestamp(20),
+            )
+            .unwrap();
+    }
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+
+    let dispatched = ids
+        .iter()
+        .filter(|workspace_id| {
+            manager
+                .workspace(**workspace_id)
+                .unwrap()
+                .routine_runs()
+                .any(|run| {
+                    run.step(RoutineStepId::new(1)).unwrap().state() == RoutineStepState::Dispatched
+                })
+        })
+        .count();
+    assert_eq!(
+        dispatched, 1,
+        "checkout exclusivity has to hold across workspaces, because a checkout is a path"
+    );
+}
