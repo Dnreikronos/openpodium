@@ -579,7 +579,7 @@ fn a_dispatched_step_is_interrupted_after_a_restart() {
 }
 
 #[test]
-fn resolving_an_interruption_retries_within_the_budget() {
+fn confirming_a_cancelled_step_settles_the_run() {
     let (_temp, mut manager, workspace_id) = manager();
     let retried = RoutineStep::new(
         RoutineStepId::new(1),
@@ -656,18 +656,43 @@ fn resolving_an_interruption_retries_within_the_budget() {
             timestamp(40),
         )
         .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(41))
+        .unwrap();
+
     let run = manager
         .workspace(workspace_id)
         .unwrap()
         .routine_run(run_id)
         .unwrap();
     let step = run.step(RoutineStepId::new(1)).unwrap();
-    assert_eq!(step.attempts().len(), 1);
     assert_eq!(
-        step.attempts()[0].task_id(),
-        first_task,
-        "a retry keeps the previous attempt and its task"
+        step.attempts().len(),
+        1,
+        "the confirmed work is not retried"
     );
+    assert_eq!(step.attempts()[0].task_id(), first_task);
+    assert_eq!(step.state(), RoutineStepState::Cancelled);
+    assert_eq!(
+        run.state(),
+        RoutineRunState::Cancelled,
+        "a cancelled run settles instead of staying active forever"
+    );
+    assert!(
+        run.held_reservations().is_empty(),
+        "a settled run releases the claims it held"
+    );
+
+    // A settled run no longer blocks the next one.
+    scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(50),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -1786,5 +1811,80 @@ fn a_restart_does_not_paste_an_interrupted_prompt_again() {
             .unwrap()
             .state(),
         RoutineStepState::Interrupted
+    );
+}
+
+#[test]
+fn cancelling_a_routine_task_from_the_timeline_does_not_start_a_retry() {
+    let (_temp, mut manager, workspace_id) = manager();
+    let retried = RoutineStep::new(
+        RoutineStepId::new(1),
+        name("Flaky"),
+        AgentId::new(1),
+        content("Try"),
+        [],
+        [],
+        [],
+        RoutineApproval::NotRequired,
+        RoutineRetryPolicy::new(3).unwrap(),
+        RoutineStepClaims::default(),
+    )
+    .unwrap();
+    let routine_id = install(
+        &mut manager,
+        workspace_id,
+        version(vec![retried], Vec::new()),
+    );
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+    let task_id = manager
+        .workspace(workspace_id)
+        .unwrap()
+        .routine_run(run_id)
+        .unwrap()
+        .step(RoutineStepId::new(1))
+        .unwrap()
+        .attempts()
+        .last()
+        .unwrap()
+        .task_id();
+
+    // The recovery control cancels the task directly, the way the timeline
+    // panel does, without telling the scheduler.
+    orchestrator
+        .cancel_task(&mut manager, workspace_id, task_id, timestamp(30))
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(31))
+        .unwrap();
+
+    let run = manager
+        .workspace(workspace_id)
+        .unwrap()
+        .routine_run(run_id)
+        .unwrap();
+    let step = run.step(RoutineStepId::new(1)).unwrap();
+    assert_eq!(
+        step.state(),
+        RoutineStepState::Interrupted,
+        "cancelling the conversation does not prove the agent stopped"
+    );
+    assert_eq!(step.attempts().len(), 1, "no retry ran alongside it");
+    assert_eq!(
+        run.held_reservations().len(),
+        2,
+        "the claims stay held until shutdown is confirmed"
     );
 }

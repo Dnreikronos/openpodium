@@ -2114,17 +2114,26 @@ impl RoutineRun {
             .ok_or(RoutineError::UnknownStep { step_id })?
             .retry()
             .max_attempts();
+        // A run that is cancelling does not retry the work it just confirmed
+        // stopped. Returning the step to pending would leave a cancelled run
+        // active forever: it never dispatches again, and it never settles.
+        let cancelling = self.state == RoutineRunState::Cancelling;
         let step = self.step_mut(step_id)?;
         expect_state(step, RoutineStepState::Interrupted, "resolve")?;
         finish_attempt(step, RoutineAttemptOutcome::Cancelled, finished_at)?;
         step.interruption = None;
         let attempts = u32::try_from(step.attempts.len()).unwrap_or(u32::MAX);
-        step.state = if attempts < max_attempts {
+        step.state = if cancelling {
+            RoutineStepState::Cancelled
+        } else if attempts < max_attempts {
             RoutineStepState::Pending
         } else {
             RoutineStepState::Failed
         };
-        if step.state == RoutineStepState::Failed {
+        if matches!(
+            step.state,
+            RoutineStepState::Failed | RoutineStepState::Cancelled
+        ) {
             self.propagate_skips();
         }
         Ok(())
@@ -2143,6 +2152,7 @@ impl RoutineRun {
             finish_attempt(step, RoutineAttemptOutcome::Cancelled, finished_at)?;
         }
         step.state = RoutineStepState::Cancelled;
+        self.propagate_skips();
         Ok(())
     }
 

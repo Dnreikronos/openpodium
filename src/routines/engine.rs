@@ -472,24 +472,23 @@ impl RoutineScheduler {
                     return Ok(Some((current.id(), transition)));
                 }
 
+                // A cancelled or timed-out handoff ends the conversation, not
+                // necessarily the work. Whoever cancelled it cannot know the
+                // agent stopped, so the step is interrupted and keeps holding
+                // its claims until a person confirms. Failing it here would
+                // release the checkout and start a retry alongside an agent
+                // that may still be writing to it.
                 if let Some(termination) = handoff.termination() {
-                    let (reason, at) = match termination {
-                        HandoffTermination::Cancelled {
-                            reason,
-                            cancelled_at,
-                            ..
-                        } => (reason.clone(), *cancelled_at),
-                        HandoffTermination::TimedOut { timed_out_at } => (
-                            content("the handoff passed its response deadline")?,
-                            *timed_out_at,
-                        ),
+                    let at = match termination {
+                        HandoffTermination::Cancelled { cancelled_at, .. } => *cancelled_at,
+                        HandoffTermination::TimedOut { timed_out_at } => *timed_out_at,
                     };
                     return Ok(Some((
                         current.id(),
-                        RoutineTransition::FailStep {
+                        RoutineTransition::InterruptStep {
                             step_id: step.step_id(),
-                            reason,
-                            finished_at: at.max(handoff_start(handoff, now)),
+                            reason: RoutineInterruptionReason::ShutdownUnconfirmed,
+                            detected_at: at.max(handoff_start(handoff, now)),
                         },
                     )));
                 }
