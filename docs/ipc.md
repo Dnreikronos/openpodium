@@ -90,6 +90,7 @@ Command payloads are:
 {"type":"list_portals"}
 {"type":"inspect_portal","portal_id":10}
 {"type":"observe_portal","portal_id":10}
+{"type":"get_portal_frame","portal_id":10,"observation_revision":4,"offset":0,"max_bytes":524288}
 {"type":"request_portal_action","action_id":"action-1","portal_id":10,"action":{"type":"click","element_id":"submit","observation_revision":4}}
 {"type":"get_portal_result","action_id":"action-1"}
 ```
@@ -132,7 +133,7 @@ handoff kind. Version 1 remains available to existing clients; orchestration
 normalizes both versions into the same durable domain model.
 
 Version 3 adds authenticated portal listing, capability inspection,
-observations, semantic actions, and durable result retrieval. Portal visibility
+observations, bounded frame retrieval, semantic actions, and durable result retrieval. Portal visibility
 is checked against the authenticated workspace and the agent's current canvas
 attachment on every request. Input and navigation return an
 `awaiting_approval` receipt until the desktop user grants the exact
@@ -140,6 +141,12 @@ agent/portal/target/operation request. The dispatcher rechecks that binding
 immediately before execution. Action intent is journaled before dispatch;
 in-flight work recovered after a crash is reported as `unknown` and is never
 replayed automatically.
+
+`observe_portal` returns accessibility data and reports whether a frame exists.
+`get_portal_frame` retrieves that frame in authenticated, revision-bound chunks
+of at most 512 KiB. Each chunk includes the viewport, encoding, byte offset,
+total byte length, base64 payload, and completion flag. A newer observation
+invalidates retrieval by the prior revision.
 
 Each structured message has a client-generated opaque ID. The server validates
 IDs and text sizes before publishing. The first accepted `(workspace, message
@@ -167,6 +174,7 @@ openpodium ipc agents list
 openpodium ipc portals list
 openpodium ipc portal inspect --portal <portal-id>
 openpodium ipc portal observe --portal <portal-id>
+openpodium ipc portal frame --portal <portal-id> --revision <revision> [--offset <bytes>] [--max-bytes <bytes>]
 openpodium ipc portal click --portal <portal-id> --element <element-id> --revision <revision> [--action-id <id>]
 openpodium ipc portal click-coordinate --portal <portal-id> --x <pixels> --y <pixels> --revision <revision> [--action-id <id>]
 openpodium ipc portal type --portal <portal-id> --element <element-id> --revision <revision> --text <text> [--action-id <id>]

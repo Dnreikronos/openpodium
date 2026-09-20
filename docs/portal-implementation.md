@@ -63,8 +63,9 @@ installed on the development machine.
 Coordinate clicks and wheel events now use the exact rendered-frame transform,
 including canvas zoom and letterboxing. Clicking a frame gives it text focus;
 ordinary text and IME commits are forwarded to the focused browser element.
-Frame capture and local input share one serialized queue so a capture cannot
-invalidate an action before dispatch. Enter, Shift-Tab, Backspace, Delete,
+Frame capture and local input share one serialized queue. Visual refresh keeps
+the current semantic revision, so agent element references remain valid until a
+new semantic observation replaces them. Enter, Shift-Tab, Backspace, Delete,
 Escape, arrow keys, Home/End, and Page Up/Down use typed CDP key events. Browser
 clipboard shortcuts remain separate because clipboard access has its own policy.
 
@@ -73,7 +74,8 @@ fixtures cover Android emulators and attached-device authorization states plus
 Apple simulators and attached devices. Missing host tools and unsupported Apple
 hosts produce explicit unavailable reasons. Available targets can be added from
 the sidebar as durable portal nodes. The Appium adapter creates UiAutomator2 or
-XCUITest sessions, captures screenshots and semantic source, executes element
-and touch input, and deletes only its automation session when closed. Real
+XCUITest sessions, captures screenshots, maps source hierarchy nodes to
+observation-scoped XPath tokens, resolves those tokens before semantic input,
+executes touch input, and deletes only its automation session when closed. Real
 emulator, simulator, and attached-device smoke tests still require the matching
 SDKs, drivers, and authorized hardware.
