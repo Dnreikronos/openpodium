@@ -27,8 +27,9 @@ pub struct AppiumBackend {
     element_bindings: BTreeMap<String, ElementBinding>,
 }
 
-/// An observed element, addressed by its position in the source tree and
-/// pinned to the identity it carried when it was observed.
+/// An element as one reading of the source tree saw it: where it sat, and what
+/// identified it there. A token keeps the identity; the path is only ever used
+/// for the reading it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ElementBinding {
     path: String,
@@ -112,29 +113,29 @@ impl AppiumBackend {
         )
     }
 
-    /// Resolves an observed token to a live element, refusing when the tree
-    /// moved underneath it. The stored path is positional, so an insertion or
-    /// a reorder would otherwise point it at a different widget.
+    /// Resolves an observed token against the live tree by identity, never by
+    /// the position it held when it was observed. A target that vanished or
+    /// that more than one element now answers to is refused rather than
+    /// guessed at.
     fn resolve_element(&self, element_id: &str) -> Result<String, AppiumError> {
         let binding = self
             .element_bindings
             .get(element_id)
             .ok_or_else(|| AppiumError::InvalidElementId(element_id.to_owned()))?;
-        let identity = self
-            .current_identities()?
-            .remove(&binding.path)
+        let (live, _) = appium_elements(&self.page_source()?)?;
+        let mut matches = live
+            .into_values()
+            .filter(|candidate| candidate.identity == binding.identity);
+        let target = matches
+            .next()
             .ok_or_else(|| AppiumError::ElementUnavailable(element_id.to_owned()))?;
-        if identity != binding.identity {
-            return Err(AppiumError::ElementChanged {
-                element_id: element_id.to_owned(),
-                observed: binding.identity.clone(),
-                found: identity,
-            });
+        if matches.next().is_some() {
+            return Err(AppiumError::AmbiguousElement(element_id.to_owned()));
         }
         let response = self.request(
             "POST",
             &self.session_path("/element")?,
-            Some(json!({"using": "xpath", "value": &binding.path})),
+            Some(json!({"using": "xpath", "value": &target.path})),
         )?;
         response
             .pointer("/value/element-6066-11e4-a52e-4f735466cecf")
@@ -144,14 +145,6 @@ impl AppiumBackend {
             .ok_or_else(|| {
                 AppiumError::Protocol("element lookup returned no element ID".to_owned())
             })
-    }
-
-    fn current_identities(&self) -> Result<BTreeMap<String, String>, AppiumError> {
-        let (bindings, _) = appium_elements(&self.page_source()?)?;
-        Ok(bindings
-            .into_values()
-            .map(|binding| (binding.path, binding.identity))
-            .collect())
     }
 
     fn page_source(&self) -> Result<String, AppiumError> {
@@ -422,12 +415,6 @@ impl PortalBackend for AppiumBackend {
     }
 }
 
-#[derive(Default)]
-struct XmlPath {
-    value: String,
-    child_counts: BTreeMap<String, usize>,
-}
-
 /// Attributes a platform derives from what an element *is*, not from where it
 /// currently sits or what state it is in.
 const IDENTITY_ATTRIBUTES: [&str; 8] = [
@@ -441,32 +428,64 @@ const IDENTITY_ATTRIBUTES: [&str; 8] = [
     "package",
 ];
 
+/// The user-visible content that tells one record apart from another.
+const CONTENT_ATTRIBUTES: [&str; 5] = ["text", "content-desc", "label", "name", "value"];
+
+/// How far up the tree a record's content is looked for. A list row and the
+/// container that holds it are enough to separate repeated controls; going
+/// further would fold unrelated screen content into every token.
+const CONTEXT_ANCESTOR_DEPTH: usize = 2;
+
+struct ParsedElement {
+    role: String,
+    path: String,
+    parent: Option<usize>,
+    attributes: BTreeMap<String, String>,
+}
+
 fn appium_elements(
     source: &str,
 ) -> Result<(BTreeMap<String, ElementBinding>, Vec<Value>), AppiumError> {
-    let mut reader = Reader::from_str(source);
-    reader.config_mut().trim_text(true);
-    let mut roots = BTreeMap::new();
-    let mut stack = Vec::<XmlPath>::new();
+    let parsed = parse_source(source)?;
+    let identities = contextual_identities(&parsed);
     let mut bindings = BTreeMap::new();
     let mut elements = Vec::new();
+    for (index, element) in parsed.iter().enumerate() {
+        if element.role == "hierarchy" {
+            continue;
+        }
+        let element_id = format!("appium-{}", bindings.len() + 1);
+        bindings.insert(
+            element_id.clone(),
+            ElementBinding {
+                path: element.path.clone(),
+                identity: identities[index].clone(),
+            },
+        );
+        elements.push(json!({
+            "element_id": element_id,
+            "role": element.role,
+            "selector": element.path,
+            "attributes": element.attributes,
+        }));
+    }
+    Ok((bindings, elements))
+}
+
+fn parse_source(source: &str) -> Result<Vec<ParsedElement>, AppiumError> {
+    let mut reader = Reader::from_str(source);
+    reader.config_mut().trim_text(true);
+    let mut elements = Vec::new();
+    let mut roots = BTreeMap::new();
+    let mut stack = Vec::<(usize, BTreeMap<String, usize>)>::new();
     loop {
         match reader.read_event() {
             Ok(Event::Start(node)) => {
-                let path = record_appium_element(
-                    &node,
-                    &mut roots,
-                    &mut stack,
-                    &mut bindings,
-                    &mut elements,
-                )?;
-                stack.push(XmlPath {
-                    value: path,
-                    child_counts: BTreeMap::new(),
-                });
+                let index = record_appium_element(&node, &mut elements, &mut roots, &mut stack)?;
+                stack.push((index, BTreeMap::new()));
             }
             Ok(Event::Empty(node)) => {
-                record_appium_element(&node, &mut roots, &mut stack, &mut bindings, &mut elements)?;
+                record_appium_element(&node, &mut elements, &mut roots, &mut stack)?;
             }
             Ok(Event::End(_)) => {
                 stack.pop();
@@ -480,68 +499,109 @@ fn appium_elements(
             }
         }
     }
-    Ok((bindings, elements))
+    Ok(elements)
 }
 
 fn record_appium_element(
     node: &BytesStart<'_>,
+    elements: &mut Vec<ParsedElement>,
     roots: &mut BTreeMap<String, usize>,
-    stack: &mut [XmlPath],
-    bindings: &mut BTreeMap<String, ElementBinding>,
-    elements: &mut Vec<Value>,
-) -> Result<String, AppiumError> {
+    stack: &mut [(usize, BTreeMap<String, usize>)],
+) -> Result<usize, AppiumError> {
     let role = node.name().as_ref().to_owned();
-    let parent = stack
-        .last()
-        .map_or_else(String::new, |parent| parent.value.clone());
+    let parent = stack.last().map(|(index, _)| *index);
+    let parent_path = parent.map_or_else(String::new, |index| elements[index].path.clone());
     let index = {
-        let counts = stack
-            .last_mut()
-            .map_or(roots, |parent| &mut parent.child_counts);
+        let counts = stack.last_mut().map_or(roots, |(_, counts)| counts);
         let index = counts.entry(role.clone()).or_default();
         *index += 1;
         *index
     };
-    let path = format!("{parent}/{role}[{index}]");
-    if role != "hierarchy" {
-        let mut attributes = BTreeMap::new();
-        for attribute in node.attributes() {
-            let attribute = attribute.map_err(|error| {
-                AppiumError::Protocol(format!("invalid XML attribute: {error}"))
-            })?;
-            let key = attribute.key.as_ref().to_owned();
-            let value = attribute
-                .normalized_value(XmlVersion::Implicit1_0)
-                .map_err(|error| {
-                    AppiumError::Protocol(format!("invalid XML attribute value: {error}"))
-                })?
-                .into_owned();
-            attributes.insert(key, value);
-        }
-        let element_id = format!("appium-{}", bindings.len() + 1);
-        bindings.insert(
-            element_id.clone(),
-            ElementBinding {
-                path: path.clone(),
-                identity: element_identity(&role, &attributes),
-            },
-        );
-        elements.push(json!({
-            "element_id": element_id,
-            "role": role,
-            "selector": path,
-            "attributes": attributes,
-        }));
+    let mut attributes = BTreeMap::new();
+    for attribute in node.attributes() {
+        let attribute = attribute
+            .map_err(|error| AppiumError::Protocol(format!("invalid XML attribute: {error}")))?;
+        let key = attribute.key.as_ref().to_owned();
+        let value = attribute
+            .normalized_value(XmlVersion::Implicit1_0)
+            .map_err(|error| {
+                AppiumError::Protocol(format!("invalid XML attribute value: {error}"))
+            })?
+            .into_owned();
+        attributes.insert(key, value);
     }
-    Ok(path)
+    elements.push(ParsedElement {
+        path: format!("{parent_path}/{role}[{index}]"),
+        role,
+        parent,
+        attributes,
+    });
+    Ok(elements.len() - 1)
+}
+
+/// What the element claims to be, together with the content of the record it
+/// belongs to. Repeated controls — a Delete on every row — are identical on
+/// their own, so the surrounding content is what tells them apart.
+fn contextual_identities(elements: &[ParsedElement]) -> Vec<String> {
+    let content = subtree_content(elements);
+    elements
+        .iter()
+        .map(|element| {
+            let mut ancestors = Vec::new();
+            let mut cursor = element.parent;
+            while let Some(index) = cursor {
+                ancestors.push(index);
+                cursor = elements[index].parent;
+            }
+            ancestors.reverse();
+            let mut identity = String::new();
+            for (position, ancestor) in ancestors.iter().enumerate() {
+                identity.push_str(&element_identity(&elements[*ancestor]));
+                if ancestors.len() - position <= CONTEXT_ANCESTOR_DEPTH {
+                    identity.push('\u{1e}');
+                    identity.push_str(&content[*ancestor].join("\u{1f}"));
+                }
+                identity.push('\u{1d}');
+            }
+            identity.push_str(&element_identity(element));
+            identity
+        })
+        .collect()
+}
+
+/// The content each element holds, directly or through its descendants. The
+/// values are sorted so that reordering records does not rewrite the identity
+/// of the container they sit in.
+fn subtree_content(elements: &[ParsedElement]) -> Vec<Vec<String>> {
+    let mut content = vec![Vec::new(); elements.len()];
+    for (index, element) in elements.iter().enumerate() {
+        let own = CONTENT_ATTRIBUTES
+            .iter()
+            .filter_map(|name| element.attributes.get(*name))
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        if own.is_empty() {
+            continue;
+        }
+        let mut cursor = Some(index);
+        while let Some(current) = cursor {
+            content[current].extend(own.iter().cloned());
+            cursor = elements[current].parent;
+        }
+    }
+    for values in &mut content {
+        values.sort();
+    }
+    content
 }
 
 /// What the element claims to be, ignoring the state attributes a platform
 /// updates as the user interacts with it.
-fn element_identity(role: &str, attributes: &BTreeMap<String, String>) -> String {
-    let mut identity = String::from(role);
+fn element_identity(element: &ParsedElement) -> String {
+    let mut identity = String::from(&element.role);
     for name in IDENTITY_ATTRIBUTES {
-        if let Some(value) = attributes.get(name) {
+        if let Some(value) = element.attributes.get(name) {
             identity.push('\u{1f}');
             identity.push_str(name);
             identity.push('=');
@@ -628,11 +688,7 @@ pub enum AppiumError {
     },
     InvalidElementId(String),
     ElementUnavailable(String),
-    ElementChanged {
-        element_id: String,
-        observed: String,
-        found: String,
-    },
+    AmbiguousElement(String),
     CoordinateOutsideViewport {
         x: u32,
         y: u32,
@@ -667,16 +723,13 @@ impl Display for AppiumError {
                 "Appium command failed with HTTP {status}: {detail}"
             ),
             Self::InvalidElementId(id) => write!(formatter, "invalid Appium element ID {id:?}"),
-            Self::ElementUnavailable(id) => {
-                write!(formatter, "observed element {id} is no longer on screen")
-            }
-            Self::ElementChanged {
-                element_id,
-                observed,
-                found,
-            } => write!(
+            Self::ElementUnavailable(id) => write!(
                 formatter,
-                "element {element_id} changed since it was observed: {observed:?} became {found:?}"
+                "element {id} is no longer on screen as it was observed"
+            ),
+            Self::AmbiguousElement(id) => write!(
+                formatter,
+                "element {id} no longer identifies a single element on screen"
             ),
             Self::CoordinateOutsideViewport { x, y } => write!(
                 formatter,
@@ -901,23 +954,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_token_is_not_clicked_when_another_element_takes_its_place() {
+    /// Serves canned Appium responses and records the requests that arrived.
+    fn appium_server(responses: Vec<&'static str>) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured_requests = Arc::clone(&requests);
-        let worker = thread::spawn(move || {
-            for response in [
-                r#"{"value":{"sessionId":"session-1"}}"#,
-                r#"{"value":{"width":800,"height":600}}"#,
-                r#"{"value":"AQ=="}"#,
-                r#"{"value":"<hierarchy><android.widget.Button text=\"Cancel\" resource-id=\"cancel\"/></hierarchy>"}"#,
-                // A Delete button is inserted ahead of Cancel, so the observed
-                // path now addresses a different widget.
-                r#"{"value":"<hierarchy><android.widget.Button text=\"Delete\" resource-id=\"delete\"/><android.widget.Button text=\"Cancel\" resource-id=\"cancel\"/></hierarchy>"}"#,
-            ] {
-                let (mut stream, _) = listener.accept().unwrap();
+        thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
                 let request = read_http_request(&mut stream);
                 captured_requests.lock().unwrap().push(request);
                 write!(
@@ -931,14 +978,72 @@ mod tests {
                 stream.shutdown(std::net::Shutdown::Write).unwrap();
             }
         });
+        (address, requests)
+    }
+
+    fn connected_backend(address: SocketAddr) -> (AppiumBackend, PortalSession) {
         let mut backend = AppiumBackend::with_address(PortalTargetKind::Android, address).unwrap();
         let config = PortalConfig::new(
             PortalTarget::new(PortalTargetKind::Android, "emulator-5554").unwrap(),
             PortalPresentation::default(),
         );
         let mut session = PortalSession::new(1);
-
         backend.connect(&config, &mut session).unwrap();
+        (backend, session)
+    }
+
+    const ALICE_THEN_BOB: &str = r#"{"value":"<hierarchy><android.widget.LinearLayout><android.widget.TextView text=\"Alice\"/><android.widget.Button content-desc=\"Delete\"/></android.widget.LinearLayout><android.widget.LinearLayout><android.widget.TextView text=\"Bob\"/><android.widget.Button content-desc=\"Delete\"/></android.widget.LinearLayout></hierarchy>"}"#;
+    const BOB_THEN_ALICE: &str = r#"{"value":"<hierarchy><android.widget.LinearLayout><android.widget.TextView text=\"Bob\"/><android.widget.Button content-desc=\"Delete\"/></android.widget.LinearLayout><android.widget.LinearLayout><android.widget.TextView text=\"Alice\"/><android.widget.Button content-desc=\"Delete\"/></android.widget.LinearLayout></hierarchy>"}"#;
+
+    #[test]
+    fn a_repeated_control_follows_its_record_across_a_reorder() {
+        let (address, requests) = appium_server(vec![
+            r#"{"value":{"sessionId":"session-1"}}"#,
+            r#"{"value":{"width":800,"height":600}}"#,
+            r#"{"value":"AQ=="}"#,
+            ALICE_THEN_BOB,
+            // The rows swap between observing and acting.
+            BOB_THEN_ALICE,
+            r#"{"value":{"element-6066-11e4-a52e-4f735466cecf":"element-42"}}"#,
+            r#"{"value":null}"#,
+        ]);
+        let (mut backend, mut session) = connected_backend(address);
+
+        let observation = backend.observe(&mut session).unwrap();
+        // appium-3 is Alice's Delete: row, label, then button.
+        backend
+            .execute(
+                &mut session,
+                &PortalAction::Click(
+                    PortalElementRef::new(observation.revision(), "appium-3").unwrap(),
+                ),
+            )
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        let lookup = requests
+            .iter()
+            .find(|request| request.contains("POST /session/session-1/element HTTP/1.1"))
+            .expect("the click must resolve a target");
+        assert!(
+            lookup
+                .contains("/hierarchy[1]/android.widget.LinearLayout[2]/android.widget.Button[1]"),
+            "the token must follow Alice to the second row: {lookup}"
+        );
+    }
+
+    #[test]
+    fn an_indistinguishable_control_is_refused_rather_than_guessed_at() {
+        let rows = r#"{"value":"<hierarchy><android.widget.LinearLayout><android.widget.Button content-desc=\"Delete\"/></android.widget.LinearLayout><android.widget.LinearLayout><android.widget.Button content-desc=\"Delete\"/></android.widget.LinearLayout></hierarchy>"}"#;
+        let (address, requests) = appium_server(vec![
+            r#"{"value":{"sessionId":"session-1"}}"#,
+            r#"{"value":{"width":800,"height":600}}"#,
+            r#"{"value":"AQ=="}"#,
+            rows,
+            rows,
+        ]);
+        let (mut backend, mut session) = connected_backend(address);
+
         let observation = backend.observe(&mut session).unwrap();
         let error = backend
             .execute(
@@ -950,17 +1055,70 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(&error, AppiumError::ElementChanged { element_id, .. } if element_id == "appium-1"),
+            matches!(&error, AppiumError::AmbiguousElement(id) if id == "appium-1"),
             "unexpected error: {error}"
         );
-        worker.join().unwrap();
         assert!(
             !requests
                 .lock()
                 .unwrap()
                 .iter()
                 .any(|request| request.contains("/click")),
-            "a changed element must never be clicked"
+            "an ambiguous element must never be clicked"
+        );
+    }
+
+    #[test]
+    fn a_token_is_not_clicked_when_its_element_is_gone() {
+        let (address, requests) = appium_server(vec![
+            r#"{"value":{"sessionId":"session-1"}}"#,
+            r#"{"value":{"width":800,"height":600}}"#,
+            r#"{"value":"AQ=="}"#,
+            r#"{"value":"<hierarchy><android.widget.Button text=\"Cancel\" resource-id=\"cancel\"/></hierarchy>"}"#,
+            // Cancel became Delete in place.
+            r#"{"value":"<hierarchy><android.widget.Button text=\"Delete\" resource-id=\"delete\"/></hierarchy>"}"#,
+        ]);
+        let (mut backend, mut session) = connected_backend(address);
+
+        let observation = backend.observe(&mut session).unwrap();
+        let error = backend
+            .execute(
+                &mut session,
+                &PortalAction::Click(
+                    PortalElementRef::new(observation.revision(), "appium-1").unwrap(),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, AppiumError::ElementUnavailable(id) if id == "appium-1"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("/click")),
+            "a replaced element must never be clicked"
+        );
+    }
+
+    #[test]
+    fn identity_separates_repeated_controls_by_the_record_they_belong_to() {
+        let source = r#"<hierarchy><android.widget.LinearLayout><android.widget.TextView text="Alice"/><android.widget.Button content-desc="Delete"/></android.widget.LinearLayout><android.widget.LinearLayout><android.widget.TextView text="Bob"/><android.widget.Button content-desc="Delete"/></android.widget.LinearLayout></hierarchy>"#;
+        let swapped = r#"<hierarchy><android.widget.LinearLayout><android.widget.TextView text="Bob"/><android.widget.Button content-desc="Delete"/></android.widget.LinearLayout><android.widget.LinearLayout><android.widget.TextView text="Alice"/><android.widget.Button content-desc="Delete"/></android.widget.LinearLayout></hierarchy>"#;
+        let (observed, _) = appium_elements(source).unwrap();
+        let (live, _) = appium_elements(swapped).unwrap();
+
+        let alice = &observed["appium-3"];
+        let bob = &observed["appium-6"];
+        assert_ne!(alice.identity, bob.identity);
+        // Alice's control keeps its identity and is found at its new position.
+        assert_eq!(alice.identity, live["appium-6"].identity);
+        assert_eq!(
+            live["appium-6"].path,
+            "/hierarchy[1]/android.widget.LinearLayout[2]/android.widget.Button[1]"
         );
     }
 }
