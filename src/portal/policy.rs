@@ -185,6 +185,12 @@ impl PortalPolicy {
 
     pub fn evaluate(&mut self, request: &PolicyRequest, now_ms: u64) -> PolicyDecision {
         self.grants.retain(|_, grant| grant.expires_at_ms > now_ms);
+        // An expired approval can no longer be granted, so dropping it here
+        // stops a later request from reusing an ID that only returns
+        // `StaleApproval`.
+        self.pending.retain(|_, approval| {
+            now_ms.saturating_sub(approval.requested_at_ms) <= PENDING_APPROVAL_LIFETIME_MS
+        });
         if let Some(CapabilityStatus::Unavailable { reason }) = capability_status(request) {
             return PolicyDecision::Denied {
                 reason: reason.clone(),
@@ -452,6 +458,28 @@ mod tests {
             policy.evaluate(&original, 1_014),
             PolicyDecision::ApprovalRequired { .. }
         ));
+    }
+
+    #[test]
+    fn an_expired_approval_is_replaced_rather_than_reissued() {
+        let mut policy = PortalPolicy::new();
+        let request = request(PortalOperation::Input, "https://example.test");
+        let expired = match policy.evaluate(&request, 10) {
+            PolicyDecision::ApprovalRequired { approval_id, .. } => approval_id,
+            decision => panic!("unexpected decision: {decision:?}"),
+        };
+        let later = 10 + PENDING_APPROVAL_LIFETIME_MS + 1;
+
+        let reissued = match policy.evaluate(&request, later) {
+            PolicyDecision::ApprovalRequired { approval_id, .. } => approval_id,
+            decision => panic!("unexpected decision: {decision:?}"),
+        };
+        assert_ne!(reissued, expired);
+        assert_eq!(
+            policy.approve(expired, &request, later, 1_000),
+            Err(PortalPolicyError::UnknownApproval(expired))
+        );
+        assert!(policy.approve(reissued, &request, later, 1_000).is_ok());
     }
 
     #[test]

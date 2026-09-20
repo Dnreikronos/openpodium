@@ -140,7 +140,9 @@ attachment on every request. Input and navigation return an
 agent/portal/target/operation request. The dispatcher rechecks that binding
 immediately before execution. Action intent is journaled before dispatch;
 in-flight work recovered after a crash is reported as `unknown` and is never
-replayed automatically.
+replayed automatically. Approval state is not durable, so a request still
+awaiting approval at restart is recovered as `failed` rather than left for an
+approval that can no longer arrive.
 
 `observe_portal` returns accessibility data and reports whether a frame exists.
 `get_portal_frame` retrieves that frame in authenticated, revision-bound chunks

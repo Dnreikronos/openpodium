@@ -2,8 +2,10 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::PortalServiceError;
+use super::{PortalServiceError, now_ms};
 use crate::ipc::{MessageId, PortalActionReceipt, PortalActionState, PortalPolicyOutcome};
+
+const APPROVAL_LOST_ON_RESTART: &str = "approval request did not survive a restart";
 
 #[derive(Debug)]
 pub(super) struct PortalActionJournal {
@@ -54,6 +56,21 @@ impl PortalActionJournal {
                      finished_at_ms = NULL
                  WHERE state IN ('queued', 'dispatched')",
                 [],
+            )
+            .map_err(journal_error)?;
+        // Approval state lives in memory, so a surviving request can never be
+        // granted. Fail it during recovery instead of leaving the client to
+        // poll an approval that no longer exists.
+        connection
+            .execute(
+                "UPDATE portal_actions
+                 SET state = 'failed',
+                     policy = 'denied',
+                     policy_detail = ?1,
+                     outcome = COALESCE(outcome, ?1),
+                     finished_at_ms = ?2
+                 WHERE state = 'awaiting_approval'",
+                params![APPROVAL_LOST_ON_RESTART, now_ms()],
             )
             .map_err(journal_error)?;
         Ok(Self { connection })
