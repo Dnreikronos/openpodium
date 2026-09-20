@@ -4,8 +4,6 @@ use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
-
 use crate::portal::{
     CapabilityStatus, PolicyDecision, PolicyRequest, PortalAction, PortalBackend,
     PortalCapabilities, PortalConfig, PortalObservation as CoreObservation, PortalOperation,
@@ -13,9 +11,12 @@ use crate::portal::{
 };
 
 use super::{
-    MessageId, PortalActionReceipt, PortalActionState, PortalCapability, PortalCapabilityStatus,
-    PortalDescriptor, PortalObservation, PortalPolicyOutcome, PortalTargetKind as WireTargetKind,
+    MessageId, PortalActionReceipt, PortalCapability, PortalCapabilityStatus, PortalDescriptor,
+    PortalObservation, PortalTargetKind as WireTargetKind,
 };
+
+mod journal;
+use journal::{JournalIntent, PortalActionJournal};
 
 const JOURNAL_FILE_NAME: &str = "portal-actions.sqlite";
 const MAX_OBSERVATION_CHARS: usize = 900_000;
@@ -72,6 +73,16 @@ pub struct PortalDispatcher {
     portals: BTreeMap<u64, PortalEntry>,
     policy: PortalPolicy,
     journal: PortalActionJournal,
+    pending_actions: BTreeMap<(u64, MessageId), PendingAction>,
+}
+
+#[derive(Clone)]
+struct PendingAction {
+    agent_id: u64,
+    portal_id: u64,
+    approval_id: u64,
+    request: PolicyRequest,
+    action: PortalAction,
 }
 
 struct PortalEntry {
@@ -153,6 +164,7 @@ impl PortalDispatcher {
             portals: BTreeMap::new(),
             policy: PortalPolicy::new(),
             journal: PortalActionJournal::open(data_directory.as_ref().join(JOURNAL_FILE_NAME))?,
+            pending_actions: BTreeMap::new(),
         })
     }
 
@@ -213,9 +225,31 @@ impl PortalDispatcher {
     }
 
     pub fn close(&mut self, portal_id: u64) -> Result<(), PortalServiceError> {
-        let entry = self.entry_mut(portal_id)?;
-        if !matches!(entry.session.state(), PortalSessionState::Disconnected) {
-            entry.backend.close(&mut entry.session)?;
+        {
+            let entry = self.entry_mut(portal_id)?;
+            if !matches!(
+                entry.session.state(),
+                PortalSessionState::Disconnected | PortalSessionState::Closed
+            ) {
+                entry.backend.close(&mut entry.session)?;
+            }
+        }
+        let pending: Vec<_> = self
+            .pending_actions
+            .iter()
+            .filter(|(_, action)| action.portal_id == portal_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (workspace_id, action_id) in pending {
+            self.pending_actions
+                .remove(&(workspace_id, action_id.clone()));
+            self.journal.finish(
+                workspace_id,
+                &action_id,
+                "failed",
+                Some("portal closed before approval".to_owned()),
+                now_ms(),
+            )?;
         }
         self.policy.revoke_portal(portal_id);
         Ok(())
@@ -338,6 +372,16 @@ impl PortalDispatcher {
                     policy_detail: Some(format!("{approval_id}:{reason}")),
                     created_at_ms: now_ms,
                 })?;
+                self.pending_actions.insert(
+                    (workspace_id, action_id.clone()),
+                    PendingAction {
+                        agent_id,
+                        portal_id,
+                        approval_id,
+                        request,
+                        action,
+                    },
+                );
                 Ok(receipt)
             }
             PolicyDecision::Denied { reason } => self.journal.insert_intent(JournalIntent {
@@ -363,21 +407,66 @@ impl PortalDispatcher {
                     policy_detail: None,
                     created_at_ms: now_ms,
                 })?;
-                self.journal
-                    .mark_dispatched(workspace_id, &action_id, now_ms)?;
-                let entry = self.authorized_entry_mut(workspace_id, agent_id, portal_id)?;
-                let result = entry.backend.execute(&mut entry.session, &action);
-                let (state, outcome) = match result {
-                    Ok(()) => ("completed", None),
-                    Err(error) => ("failed", Some(error.to_string())),
-                };
-                self.journal
-                    .finish(workspace_id, &action_id, state, outcome, now_ms)?;
-                self.journal
-                    .receipt(workspace_id, &action_id)?
-                    .ok_or_else(|| PortalServiceError::MissingReceipt(action_id.to_string()))
+                self.dispatch_action(workspace_id, agent_id, action_id, portal_id, action, now_ms)
             }
         }
+    }
+
+    pub fn approve_action(
+        &mut self,
+        workspace_id: u64,
+        action_id: &MessageId,
+        approval_id: u64,
+        lifetime_ms: u64,
+    ) -> Result<PortalActionReceipt, PortalServiceError> {
+        self.approve_action_at(workspace_id, action_id, approval_id, lifetime_ms, now_ms())
+    }
+
+    pub fn approve_action_at(
+        &mut self,
+        workspace_id: u64,
+        action_id: &MessageId,
+        approval_id: u64,
+        lifetime_ms: u64,
+        now_ms: u64,
+    ) -> Result<PortalActionReceipt, PortalServiceError> {
+        let key = (workspace_id, action_id.clone());
+        let pending =
+            self.pending_actions.get(&key).cloned().ok_or_else(|| {
+                PortalServiceError::PendingActionUnavailable(action_id.to_string())
+            })?;
+        if pending.approval_id != approval_id {
+            return Err(PortalServiceError::ApprovalMismatch {
+                expected: pending.approval_id,
+                found: approval_id,
+            });
+        }
+
+        let entry = self.authorized_entry(workspace_id, pending.agent_id, pending.portal_id)?;
+        let current_request = PolicyRequest::new(
+            pending.agent_id,
+            pending.portal_id,
+            operation_for(&pending.action),
+            action_target(&pending.action, entry.config.target().selector()),
+            entry.capabilities.clone(),
+        )
+        .map_err(PortalServiceError::Policy)?;
+        if current_request != pending.request {
+            return Err(PortalServiceError::Policy(PortalPolicyError::StaleApproval));
+        }
+        self.policy
+            .approve(approval_id, &current_request, now_ms, lifetime_ms)
+            .map_err(PortalServiceError::Policy)?;
+        self.journal.mark_approved(workspace_id, action_id)?;
+        self.pending_actions.remove(&key);
+        self.dispatch_action(
+            workspace_id,
+            pending.agent_id,
+            action_id.clone(),
+            pending.portal_id,
+            pending.action,
+            now_ms,
+        )
     }
 
     pub fn result(
@@ -402,6 +491,30 @@ impl PortalDispatcher {
 
     pub fn set_policy_rule(&mut self, operation: PortalOperation, rule: crate::portal::PolicyRule) {
         self.policy.set_rule(operation, rule);
+    }
+
+    fn dispatch_action(
+        &mut self,
+        workspace_id: u64,
+        agent_id: u64,
+        action_id: MessageId,
+        portal_id: u64,
+        action: PortalAction,
+        now_ms: u64,
+    ) -> Result<PortalActionReceipt, PortalServiceError> {
+        self.journal
+            .mark_dispatched(workspace_id, &action_id, now_ms)?;
+        let entry = self.authorized_entry_mut(workspace_id, agent_id, portal_id)?;
+        let result = entry.backend.execute(&mut entry.session, &action);
+        let (state, outcome) = match result {
+            Ok(()) => ("completed", None),
+            Err(error) => ("failed", Some(error.to_string())),
+        };
+        self.journal
+            .finish(workspace_id, &action_id, state, outcome, now_ms)?;
+        self.journal
+            .receipt(workspace_id, &action_id)?
+            .ok_or_else(|| PortalServiceError::MissingReceipt(action_id.to_string()))
     }
 
     fn entry(&self, portal_id: u64) -> Result<&PortalEntry, PortalServiceError> {
@@ -587,256 +700,6 @@ fn now_ms() -> u64 {
 }
 
 #[derive(Debug)]
-struct PortalActionJournal {
-    connection: Connection,
-}
-
-struct JournalIntent<'a> {
-    workspace_id: u64,
-    agent_id: u64,
-    portal_id: u64,
-    action_id: &'a MessageId,
-    fingerprint: &'a str,
-    state: &'a str,
-    policy: &'a str,
-    policy_detail: Option<String>,
-    created_at_ms: u64,
-}
-
-impl PortalActionJournal {
-    fn open(path: impl AsRef<Path>) -> Result<Self, PortalServiceError> {
-        let connection = Connection::open(path).map_err(journal_error)?;
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = FULL;
-                 CREATE TABLE IF NOT EXISTS portal_actions (
-                     workspace_id   INTEGER NOT NULL,
-                     action_id      TEXT NOT NULL,
-                     agent_id       INTEGER NOT NULL,
-                     portal_id      INTEGER NOT NULL,
-                     fingerprint    TEXT NOT NULL,
-                     state          TEXT NOT NULL,
-                     policy         TEXT NOT NULL,
-                     policy_detail  TEXT,
-                     created_at_ms  INTEGER NOT NULL,
-                     dispatched_at_ms INTEGER,
-                     finished_at_ms INTEGER,
-                     outcome        TEXT,
-                     PRIMARY KEY (workspace_id, action_id)
-                 ) STRICT;",
-            )
-            .map_err(journal_error)?;
-        connection
-            .execute(
-                "UPDATE portal_actions
-                 SET state = 'unknown',
-                     outcome = COALESCE(outcome, 'execution outcome unknown after restart'),
-                     finished_at_ms = NULL
-                 WHERE state IN ('queued', 'dispatched')",
-                [],
-            )
-            .map_err(journal_error)?;
-        Ok(Self { connection })
-    }
-
-    fn insert_intent(
-        &self,
-        intent: JournalIntent<'_>,
-    ) -> Result<PortalActionReceipt, PortalServiceError> {
-        if let Some(existing) = self.record(intent.workspace_id, intent.action_id)? {
-            if existing.agent_id == intent.agent_id
-                && existing.portal_id == intent.portal_id
-                && existing.fingerprint == intent.fingerprint
-            {
-                return existing.into_receipt(true);
-            }
-            return Err(PortalServiceError::ActionConflict(
-                intent.action_id.to_string(),
-            ));
-        }
-        self.connection
-            .execute(
-                "INSERT INTO portal_actions (
-                    workspace_id, action_id, agent_id, portal_id, fingerprint,
-                    state, policy, policy_detail, created_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    intent.workspace_id,
-                    intent.action_id.as_str(),
-                    intent.agent_id,
-                    intent.portal_id,
-                    intent.fingerprint,
-                    intent.state,
-                    intent.policy,
-                    intent.policy_detail,
-                    intent.created_at_ms,
-                ],
-            )
-            .map_err(journal_error)?;
-        self.record(intent.workspace_id, intent.action_id)?
-            .ok_or_else(|| PortalServiceError::MissingReceipt(intent.action_id.to_string()))?
-            .into_receipt(false)
-    }
-
-    fn mark_dispatched(
-        &self,
-        workspace_id: u64,
-        action_id: &MessageId,
-        dispatched_at_ms: u64,
-    ) -> Result<(), PortalServiceError> {
-        self.connection
-            .execute(
-                "UPDATE portal_actions
-                 SET state = 'dispatched', dispatched_at_ms = ?3
-                 WHERE workspace_id = ?1 AND action_id = ?2",
-                params![workspace_id, action_id.as_str(), dispatched_at_ms],
-            )
-            .map(|_| ())
-            .map_err(journal_error)
-    }
-
-    fn finish(
-        &self,
-        workspace_id: u64,
-        action_id: &MessageId,
-        state: &str,
-        outcome: Option<String>,
-        finished_at_ms: u64,
-    ) -> Result<(), PortalServiceError> {
-        self.connection
-            .execute(
-                "UPDATE portal_actions
-                 SET state = ?3, outcome = ?4, finished_at_ms = ?5
-                 WHERE workspace_id = ?1 AND action_id = ?2",
-                params![
-                    workspace_id,
-                    action_id.as_str(),
-                    state,
-                    outcome,
-                    finished_at_ms
-                ],
-            )
-            .map(|_| ())
-            .map_err(journal_error)
-    }
-
-    fn receipt(
-        &self,
-        workspace_id: u64,
-        action_id: &MessageId,
-    ) -> Result<Option<PortalActionReceipt>, PortalServiceError> {
-        self.record(workspace_id, action_id)?
-            .map(|record| record.into_receipt(false))
-            .transpose()
-    }
-
-    fn record(
-        &self,
-        workspace_id: u64,
-        action_id: &MessageId,
-    ) -> Result<Option<JournalRecord>, PortalServiceError> {
-        self.connection
-            .query_row(
-                "SELECT agent_id, portal_id, fingerprint, state, policy,
-                        policy_detail, created_at_ms, dispatched_at_ms,
-                        finished_at_ms, outcome
-                 FROM portal_actions
-                 WHERE workspace_id = ?1 AND action_id = ?2",
-                params![workspace_id, action_id.as_str()],
-                |row| {
-                    Ok(JournalRecord {
-                        action_id: action_id.clone(),
-                        agent_id: row.get(0)?,
-                        portal_id: row.get(1)?,
-                        fingerprint: row.get(2)?,
-                        state: row.get(3)?,
-                        policy: row.get(4)?,
-                        policy_detail: row.get(5)?,
-                        created_at_ms: row.get(6)?,
-                        dispatched_at_ms: row.get(7)?,
-                        finished_at_ms: row.get(8)?,
-                        outcome: row.get(9)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(journal_error)
-    }
-}
-
-#[derive(Debug)]
-struct JournalRecord {
-    action_id: MessageId,
-    agent_id: u64,
-    portal_id: u64,
-    fingerprint: String,
-    state: String,
-    policy: String,
-    policy_detail: Option<String>,
-    created_at_ms: u64,
-    dispatched_at_ms: Option<u64>,
-    finished_at_ms: Option<u64>,
-    outcome: Option<String>,
-}
-
-impl JournalRecord {
-    fn into_receipt(self, duplicate: bool) -> Result<PortalActionReceipt, PortalServiceError> {
-        let policy = match self.policy.as_str() {
-            "allowed" => PortalPolicyOutcome::Allowed,
-            "approval_required" => {
-                let detail = self.policy_detail.unwrap_or_default();
-                let (approval_id, reason) = detail.split_once(':').ok_or_else(|| {
-                    PortalServiceError::Journal("approval receipt is malformed".to_owned())
-                })?;
-                PortalPolicyOutcome::ApprovalRequired {
-                    approval_id: approval_id.parse().map_err(|_| {
-                        PortalServiceError::Journal("approval ID is malformed".to_owned())
-                    })?,
-                    reason: reason.to_owned(),
-                }
-            }
-            "denied" => PortalPolicyOutcome::Denied {
-                reason: self.policy_detail.unwrap_or_default(),
-            },
-            policy => {
-                return Err(PortalServiceError::Journal(format!(
-                    "unknown portal policy state {policy:?}"
-                )));
-            }
-        };
-        let state = match self.state.as_str() {
-            "queued" => PortalActionState::Queued,
-            "awaiting_approval" => PortalActionState::AwaitingApproval,
-            "dispatched" => PortalActionState::Dispatched,
-            "completed" => PortalActionState::Completed,
-            "failed" => PortalActionState::Failed,
-            "unknown" => PortalActionState::Unknown,
-            state => {
-                return Err(PortalServiceError::Journal(format!(
-                    "unknown portal action state {state:?}"
-                )));
-            }
-        };
-        Ok(PortalActionReceipt {
-            action_id: self.action_id,
-            portal_id: self.portal_id,
-            duplicate,
-            state,
-            policy,
-            created_at_ms: self.created_at_ms,
-            dispatched_at_ms: self.dispatched_at_ms,
-            finished_at_ms: self.finished_at_ms,
-            outcome: self.outcome,
-        })
-    }
-}
-
-fn journal_error(error: rusqlite::Error) -> PortalServiceError {
-    PortalServiceError::Journal(error.to_string())
-}
-
-#[derive(Debug)]
 pub enum PortalServiceError {
     InvalidPortalId,
     InvalidAgentId,
@@ -852,6 +715,8 @@ pub enum PortalServiceError {
     ActionConflict(String),
     UnknownAction(String),
     MissingReceipt(String),
+    PendingActionUnavailable(String),
+    ApprovalMismatch { expected: u64, found: u64 },
     Journal(String),
 }
 
@@ -891,6 +756,16 @@ impl Display for PortalServiceError {
             }
             Self::UnknownAction(id) => write!(formatter, "portal action {id} does not exist"),
             Self::MissingReceipt(id) => write!(formatter, "portal action {id} has no receipt"),
+            Self::PendingActionUnavailable(id) => {
+                write!(
+                    formatter,
+                    "portal action {id} is not awaiting local approval"
+                )
+            }
+            Self::ApprovalMismatch { expected, found } => write!(
+                formatter,
+                "portal approval changed: expected {expected}, found {found}"
+            ),
             Self::Journal(message) => write!(formatter, "portal action journal failed: {message}"),
         }
     }
@@ -905,6 +780,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::ipc::{PortalActionState, PortalPolicyOutcome};
     use crate::portal::{
         PortalElementRef, PortalFrame, PortalFrameEncoding, PortalObservation as CoreObservation,
         PortalViewport,
@@ -1016,11 +892,16 @@ mod tests {
         let click = PortalAction::Click(
             PortalElementRef::new(observation.observation.revision, "submit").unwrap(),
         );
+        let action_id = MessageId::new("action-1").unwrap();
         let receipt = dispatcher
-            .request_action_at(4, 7, MessageId::new("action-1").unwrap(), 10, click, 100)
+            .request_action_at(4, 7, action_id.clone(), 10, click, 100)
             .unwrap();
         assert_eq!(receipt.state, PortalActionState::AwaitingApproval);
         assert!(executed.lock().unwrap().is_empty());
+        let approval_id = match receipt.policy {
+            PortalPolicyOutcome::ApprovalRequired { approval_id, .. } => approval_id,
+            policy => panic!("unexpected policy outcome: {policy:?}"),
+        };
 
         let duplicate = dispatcher
             .request_action_at(
@@ -1035,6 +916,47 @@ mod tests {
             )
             .unwrap();
         assert!(duplicate.duplicate);
+
+        let approved = dispatcher
+            .approve_action_at(4, &action_id, approval_id, 1_000, 102)
+            .unwrap();
+        assert_eq!(approved.state, PortalActionState::Completed);
+        assert_eq!(executed.lock().unwrap().len(), 1);
+        assert_eq!(
+            dispatcher.result(4, 7, &action_id).unwrap().state,
+            PortalActionState::Completed
+        );
+    }
+
+    #[test]
+    fn closing_a_portal_cancels_pending_actions_and_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, executed) = dispatcher(&temp);
+        let observation = dispatcher.observe(4, 7, 10).unwrap();
+        let action_id = MessageId::new("action-close").unwrap();
+        dispatcher
+            .request_action_at(
+                4,
+                7,
+                action_id.clone(),
+                10,
+                PortalAction::Click(
+                    PortalElementRef::new(observation.observation.revision, "submit").unwrap(),
+                ),
+                100,
+            )
+            .unwrap();
+
+        dispatcher.close(10).unwrap();
+        dispatcher.close(10).unwrap();
+
+        let receipt = dispatcher.result(4, 7, &action_id).unwrap();
+        assert_eq!(receipt.state, PortalActionState::Failed);
+        assert_eq!(
+            receipt.outcome.as_deref(),
+            Some("portal closed before approval")
+        );
+        assert!(executed.lock().unwrap().is_empty());
     }
 
     #[test]

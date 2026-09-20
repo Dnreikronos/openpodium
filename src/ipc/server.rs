@@ -17,9 +17,9 @@ use super::store::{InsertResult, MessageStore, StoreError, StoredMessage};
 use super::{
     AgentCapabilities, AgentDescriptor, AuthenticationError, CapabilityIssuer, Credentials,
     ErrorCode, MAX_FRAME_BYTES, MESSAGE_STORE_FILE_NAME, MessageId, PROTOCOL_NAME,
-    PROTOCOL_VERSION, PortalActionRequest, PortalDispatcher, PortalServiceError, ProtocolCommand,
-    ProtocolError, ProtocolRequest, ProtocolResponse, ProtocolResult, SECRET_FILE_NAME,
-    SUPPORTED_VERSIONS,
+    PROTOCOL_VERSION, PortalActionReceipt, PortalActionRequest, PortalDispatcher,
+    PortalServiceError, ProtocolCommand, ProtocolError, ProtocolRequest, ProtocolResponse,
+    ProtocolResult, SECRET_FILE_NAME, SUPPORTED_VERSIONS,
 };
 
 const WORKER_COUNT: usize = 4;
@@ -212,6 +212,16 @@ impl IpcService {
 
     pub fn close_portal(&self, portal_id: u64) -> Result<(), PortalServiceError> {
         mutex_lock(&self.portals).close(portal_id)
+    }
+
+    pub fn approve_portal_action(
+        &self,
+        workspace_id: u64,
+        action_id: &MessageId,
+        approval_id: u64,
+        lifetime_ms: u64,
+    ) -> Result<PortalActionReceipt, PortalServiceError> {
+        mutex_lock(&self.portals).approve_action(workspace_id, action_id, approval_id, lifetime_ms)
     }
 
     pub fn connection_info(&self, workspace_id: u64, agent_id: u64) -> Option<ConnectionInfo> {
@@ -655,11 +665,13 @@ fn portal_protocol_error(error: PortalServiceError) -> ProtocolError {
         PortalServiceError::Journal(_)
         | PortalServiceError::Backend(_)
         | PortalServiceError::Session(_)
-        | PortalServiceError::MissingReceipt(_) => ErrorCode::ServiceUnavailable,
+        | PortalServiceError::MissingReceipt(_)
+        | PortalServiceError::PendingActionUnavailable(_) => ErrorCode::ServiceUnavailable,
         PortalServiceError::InvalidPortalId
         | PortalServiceError::InvalidAgentId
         | PortalServiceError::InvalidScope
         | PortalServiceError::DuplicatePortal(_)
+        | PortalServiceError::ApprovalMismatch { .. }
         | PortalServiceError::Policy(_) => ErrorCode::InvalidRequest,
     };
     ProtocolError::new(code, error.to_string())
