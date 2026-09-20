@@ -151,16 +151,16 @@ pub(crate) fn resize_node(
 pub(crate) fn duplicate(
     layout: &CanvasLayout,
     selection: &[NodeId],
+    all: &CanvasLayout,
 ) -> (CanvasLayout, Vec<NodeId>) {
     let selected = expanded_selection(layout, selection);
     if selected.is_empty() {
         return (layout.clone(), Vec::new());
     }
-    let mut next_node = next_id(layout.nodes().iter().map(|node| node.id().get()));
-    let mut next_group = next_id(layout.groups().iter().map(|group| group.id().get()));
+    let mut next_node = next_id(all.nodes().iter().map(|node| node.id().get()));
+    let mut next_group = next_id(all.groups().iter().map(|group| group.id().get()));
     let mut next_connection = next_id(
-        layout
-            .connections()
+        all.connections()
             .iter()
             .map(|connection| connection.id().get()),
     );
@@ -257,7 +257,11 @@ pub(crate) fn remove(layout: &CanvasLayout, selection: &[NodeId]) -> CanvasLayou
     )
 }
 
-pub(crate) fn group(layout: &CanvasLayout, selection: &[NodeId]) -> CanvasLayout {
+pub(crate) fn group(
+    layout: &CanvasLayout,
+    selection: &[NodeId],
+    all: &CanvasLayout,
+) -> CanvasLayout {
     let selected = selection.iter().copied().collect::<BTreeSet<_>>();
     if selected.len() < 2 {
         return layout.clone();
@@ -274,7 +278,7 @@ pub(crate) fn group(layout: &CanvasLayout, selection: &[NodeId]) -> CanvasLayout
         })
         .collect::<Vec<_>>();
     groups.push(NodeGroup::new(
-        NodeGroupId::new(next_id(groups.iter().map(|group| group.id().get()))),
+        NodeGroupId::new(next_id(all.groups().iter().map(|group| group.id().get()))),
         selected,
     ));
     CanvasLayout::new(
@@ -301,6 +305,7 @@ pub(crate) fn ungroup(layout: &CanvasLayout, selection: &[NodeId]) -> CanvasLayo
 pub(crate) fn connect(
     layout: &CanvasLayout,
     selection: &[NodeId],
+    all: &CanvasLayout,
 ) -> Result<CanvasLayout, &'static str> {
     if selection.len() != 2 {
         return Err("select exactly two nodes to connect");
@@ -328,7 +333,9 @@ pub(crate) fn connect(
     let mut connections = layout.connections().to_vec();
     connections.push(Connection::new(
         ConnectionId::new(next_id(
-            connections.iter().map(|connection| connection.id().get()),
+            all.connections()
+                .iter()
+                .map(|connection| connection.id().get()),
         )),
         source.id(),
         target.id(),
@@ -539,6 +546,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn duplicated_nodes_use_ids_above_nodes_on_inactive_floors() {
+        let first = Node::new(
+            NodeId::new(1),
+            NodeTarget::Agent(AgentId::new(1)),
+            CanvasPoint::new(0.0, 0.0).unwrap(),
+            CanvasSize::new(300.0, 200.0).unwrap(),
+        );
+        let hidden = Node::new(
+            NodeId::new(10),
+            NodeTarget::Agent(AgentId::new(2)),
+            CanvasPoint::new(0.0, 0.0).unwrap(),
+            CanvasSize::new(300.0, 200.0).unwrap(),
+        );
+        let visible = CanvasLayout::new(vec![first.clone()], vec![], vec![]);
+        let all = CanvasLayout::new(vec![first, hidden], vec![], vec![]);
+        let (_, selection) = duplicate(&visible, &[NodeId::new(1)], &all);
+        assert_eq!(selection, vec![NodeId::new(11)]);
+    }
+
+    #[test]
     fn grouped_nodes_move_together_and_snap_once() {
         let layout = layout();
         let moved = move_nodes(&layout, &[NodeId::new(1)], 31.0, 49.0);
@@ -562,7 +589,7 @@ mod tests {
     #[test]
     fn duplication_preserves_internal_relationships() {
         let layout = layout();
-        let (duplicated, selection) = duplicate(&layout, &[NodeId::new(1)]);
+        let (duplicated, selection) = duplicate(&layout, &[NodeId::new(1)], &layout);
 
         assert_eq!(selection, vec![NodeId::new(3), NodeId::new(4)]);
         assert_eq!(duplicated.nodes().len(), 4);
@@ -592,7 +619,7 @@ mod tests {
         let layout = CanvasLayout::new(vec![node(1, 0.0), node(2, 400.0)], vec![], vec![]);
         let selection = selection_for_click(&layout, &[], NodeId::new(2), false);
         let selection = selection_for_click(&layout, &selection, NodeId::new(1), true);
-        let connected = connect(&layout, &selection).unwrap();
+        let connected = connect(&layout, &selection, &layout).unwrap();
 
         assert_eq!(selection, vec![NodeId::new(2), NodeId::new(1)]);
         assert_eq!(connected.connections()[0].source(), NodeId::new(2));
@@ -622,7 +649,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let grouped = group(&layout, &[NodeId::new(1), NodeId::new(2)]);
+        let grouped = group(&layout, &[NodeId::new(1), NodeId::new(2)], &layout);
         let front = change_z_order(&grouped, &[NodeId::new(1)], ZOrder::Front);
 
         assert_eq!(grouped.groups().len(), 1);
