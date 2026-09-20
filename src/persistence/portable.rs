@@ -16,13 +16,14 @@ use crate::domain::{
     Agent, AgentId, AgentProgram, Arrow, CanvasColor, CanvasLayout, CanvasNodeContent, CanvasPoint,
     CanvasSize, CanvasText, Connection, ConnectionId, ConnectionKind, Content, DiffComparison,
     DomainCommand, Handoff, HandoffId, HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId,
-    NodeTarget, NormalizedPoint, ProjectPath, Role, RoleColor, RoleIcon, RoleId, Shape, ShapeKind,
-    StrokeWidth, Task, TaskId, TaskState, Workspace, WorkspaceIcon,
+    NodeTarget, NormalizedPoint, PortalConfig, PortalPresentation, PortalTarget, PortalTargetKind,
+    ProjectPath, Role, RoleColor, RoleIcon, RoleId, Shape, ShapeKind, StrokeWidth, Task, TaskId,
+    TaskState, Workspace, WorkspaceIcon,
 };
 
 const TEMPLATE_FORMAT: &str = "openpodium-template";
 const ARCHIVE_FORMAT: &str = "openpodium-workspace-archive";
-const DOCUMENT_VERSION: u32 = 1;
+const DOCUMENT_VERSION: u32 = 2;
 const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ITEMS: usize = 8_192;
 const MAX_ID_CHARS: usize = 128;
@@ -233,6 +234,12 @@ pub enum CanvasContentV1 {
     Text {
         markdown: String,
     },
+    Portal {
+        kind: PortalTargetKindV1,
+        selector: String,
+        preserve_aspect_ratio: bool,
+        frame_rate_limit: u16,
+    },
     Shape {
         shape: ShapeV1,
     },
@@ -242,6 +249,34 @@ pub enum CanvasContentV1 {
     Freehand {
         freehand: FreehandV1,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortalTargetKindV1 {
+    Browser,
+    Android,
+    Ios,
+}
+
+impl From<PortalTargetKind> for PortalTargetKindV1 {
+    fn from(kind: PortalTargetKind) -> Self {
+        match kind {
+            PortalTargetKind::Browser => Self::Browser,
+            PortalTargetKind::Android => Self::Android,
+            PortalTargetKind::Ios => Self::Ios,
+        }
+    }
+}
+
+impl From<PortalTargetKindV1> for PortalTargetKind {
+    fn from(kind: PortalTargetKindV1) -> Self {
+        match kind {
+            PortalTargetKindV1::Browser => Self::Browser,
+            PortalTargetKindV1::Android => Self::Android,
+            PortalTargetKindV1::Ios => Self::Ios,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -585,6 +620,10 @@ fn decode_versioned<T>(
         .ok_or_else(|| PortableError::InvalidDocument("document is missing version".to_owned()))?;
     match u32::try_from(version).unwrap_or(u32::MAX) {
         DOCUMENT_VERSION => parse(value),
+        1 => {
+            migrate_v1(object);
+            parse(value)
+        }
         0 => {
             migrate_v0(object, expected_format)?;
             parse(value)
@@ -619,6 +658,10 @@ fn migrate_v0(
         );
     }
     Ok(())
+}
+
+fn migrate_v1(object: &mut serde_json::Map<String, Value>) {
+    object.insert("version".to_owned(), Value::from(DOCUMENT_VERSION));
 }
 
 #[derive(Default)]
@@ -866,6 +909,12 @@ fn content_record(content: &CanvasNodeContent) -> Result<CanvasContentV1, Portab
         },
         CanvasNodeContent::Text { markdown } => CanvasContentV1::Text {
             markdown: markdown.as_str().to_owned(),
+        },
+        CanvasNodeContent::Portal(config) => CanvasContentV1::Portal {
+            kind: config.target().kind().into(),
+            selector: config.target().selector().to_owned(),
+            preserve_aspect_ratio: config.presentation().preserve_aspect_ratio(),
+            frame_rate_limit: config.presentation().frame_rate_limit(),
         },
         CanvasNodeContent::Shape(shape) => CanvasContentV1::Shape {
             shape: ShapeV1 {
@@ -1321,6 +1370,22 @@ fn content_domain(
             markdown: CanvasText::new(markdown.clone())
                 .map_err(|error| PortableError::InvalidDomain(error.to_string()))?,
         },
+        CanvasContentV1::Portal {
+            kind,
+            selector,
+            preserve_aspect_ratio,
+            frame_rate_limit,
+        } => {
+            let target = PortalTarget::new((*kind).into(), selector.clone())
+                .map_err(|error| PortableError::InvalidDomain(error.to_string()))?;
+            let presentation = PortalPresentation::new(*preserve_aspect_ratio, *frame_rate_limit)
+                .ok_or_else(|| {
+                PortableError::InvalidDomain(
+                    "portal frame rate limit must be greater than zero".to_owned(),
+                )
+            })?;
+            CanvasNodeContent::Portal(PortalConfig::new(target, presentation))
+        }
         CanvasContentV1::Shape { shape } => CanvasNodeContent::Shape(Shape::new(
             shape.kind.into(),
             CanvasColor::rgba(shape.fill[0], shape.fill[1], shape.fill[2], shape.fill[3]),
@@ -1415,6 +1480,7 @@ fn preview_body(
                     referenced_paths.insert(root.clone());
                 }
                 CanvasContentV1::Text { .. }
+                | CanvasContentV1::Portal { .. }
                 | CanvasContentV1::Shape { .. }
                 | CanvasContentV1::Arrow { .. }
                 | CanvasContentV1::Freehand { .. } => {}
@@ -1596,6 +1662,20 @@ fn validate_content(content: &CanvasContentV1) -> Result<(), PortableError> {
             CanvasText::new(markdown.clone())
                 .map_err(|error| PortableError::InvalidDomain(error.to_string()))?;
         }
+        CanvasContentV1::Portal {
+            kind,
+            selector,
+            frame_rate_limit,
+            ..
+        } => {
+            PortalTarget::new((*kind).into(), selector.clone())
+                .map_err(|error| PortableError::InvalidDomain(error.to_string()))?;
+            PortalPresentation::new(true, *frame_rate_limit).ok_or_else(|| {
+                PortableError::InvalidDomain(
+                    "portal frame rate limit must be greater than zero".to_owned(),
+                )
+            })?;
+        }
         CanvasContentV1::Shape { shape } => {
             StrokeWidth::new(shape.stroke_width)
                 .map_err(|error| PortableError::InvalidDomain(error.to_string()))?;
@@ -1725,6 +1805,9 @@ fn scan_body(
                 }
                 CanvasContentV1::Text { markdown } => {
                     scan_string(warnings, &format!("{field}.markdown"), markdown);
+                }
+                CanvasContentV1::Portal { selector, .. } => {
+                    scan_string(warnings, &format!("{field}.selector"), selector);
                 }
                 CanvasContentV1::Arrow { arrow } => {
                     if let Some(label) = &arrow.label {
@@ -2094,6 +2177,43 @@ mod tests {
         let document = decode_template(&payload).unwrap();
         assert_eq!(document.template.canvas.nodes[0].x, 0.0);
         assert_eq!(document.template.canvas.nodes[0].y, 0.0);
+    }
+
+    #[test]
+    fn portal_template_round_trips_configuration_without_a_live_session() {
+        let mut source = workspace();
+        source
+            .execute(DomainCommand::AddNode(Node::with_content(
+                NodeId::new(9),
+                CanvasNodeContent::Portal(PortalConfig::browser("https://example.test").unwrap()),
+                CanvasPoint::new(12.0, 24.0).unwrap(),
+                CanvasSize::new(320.0, 240.0).unwrap(),
+            )))
+            .unwrap();
+
+        let document =
+            decode_template(&export_template(&source, &[NodeId::new(9)]).unwrap()).unwrap();
+        assert_eq!(document.version, DOCUMENT_VERSION);
+        assert!(matches!(
+            document.template.canvas.nodes[0].content.as_ref(),
+            Some(CanvasContentV1::Portal { .. })
+        ));
+
+        let mut destination = workspace();
+        let plan = import_template(
+            &document,
+            &destination,
+            PointV1 { x: 0.0, y: 0.0 },
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        for command in plan.commands {
+            destination.execute(command).unwrap();
+        }
+        assert_eq!(
+            destination.node(NodeId::new(1)).unwrap().content(),
+            &CanvasNodeContent::Portal(PortalConfig::browser("https://example.test").unwrap())
+        );
     }
 
     #[test]

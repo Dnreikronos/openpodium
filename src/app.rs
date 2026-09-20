@@ -30,6 +30,7 @@ use openpodium::persistence::{
     ImportPreview, PointV1, export_canvas_fragment, export_role, import_canvas_fragment,
     import_role,
 };
+use openpodium::portal::PortalFrame;
 use openpodium::runtime::{
     EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, ProcessSpec,
     RuntimeError, check_agent_capability, check_environment, prepare_environment_process,
@@ -93,6 +94,7 @@ struct OpenPodium {
     canvas_history: History,
     canvas_revision: u64,
     terminals: BTreeMap<TerminalKey, Session>,
+    portal_frames: BTreeMap<NodeId, PortalFrame>,
     focused_terminal: Option<NodeId>,
     terminal_generation: u64,
     chat_ui: chat::UiState,
@@ -198,6 +200,7 @@ impl Default for OpenPodium {
             canvas_history: History::default(),
             canvas_revision: 1,
             terminals: BTreeMap::new(),
+            portal_frames: BTreeMap::new(),
             focused_terminal: None,
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),
@@ -1157,7 +1160,8 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         let terminal_views = terminal_views(state, &layout);
         let document = canvas::CanvasDocument::new(workspace, layout, terminal_views)
             .with_git_severity(floors::node_severities(state))
-            .with_context_bodies(context_nodes::bodies(&state.context_ui));
+            .with_context_bodies(context_nodes::bodies(&state.context_ui))
+            .with_portal_frames(state.portal_frames.clone());
         row![
             canvas::view(
                 state.camera,
@@ -1205,6 +1209,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
 impl OpenPodium {
     fn reset_canvas_session(&mut self) {
         self.focused_terminal = None;
+        self.portal_frames.clear();
         self.camera = Camera::default();
         self.canvas_selection.clear();
         self.canvas_preview = None;
@@ -3877,6 +3882,7 @@ mod tests {
             canvas_history: History::default(),
             canvas_revision: 1,
             terminals: BTreeMap::new(),
+            portal_frames: BTreeMap::new(),
             focused_terminal: None,
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),
@@ -4441,6 +4447,7 @@ mod tests {
             canvas_history: History::default(),
             canvas_revision: 1,
             terminals,
+            portal_frames: BTreeMap::new(),
             focused_terminal: None,
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),

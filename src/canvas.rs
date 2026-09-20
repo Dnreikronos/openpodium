@@ -14,6 +14,7 @@ use openpodium::domain::{
     AgentProgram, CanvasLayout, CanvasNodeContent, NodeId, NodeTarget, Workspace,
 };
 use openpodium::git::CollisionSeverity;
+use openpodium::portal::PortalFrame;
 
 use crate::terminal;
 
@@ -25,6 +26,7 @@ pub(crate) struct CanvasDocument {
     labels: BTreeMap<NodeId, NodeLabel>,
     terminals: BTreeMap<NodeId, terminal::View>,
     bodies: BTreeMap<NodeId, String>,
+    portal_frames: BTreeMap<NodeId, PortalFrame>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +163,15 @@ impl CanvasDocument {
                         subtitle: "Canvas annotation".to_owned(),
                         kind: NodeKind::Context,
                     },
+                    CanvasNodeContent::Portal(config) => NodeLabel {
+                        title: "Portal".to_owned(),
+                        subtitle: format!(
+                            "{:?} · {} · disconnected",
+                            config.target().kind(),
+                            config.target().selector()
+                        ),
+                        kind: NodeKind::Context,
+                    },
                     CanvasNodeContent::Shape(shape) => NodeLabel {
                         title: format!("{:?}", shape.kind()),
                         subtitle: "Canvas shape".to_owned(),
@@ -185,6 +196,7 @@ impl CanvasDocument {
             labels,
             terminals,
             bodies: BTreeMap::new(),
+            portal_frames: BTreeMap::new(),
         }
     }
 
@@ -209,6 +221,11 @@ impl CanvasDocument {
         self
     }
 
+    pub(crate) fn with_portal_frames(mut self, frames: BTreeMap<NodeId, PortalFrame>) -> Self {
+        self.portal_frames = frames;
+        self
+    }
+
     pub(super) fn label(&self, node_id: NodeId) -> &NodeLabel {
         self.labels
             .get(&node_id)
@@ -221,6 +238,10 @@ impl CanvasDocument {
 
     pub(super) fn body(&self, node_id: NodeId) -> Option<&str> {
         self.bodies.get(&node_id).map(String::as_str)
+    }
+
+    pub(super) fn portal_frame(&self, node_id: NodeId) -> Option<&PortalFrame> {
+        self.portal_frames.get(&node_id)
     }
 }
 

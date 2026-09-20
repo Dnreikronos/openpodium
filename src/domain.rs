@@ -10,6 +10,8 @@
 //! find_agent(TaskId::new(1));
 //! ```
 
+pub use crate::portal::{PortalConfig, PortalPresentation, PortalTarget, PortalTargetKind};
+
 mod ids;
 pub use ids::*;
 

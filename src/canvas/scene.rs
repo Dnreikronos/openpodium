@@ -2,11 +2,13 @@ use std::collections::BTreeSet;
 
 use iced::theme::palette;
 use iced::widget::canvas::{self, Path, Stroke};
-use iced::{Color, Font, Pixels, Point, Radians, Size, Theme, Vector, font};
+use iced::widget::image::Handle;
+use iced::{Color, Font, Pixels, Point, Radians, Rectangle, Size, Theme, Vector, font};
 use openpodium::domain::{
     AgentProgram, CanvasColor, CanvasNodeContent, ConnectionKind, Node, NodeGroup, NodeId,
     ShapeKind,
 };
+use openpodium::portal::{PortalFrame, PortalFrameTransform, PortalRect};
 
 use crate::terminal::{self, BODY_PADDING, CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT};
 
@@ -274,21 +276,37 @@ fn draw_nodes(
                 );
             } else {
                 let body_padding = (12.0 * zoom).clamp(7.0, 16.0);
-                draw_content(
-                    frame,
-                    Point::new(
-                        top_left.x + body_padding,
-                        top_left.y + header_height + body_padding,
-                    ),
-                    Size::new(
-                        (size.width - body_padding * 2.0).max(1.0),
-                        (size.height - header_height - body_padding * 2.0).max(1.0),
-                    ),
-                    zoom,
-                    node.content(),
-                    document.body(node.id()),
-                    palette.background.base.text,
+                let body_top_left = Point::new(
+                    top_left.x + body_padding,
+                    top_left.y + header_height + body_padding,
                 );
+                let body_size = Size::new(
+                    (size.width - body_padding * 2.0).max(1.0),
+                    (size.height - header_height - body_padding * 2.0).max(1.0),
+                );
+                let rendered_portal =
+                    document
+                        .portal_frame(node.id())
+                        .is_some_and(|portal_frame| {
+                            draw_portal_frame(
+                                frame,
+                                node.content(),
+                                portal_frame,
+                                body_top_left,
+                                body_size,
+                            )
+                        });
+                if !rendered_portal {
+                    draw_content(
+                        frame,
+                        body_top_left,
+                        body_size,
+                        zoom,
+                        node.content(),
+                        document.body(node.id()),
+                        palette.background.base.text,
+                    );
+                }
             }
         }
 
@@ -304,6 +322,41 @@ fn draw_nodes(
             );
         }
     }
+}
+
+fn draw_portal_frame(
+    frame: &mut canvas::Frame,
+    content: &CanvasNodeContent,
+    portal_frame: &PortalFrame,
+    body_top_left: Point,
+    body_size: Size,
+) -> bool {
+    let CanvasNodeContent::Portal(config) = content else {
+        return false;
+    };
+    let Some(node_bounds) = PortalRect::new(
+        f64::from(body_top_left.x),
+        f64::from(body_top_left.y),
+        f64::from(body_size.width),
+        f64::from(body_size.height),
+    ) else {
+        return false;
+    };
+    let transform = PortalFrameTransform::new(
+        node_bounds,
+        portal_frame.viewport(),
+        config.presentation().preserve_aspect_ratio(),
+    );
+    let destination = transform.destination();
+    let image = Handle::from_bytes(portal_frame.bytes().to_vec());
+    frame.draw_image(
+        Rectangle::new(
+            Point::new(destination.x() as f32, destination.y() as f32),
+            Size::new(destination.width() as f32, destination.height() as f32),
+        ),
+        &image,
+    );
+    true
 }
 
 fn draw_content(
@@ -348,6 +401,13 @@ fn draw_content(
         CanvasNodeContent::Text { markdown } => {
             draw_body_text(frame, body_top_left, markdown.as_str(), zoom, text_color)
         }
+        CanvasNodeContent::Portal(config) => draw_body_text(
+            frame,
+            body_top_left,
+            body.unwrap_or(config.target().selector()),
+            zoom,
+            text_color,
+        ),
         CanvasNodeContent::Shape(shape) => {
             let path = match shape.kind() {
                 ShapeKind::Rectangle => Path::rounded_rectangle(

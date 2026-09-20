@@ -84,7 +84,7 @@ impl Error for CanvasTransferError {
 mod tests {
     use crate::domain::{
         CanvasNodeContent, CanvasPoint, CanvasSize, CanvasText, Connection, ConnectionId,
-        ConnectionKind, Node, NodeId,
+        ConnectionKind, Node, NodeId, PortalConfig,
     };
 
     use super::*;
@@ -93,9 +93,7 @@ mod tests {
     fn portable_fragments_preserve_owned_content_and_connections() {
         let first = Node::with_content(
             NodeId::new(7),
-            CanvasNodeContent::Text {
-                markdown: CanvasText::new("Context").unwrap(),
-            },
+            CanvasNodeContent::Portal(PortalConfig::browser("https://example.test").unwrap()),
             CanvasPoint::new(20.0, 40.0).unwrap(),
             CanvasSize::new(240.0, 160.0).unwrap(),
         );

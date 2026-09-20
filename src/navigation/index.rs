@@ -292,6 +292,7 @@ fn index_node(workspace: &Workspace, node: &Node, documents: &mut Vec<SearchDocu
             },
         }),
         CanvasNodeContent::Reference(_)
+        | CanvasNodeContent::Portal(_)
         | CanvasNodeContent::Shape(_)
         | CanvasNodeContent::Arrow(_)
         | CanvasNodeContent::Freehand(_) => {}
