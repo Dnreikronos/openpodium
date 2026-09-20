@@ -15,7 +15,7 @@ pub(super) struct UiState {
     last_poll: Option<Instant>,
     signature: Option<String>,
     main: Option<PathBuf>,
-    report: CollisionReport,
+    pub(super) report: CollisionReport,
 }
 
 #[derive(Clone)]

@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use super::{
-    AgentId, AgentState, CanvasPoint, CanvasSize, CommandPresetId, ConnectionId, Content,
-    DeliveryAttempt, EnvironmentProfileId, HandoffId, HandoffMessageId, HandoffProgress,
+    AgentId, AgentState, CanvasNodeContent, CanvasPoint, CanvasSize, CommandPresetId, ConnectionId,
+    Content, DeliveryAttempt, EnvironmentProfileId, HandoffId, HandoffMessageId, HandoffProgress,
     HandoffResponse, HandoffTermination, Name, NodeGroupId, NodeId, RoleColor, RoleIcon, RoleId,
     TaskId, TaskState, Timestamp,
 };
@@ -293,7 +293,7 @@ pub enum NodeTarget {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     id: NodeId,
-    target: NodeTarget,
+    content: CanvasNodeContent,
     position: CanvasPoint,
     size: CanvasSize,
     z_index: i32,
@@ -306,9 +306,18 @@ impl Node {
         position: CanvasPoint,
         size: CanvasSize,
     ) -> Self {
+        Self::with_content(id, CanvasNodeContent::Reference(target), position, size)
+    }
+
+    pub const fn with_content(
+        id: NodeId,
+        content: CanvasNodeContent,
+        position: CanvasPoint,
+        size: CanvasSize,
+    ) -> Self {
         Self {
             id,
-            target,
+            content,
             position,
             size,
             z_index: 0,
@@ -322,9 +331,25 @@ impl Node {
         size: CanvasSize,
         z_index: i32,
     ) -> Self {
+        Self::with_content_and_z_index(
+            id,
+            CanvasNodeContent::Reference(target),
+            position,
+            size,
+            z_index,
+        )
+    }
+
+    pub const fn with_content_and_z_index(
+        id: NodeId,
+        content: CanvasNodeContent,
+        position: CanvasPoint,
+        size: CanvasSize,
+        z_index: i32,
+    ) -> Self {
         Self {
             id,
-            target,
+            content,
             position,
             size,
             z_index,
@@ -335,8 +360,12 @@ impl Node {
         self.id
     }
 
-    pub const fn target(&self) -> NodeTarget {
-        self.target
+    pub const fn reference(&self) -> Option<NodeTarget> {
+        self.content.reference()
+    }
+
+    pub const fn content(&self) -> &CanvasNodeContent {
+        &self.content
     }
 
     pub const fn position(&self) -> CanvasPoint {
@@ -393,6 +422,7 @@ pub enum ConnectionKind {
     Assignment,
     Dependency,
     Handoff,
+    Reference,
 }
 
 impl ConnectionKind {
@@ -409,6 +439,16 @@ impl ConnectionKind {
                 Some(Self::Handoff)
             }
             _ => None,
+        }
+    }
+
+    pub const fn between_content(
+        source: &CanvasNodeContent,
+        target: &CanvasNodeContent,
+    ) -> Option<Self> {
+        match (source.reference(), target.reference()) {
+            (Some(source), Some(target)) => Self::between(source, target),
+            (None, _) | (_, None) => Some(Self::Reference),
         }
     }
 }

@@ -168,12 +168,12 @@ pub fn navigation_target(workspace: &Workspace, task_id: TaskId) -> Option<Navig
     let task = workspace.task(task_id)?;
     let task_node = workspace
         .nodes()
-        .find(|node| node.target() == NodeTarget::Task(task_id))
+        .find(|node| node.reference() == Some(NodeTarget::Task(task_id)))
         .map(|node| node.id());
     let assignee_node = task.assignee().and_then(|assignee| {
         workspace
             .nodes()
-            .find(|node| node.target() == NodeTarget::Agent(assignee))
+            .find(|node| node.reference() == Some(NodeTarget::Agent(assignee)))
             .map(|node| node.id())
     });
     Some(NavigationTarget {
@@ -315,7 +315,7 @@ fn project_event(workspace: &Workspace, event: &TimelineEvent) -> TimelineItem {
             ),
         ),
         DomainEvent::NodeAdded(node) => (
-            task_from_target(node.target()),
+            node.reference().and_then(task_from_target),
             "Canvas node added".to_owned(),
             format!("Node {}", node.id()),
         ),

@@ -34,6 +34,9 @@ pub use orchestration::*;
 mod entities;
 pub use entities::*;
 
+mod canvas_content;
+pub use canvas_content::*;
+
 mod events;
 pub use events::*;
 

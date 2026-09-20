@@ -58,6 +58,36 @@ pub(super) fn node_severities(
     status::node_severities(state)
 }
 
+pub(super) fn changed_paths(state: &OpenPodium) -> Vec<openpodium::git::ChangedPath> {
+    let Some(workspace) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+    else {
+        return Vec::new();
+    };
+    let Some(directory) = workspace.active_directory() else {
+        return Vec::new();
+    };
+    let directory = std::path::Path::new(directory.as_str());
+    state
+        .floor_ui
+        .status
+        .report
+        .inventories
+        .iter()
+        .find(|inventory| {
+            match (
+                dunce::canonicalize(&inventory.checkout),
+                dunce::canonicalize(directory),
+            ) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => dunce::simplified(&inventory.checkout) == dunce::simplified(directory),
+            }
+        })
+        .map_or_else(Vec::new, |inventory| inventory.paths.clone())
+}
+
 pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessage> {
     match message {
         Message::Integration(message) => return integration::update(state, message),
@@ -122,7 +152,7 @@ pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessag
                 .canvas_selection
                 .first()
                 .and_then(|node| manager.workspace(id)?.node(*node))
-                .and_then(|node| match node.target() {
+                .and_then(|node| match node.reference()? {
                     NodeTarget::Agent(id) => Some(FloorOwner::Agent(id)),
                     NodeTarget::Task(id) => Some(FloorOwner::Task(id)),
                     _ => None,

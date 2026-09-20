@@ -1,22 +1,23 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    Agent, AgentId, AgentProgram, AgentState, CanvasLayout, CanvasPoint, CanvasSize,
-    ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft, ChatMessage, ChatMessageId,
-    ChatThread, ChatThreadId, CommandPreset, CommandPresetId, Connection, ConnectionId,
-    ConnectionKind, ContainerEnvironment, Content, CustomEnvironment, DeliveryAttempt,
-    DeliveryMechanism, DeliveryOutcome, DomainCommand, DomainEvent, EnvironmentKind,
-    EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffMessageId, HandoffPayload,
-    HandoffProgress, HandoffResponse, HandoffResponseStatus, HandoffTermination, Name, Node,
-    NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleColor, RoleIcon, RoleId, SshEnvironment,
-    Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceDirectory, WorkspaceIcon,
-    WorkspaceId, WorkspaceSettings,
+    Agent, AgentId, AgentProgram, AgentState, Arrow, CanvasColor, CanvasLayout, CanvasNodeContent,
+    CanvasPoint, CanvasSize, CanvasText, ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft,
+    ChatMessage, ChatMessageId, ChatThread, ChatThreadId, CommandPreset, CommandPresetId,
+    Connection, ConnectionId, ConnectionKind, ContainerEnvironment, Content, CustomEnvironment,
+    DeliveryAttempt, DeliveryMechanism, DeliveryOutcome, DiffComparison, DomainCommand,
+    DomainEvent, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Freehand, Handoff,
+    HandoffId, HandoffMessageId, HandoffPayload, HandoffProgress, HandoffResponse,
+    HandoffResponseStatus, HandoffTermination, Name, Node, NodeGroup, NodeGroupId, NodeId,
+    NodeTarget, NormalizedPoint, ProjectPath, Role, RoleColor, RoleIcon, RoleId, Shape, ShapeKind,
+    SshEnvironment, StrokeWidth, Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace,
+    WorkspaceDirectory, WorkspaceIcon, WorkspaceId, WorkspaceSettings,
 };
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 9;
-pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 8;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 10;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 9;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
     serde_json::to_vec(&StoredEvent::from(event)).map_err(|source| {
@@ -94,6 +95,13 @@ pub(crate) fn decode_event(
             "domain event",
             sequence,
             "floors require event format version 9",
+        ));
+    }
+    if format_version < 10 && stored.requires_version_ten() {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "canvas context and drawing nodes require event format version 10",
         ));
     }
     stored
@@ -474,6 +482,16 @@ impl StoredEvent {
         matches!(self, Self::TaskCancelled { .. } | Self::TaskResumed { .. })
     }
 
+    fn requires_version_ten(&self) -> bool {
+        match self {
+            Self::NodeAdded { node } | Self::AgentNodeAdded { node, .. } => node.content.is_some(),
+            Self::CanvasReplaced { before, after } => {
+                before.has_owned_content() || after.has_owned_content()
+            }
+            _ => false,
+        }
+    }
+
     fn into_domain(self) -> Result<DomainEvent, String> {
         match self {
             Self::FloorsChanged { before, after } => Ok(DomainEvent::FloorsChanged {
@@ -778,6 +796,11 @@ impl StoredWorkspace {
             return Err(
                 "typed handoffs and orchestration history require snapshot format version 7"
                     .to_owned(),
+            );
+        }
+        if format_version < 9 && self.nodes.iter().any(|node| node.content.is_some()) {
+            return Err(
+                "canvas context and drawing nodes require snapshot format version 9".to_owned(),
             );
         }
 
@@ -1939,7 +1962,10 @@ impl HandoffPayloadV1 {
 #[serde(deny_unknown_fields)]
 struct NodeV1 {
     id: u64,
-    target: NodeTargetV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<NodeTargetV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<CanvasNodeContentV1>,
     x: f32,
     y: f32,
     width: f32,
@@ -1950,9 +1976,14 @@ struct NodeV1 {
 
 impl From<&Node> for NodeV1 {
     fn from(node: &Node) -> Self {
+        let (target, content) = match node.content() {
+            CanvasNodeContent::Reference(target) => (Some((*target).into()), None),
+            content => (None, Some(content.into())),
+        };
         Self {
             id: node.id().get(),
-            target: node.target().into(),
+            target,
+            content,
             x: node.position().x(),
             y: node.position().y(),
             width: node.size().width(),
@@ -1964,9 +1995,17 @@ impl From<&Node> for NodeV1 {
 
 impl NodeV1 {
     fn into_domain(self) -> Result<Node, String> {
-        Ok(Node::with_z_index(
+        let content = match (self.target, self.content) {
+            (Some(target), None) => CanvasNodeContent::Reference(target.into()),
+            (None, Some(content)) => content.into_domain()?,
+            (Some(_), Some(_)) => {
+                return Err("a stored node cannot have both a target and owned content".to_owned());
+            }
+            (None, None) => return Err("a stored node must have content".to_owned()),
+        };
+        Ok(Node::with_content_and_z_index(
             NodeId::new(self.id),
-            self.target.into(),
+            content,
             CanvasPoint::new(self.x, self.y).map_err(|error| error.to_string())?,
             CanvasSize::new(self.width, self.height).map_err(|error| error.to_string())?,
             self.z_index,
@@ -2040,6 +2079,7 @@ enum ConnectionKindV1 {
     Assignment,
     Dependency,
     Handoff,
+    Reference,
 }
 
 impl From<ConnectionKind> for ConnectionKindV1 {
@@ -2049,6 +2089,7 @@ impl From<ConnectionKind> for ConnectionKindV1 {
             ConnectionKind::Assignment => Self::Assignment,
             ConnectionKind::Dependency => Self::Dependency,
             ConnectionKind::Handoff => Self::Handoff,
+            ConnectionKind::Reference => Self::Reference,
         }
     }
 }
@@ -2060,13 +2101,14 @@ impl From<ConnectionKindV1> for ConnectionKind {
             ConnectionKindV1::Assignment => Self::Assignment,
             ConnectionKindV1::Dependency => Self::Dependency,
             ConnectionKindV1::Handoff => Self::Handoff,
+            ConnectionKindV1::Reference => Self::Reference,
         }
     }
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CanvasLayoutV1 {
+pub(super) struct CanvasLayoutV1 {
     nodes: Vec<NodeV1>,
     groups: Vec<NodeGroupV1>,
     connections: Vec<ConnectionV1>,
@@ -2087,7 +2129,11 @@ impl From<&CanvasLayout> for CanvasLayoutV1 {
 }
 
 impl CanvasLayoutV1 {
-    fn into_domain(self) -> Result<CanvasLayout, String> {
+    fn has_owned_content(&self) -> bool {
+        self.nodes.iter().any(|node| node.content.is_some())
+    }
+
+    pub(super) fn into_domain(self) -> Result<CanvasLayout, String> {
         Ok(CanvasLayout::new(
             self.nodes
                 .into_iter()
@@ -2102,6 +2148,234 @@ impl CanvasLayoutV1 {
                 .map(ConnectionV1::into_domain)
                 .collect(),
         ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum CanvasNodeContentV1 {
+    Note {
+        path: String,
+        title: String,
+    },
+    FileTree {
+        root: String,
+    },
+    Artifact {
+        path: String,
+    },
+    Diff {
+        path: String,
+        comparison: DiffComparisonV1,
+    },
+    Text {
+        markdown: String,
+    },
+    Shape {
+        kind: ShapeKindV1,
+        fill: [u8; 4],
+        stroke: [u8; 4],
+        stroke_width: f32,
+    },
+    Arrow {
+        start: NormalizedPointV1,
+        end: NormalizedPointV1,
+        stroke: [u8; 4],
+        stroke_width: f32,
+        label: Option<String>,
+    },
+    Freehand {
+        points: Vec<NormalizedPointV1>,
+        stroke: [u8; 4],
+        stroke_width: f32,
+    },
+}
+
+impl From<&CanvasNodeContent> for CanvasNodeContentV1 {
+    fn from(content: &CanvasNodeContent) -> Self {
+        match content {
+            CanvasNodeContent::Reference(_) => {
+                unreachable!("reference node content is stored in the legacy target field")
+            }
+            CanvasNodeContent::Note { path, title } => Self::Note {
+                path: path.as_str().to_owned(),
+                title: title.as_str().to_owned(),
+            },
+            CanvasNodeContent::FileTree { root } => Self::FileTree {
+                root: root.as_str().to_owned(),
+            },
+            CanvasNodeContent::Artifact { path } => Self::Artifact {
+                path: path.as_str().to_owned(),
+            },
+            CanvasNodeContent::Diff { path, comparison } => Self::Diff {
+                path: path.as_str().to_owned(),
+                comparison: (*comparison).into(),
+            },
+            CanvasNodeContent::Text { markdown } => Self::Text {
+                markdown: markdown.as_str().to_owned(),
+            },
+            CanvasNodeContent::Shape(shape) => Self::Shape {
+                kind: shape.kind().into(),
+                fill: shape.fill().channels(),
+                stroke: shape.stroke().channels(),
+                stroke_width: shape.stroke_width().get(),
+            },
+            CanvasNodeContent::Arrow(arrow) => Self::Arrow {
+                start: arrow.start().into(),
+                end: arrow.end().into(),
+                stroke: arrow.stroke().channels(),
+                stroke_width: arrow.stroke_width().get(),
+                label: arrow.label().map(|label| label.as_str().to_owned()),
+            },
+            CanvasNodeContent::Freehand(freehand) => Self::Freehand {
+                points: freehand.points().iter().copied().map(Into::into).collect(),
+                stroke: freehand.stroke().channels(),
+                stroke_width: freehand.stroke_width().get(),
+            },
+        }
+    }
+}
+
+impl CanvasNodeContentV1 {
+    fn into_domain(self) -> Result<CanvasNodeContent, String> {
+        match self {
+            Self::Note { path, title } => Ok(CanvasNodeContent::Note {
+                path: project_path(path)?,
+                title: Name::new(title).map_err(|error| error.to_string())?,
+            }),
+            Self::FileTree { root } => Ok(CanvasNodeContent::FileTree {
+                root: project_path(root)?,
+            }),
+            Self::Artifact { path } => Ok(CanvasNodeContent::Artifact {
+                path: project_path(path)?,
+            }),
+            Self::Diff { path, comparison } => Ok(CanvasNodeContent::Diff {
+                path: project_path(path)?,
+                comparison: comparison.into(),
+            }),
+            Self::Text { markdown } => Ok(CanvasNodeContent::Text {
+                markdown: CanvasText::new(markdown).map_err(|error| error.to_string())?,
+            }),
+            Self::Shape {
+                kind,
+                fill,
+                stroke,
+                stroke_width,
+            } => Ok(CanvasNodeContent::Shape(Shape::new(
+                kind.into(),
+                color(fill),
+                color(stroke),
+                StrokeWidth::new(stroke_width).map_err(|error| error.to_string())?,
+            ))),
+            Self::Arrow {
+                start,
+                end,
+                stroke,
+                stroke_width,
+                label,
+            } => Ok(CanvasNodeContent::Arrow(Arrow::new(
+                start.into_domain()?,
+                end.into_domain()?,
+                color(stroke),
+                StrokeWidth::new(stroke_width).map_err(|error| error.to_string())?,
+                label
+                    .map(Name::new)
+                    .transpose()
+                    .map_err(|error| error.to_string())?,
+            ))),
+            Self::Freehand {
+                points,
+                stroke,
+                stroke_width,
+            } => Ok(CanvasNodeContent::Freehand(
+                Freehand::new(
+                    points
+                        .into_iter()
+                        .map(NormalizedPointV1::into_domain)
+                        .collect::<Result<_, _>>()?,
+                    color(stroke),
+                    StrokeWidth::new(stroke_width).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?,
+            )),
+        }
+    }
+}
+
+fn project_path(value: String) -> Result<ProjectPath, String> {
+    ProjectPath::new(value).map_err(|error| error.to_string())
+}
+
+fn color([red, green, blue, alpha]: [u8; 4]) -> CanvasColor {
+    CanvasColor::rgba(red, green, blue, alpha)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiffComparisonV1 {
+    WorkingTreeAgainstHead,
+}
+
+impl From<DiffComparison> for DiffComparisonV1 {
+    fn from(comparison: DiffComparison) -> Self {
+        match comparison {
+            DiffComparison::WorkingTreeAgainstHead => Self::WorkingTreeAgainstHead,
+        }
+    }
+}
+
+impl From<DiffComparisonV1> for DiffComparison {
+    fn from(comparison: DiffComparisonV1) -> Self {
+        match comparison {
+            DiffComparisonV1::WorkingTreeAgainstHead => Self::WorkingTreeAgainstHead,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ShapeKindV1 {
+    Rectangle,
+    Ellipse,
+}
+
+impl From<ShapeKind> for ShapeKindV1 {
+    fn from(kind: ShapeKind) -> Self {
+        match kind {
+            ShapeKind::Rectangle => Self::Rectangle,
+            ShapeKind::Ellipse => Self::Ellipse,
+        }
+    }
+}
+
+impl From<ShapeKindV1> for ShapeKind {
+    fn from(kind: ShapeKindV1) -> Self {
+        match kind {
+            ShapeKindV1::Rectangle => Self::Rectangle,
+            ShapeKindV1::Ellipse => Self::Ellipse,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NormalizedPointV1 {
+    x: f32,
+    y: f32,
+}
+
+impl From<NormalizedPoint> for NormalizedPointV1 {
+    fn from(point: NormalizedPoint) -> Self {
+        Self {
+            x: point.x(),
+            y: point.y(),
+        }
+    }
+}
+
+impl NormalizedPointV1 {
+    fn into_domain(self) -> Result<NormalizedPoint, String> {
+        NormalizedPoint::new(self.x, self.y).map_err(|error| error.to_string())
     }
 }
 

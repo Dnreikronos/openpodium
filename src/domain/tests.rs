@@ -948,9 +948,9 @@ fn canvas_edits_restore_geometry_groups_and_connections() {
             .nodes()
             .iter()
             .map(|node| {
-                Node::with_z_index(
+                Node::with_content_and_z_index(
                     node.id(),
-                    node.target(),
+                    node.content().clone(),
                     CanvasPoint::new(node.position().x() + 40.0, 60.0).unwrap(),
                     node.size(),
                     node.z_index(),
