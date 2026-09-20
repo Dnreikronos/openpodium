@@ -2,7 +2,7 @@ use std::process::Command;
 
 use openpodium::ipc::{
     AGENT_ID_ENV, AVAILABLE_ENV, AgentCapabilities, AgentRegistration, ENDPOINT_ENV, IpcService,
-    ProtocolResponse, ProtocolResult, TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
+    MessagePeer, ProtocolResponse, ProtocolResult, TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
 };
 use tempfile::TempDir;
 
@@ -144,7 +144,7 @@ fn binary_sends_a_version_two_question() {
         String::from_utf8_lossy(&output.stderr)
     );
     let accepted = service.try_recv().unwrap();
-    assert_eq!(accepted.recipient_agent_id, 8);
+    assert_eq!(accepted.recipient, MessagePeer::Agent(8));
     assert!(matches!(
         accepted.command,
         openpodium::ipc::ProtocolCommand::SendHandoff {

@@ -3906,7 +3906,7 @@ mod tests {
                 &openpodium::ipc::AcceptedMessage {
                     workspace_id: first_id.get(),
                     sender_agent_id: 1,
-                    recipient_agent_id: 2,
+                    recipient: openpodium::ipc::MessagePeer::Agent(2),
                     command: openpodium::ipc::ProtocolCommand::SendHandoff {
                         message_id: openpodium::ipc::MessageId::new("task-1").unwrap(),
                         recipient_agent_id: 2,

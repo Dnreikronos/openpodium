@@ -467,9 +467,9 @@ fn progress_and_response_route_back_to_the_task_sender() {
 
     let task = service.try_recv().unwrap();
     let progress = service.try_recv().unwrap();
-    assert_eq!(task.recipient_agent_id, 2);
+    assert_eq!(task.recipient, MessagePeer::Agent(2));
     assert_eq!(progress.sender_agent_id, 2);
-    assert_eq!(progress.recipient_agent_id, 1);
+    assert_eq!(progress.recipient, MessagePeer::Agent(1));
 }
 
 #[test]
@@ -538,10 +538,10 @@ fn version_two_questions_progress_responses_and_cancellation_are_routed() {
 
     let messages: Vec<_> = std::iter::from_fn(|| service.try_recv()).collect();
     assert_eq!(messages.len(), 4);
-    assert_eq!(messages[0].recipient_agent_id, 2);
-    assert_eq!(messages[1].recipient_agent_id, 1);
-    assert_eq!(messages[2].recipient_agent_id, 1);
-    assert_eq!(messages[3].recipient_agent_id, 2);
+    assert_eq!(messages[0].recipient, MessagePeer::Agent(2));
+    assert_eq!(messages[1].recipient, MessagePeer::Agent(1));
+    assert_eq!(messages[2].recipient, MessagePeer::Agent(1));
+    assert_eq!(messages[3].recipient, MessagePeer::Agent(2));
 }
 
 #[test]
@@ -668,4 +668,100 @@ fn malformed_and_oversized_frames_return_stable_errors() {
     BufReader::new(oversized).read_line(&mut response).unwrap();
     let response: ProtocolResponse = serde_json::from_str(&response).unwrap();
     assert_eq!(response.error.unwrap().code, ErrorCode::FrameTooLarge);
+}
+
+#[test]
+fn a_routine_step_completes_with_structured_outputs() {
+    let (_temp, service) = service();
+    let handoff_id = MessageId::new("routine-1-1-1").unwrap();
+
+    // The scheduler publishes the work it already dispatched. No agent sent it,
+    // so the record names the scheduler rather than borrowing an agent ID.
+    service
+        .register_routine_handoff(1, &handoff_id, 2, "Investigate", "Look into the parser")
+        .unwrap();
+    assert!(
+        service.try_recv().is_none(),
+        "the scheduler already dispatched this work; it must not re-enter the queue"
+    );
+
+    // Registering the same dispatch again is how recovery repairs a crash
+    // between the journal write and this call.
+    service
+        .register_routine_handoff(1, &handoff_id, 2, "Investigate", "Look into the parser")
+        .unwrap();
+
+    let completion = ProtocolCommand::RespondToHandoff {
+        message_id: MessageId::new("response-1").unwrap(),
+        handoff_message_id: handoff_id.clone(),
+        status: ResponseStatus::Completed,
+        body: "Found it".to_owned(),
+        outputs: BTreeMap::from([("finding".to_owned(), "the parser drops escapes".to_owned())]),
+    };
+    let response = round_trip(
+        service.endpoint(),
+        &request(&service, 1, 2, "request-1", completion),
+    );
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert_eq!(response.version, Some(PROTOCOL_VERSION));
+
+    let accepted = service.try_recv().unwrap();
+    assert_eq!(accepted.sender_agent_id, 2);
+    assert_eq!(
+        accepted.recipient,
+        MessagePeer::Routine,
+        "a routine completion is routed to the scheduler, not to a peer agent"
+    );
+    match accepted.command {
+        ProtocolCommand::RespondToHandoff { outputs, .. } => {
+            assert_eq!(
+                outputs.get("finding").map(String::as_str),
+                Some("the parser drops escapes")
+            );
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
+fn an_agent_that_was_not_assigned_cannot_complete_a_routine_step() {
+    let (_temp, service) = service();
+    let handoff_id = MessageId::new("routine-1-1-1").unwrap();
+    service
+        .register_routine_handoff(1, &handoff_id, 2, "Investigate", "Look into the parser")
+        .unwrap();
+
+    let completion = ProtocolCommand::RespondToHandoff {
+        message_id: MessageId::new("response-1").unwrap(),
+        handoff_message_id: handoff_id,
+        status: ResponseStatus::Completed,
+        body: "Not mine".to_owned(),
+        outputs: BTreeMap::new(),
+    };
+    let response = round_trip(
+        service.endpoint(),
+        &request(&service, 1, 1, "request-1", completion),
+    );
+    assert_eq!(
+        response.error.map(|error| error.code),
+        Some(ErrorCode::InvalidRequest)
+    );
+}
+
+#[test]
+fn structured_outputs_are_rejected_when_they_are_malformed() {
+    let long_value = "x".repeat(16_385);
+    for outputs in [
+        BTreeMap::from([("not a key".to_owned(), "value".to_owned())]),
+        BTreeMap::from([("finding".to_owned(), long_value)]),
+    ] {
+        let command = ProtocolCommand::RespondToHandoff {
+            message_id: MessageId::new("response-1").unwrap(),
+            handoff_message_id: MessageId::new("routine-1-1-1").unwrap(),
+            status: ResponseStatus::Completed,
+            body: "Done".to_owned(),
+            outputs,
+        };
+        assert!(command.validate().is_err());
+    }
 }

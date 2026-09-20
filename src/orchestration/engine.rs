@@ -8,7 +8,9 @@ use crate::domain::{
     HandoffResponseStatus, HandoffTermination, Name, Task, TaskId, TaskState, Timestamp, Workspace,
     WorkspaceId,
 };
-use crate::ipc::{AcceptedMessage, HandoffKind, MessageId, ProtocolCommand, ResponseStatus};
+use crate::ipc::{
+    AcceptedMessage, HandoffKind, MessageId, MessagePeer, ProtocolCommand, ResponseStatus,
+};
 use crate::persistence::PersistenceError;
 use crate::workspaces::{WorkspaceError, WorkspaceManager};
 
@@ -255,6 +257,37 @@ impl Orchestrator {
                 "agent-list and portal requests do not enter the orchestration queue".to_owned(),
             )),
         }
+    }
+
+    /// Queues delivery for a handoff the routine scheduler already persisted.
+    ///
+    /// The scheduler records the attempt, its task, and its handoff in one
+    /// journal batch before calling this, so there is nothing to validate or
+    /// create here; this only puts the prompt into the recipient's mailbox.
+    /// Agent-submitted handoffs must still go through [`Orchestrator::accept`],
+    /// which authenticates them.
+    pub fn submit_routine_handoff(
+        &mut self,
+        workspaces: &mut WorkspaceManager,
+        workspace_id: WorkspaceId,
+        handoff_id: HandoffId,
+        now: Timestamp,
+    ) -> Result<(), OrchestrationError> {
+        let handoff = handoff(workspaces, workspace_id, handoff_id)?;
+        if handoff.origin().run().is_none() {
+            return Err(OrchestrationError::InvalidMessage(format!(
+                "handoff {handoff_id} was not submitted by a routine"
+            )));
+        }
+        let message_id = handoff
+            .message_id()
+            .ok_or_else(|| {
+                OrchestrationError::InvalidMessage(format!(
+                    "routine handoff {handoff_id} has no message ID"
+                ))
+            })?
+            .clone();
+        self.enqueue(workspaces, workspace_id, handoff_id, &message_id, now)
     }
 
     pub fn cancel_task(
@@ -550,6 +583,9 @@ impl Orchestrator {
         {
             transition_task_running(workspaces, workspace_id, *task_id, accepted_at)?;
         }
+        if !notifies_origin(handoff(workspaces, workspace_id, handoff_id)?) {
+            return Ok(());
+        }
         self.enqueue(
             workspaces,
             workspace_id,
@@ -599,6 +635,9 @@ impl Orchestrator {
             handoff(workspaces, workspace_id, handoff_id)?.payload()
         {
             transition_task_response(workspaces, workspace_id, *task_id, status, accepted_at)?;
+        }
+        if !notifies_origin(handoff(workspaces, workspace_id, handoff_id)?) {
+            return Ok(());
         }
         self.enqueue(
             workspaces,
@@ -987,17 +1026,21 @@ fn delivery_message_ids(handoff: &Handoff) -> Vec<HandoffMessageId> {
     if handoff.termination().is_none() || handoff.is_delivered() {
         messages.extend(handoff.message_id().cloned());
     }
-    messages.extend(
-        handoff
-            .progress()
-            .iter()
-            .map(|progress| progress.message_id().clone()),
-    );
-    messages.extend(
-        handoff
-            .response()
-            .map(|response| response.message_id().clone()),
-    );
+    // Progress and responses travel back to the submitting agent. The routine
+    // scheduler has no terminal, so it reads them from durable state instead.
+    if handoff.source().is_some() {
+        messages.extend(
+            handoff
+                .progress()
+                .iter()
+                .map(|progress| progress.message_id().clone()),
+        );
+        messages.extend(
+            handoff
+                .response()
+                .map(|response| response.message_id().clone()),
+        );
+    }
     if let Some(HandoffTermination::Cancelled { message_id, .. }) = handoff.termination() {
         messages.push(message_id.clone());
     }
@@ -1027,19 +1070,30 @@ fn validate_routed_participants(
     message: &AcceptedMessage,
     from_recipient: bool,
 ) -> Result<(), OrchestrationError> {
-    let (sender, recipient) = if from_recipient {
-        (Some(handoff.recipient()), handoff.source())
-    } else {
-        (handoff.source(), Some(handoff.recipient()))
+    let origin = match handoff.origin() {
+        crate::domain::HandoffOrigin::Agent(agent_id) => MessagePeer::Agent(agent_id.get()),
+        crate::domain::HandoffOrigin::Routine { .. } => MessagePeer::Routine,
     };
-    if sender.map(AgentId::get) != Some(message.sender_agent_id)
-        || recipient.map(AgentId::get) != Some(message.recipient_agent_id)
+    let recipient = MessagePeer::Agent(handoff.recipient().get());
+    let (expected_sender, expected_peer) = if from_recipient {
+        (recipient, origin)
+    } else {
+        (origin, recipient)
+    };
+    if expected_sender != MessagePeer::Agent(message.sender_agent_id)
+        || message.recipient != expected_peer
     {
         return Err(OrchestrationError::InvalidMessage(
             "routed message participants do not match the handoff".to_owned(),
         ));
     }
     Ok(())
+}
+
+/// Whether progress and responses travel back to a terminal at all. The routine
+/// scheduler has none; it reads a completion from durable state instead.
+fn notifies_origin(handoff: &Handoff) -> bool {
+    handoff.source().is_some()
 }
 
 /// The agent a back-channel message is delivered to. Routine-submitted work
@@ -1055,8 +1109,10 @@ fn originating_agent(handoff: &Handoff) -> Result<AgentId, OrchestrationError> {
 
 fn domain_outputs(
     outputs: &BTreeMap<String, String>,
-) -> Result<BTreeMap<crate::domain::RoutineOutputKey, crate::domain::RoutineValue>, OrchestrationError>
-{
+) -> Result<
+    BTreeMap<crate::domain::RoutineOutputKey, crate::domain::RoutineValue>,
+    OrchestrationError,
+> {
     outputs
         .iter()
         .map(|(key, value)| {

@@ -7,7 +7,9 @@ use crate::domain::{
     Agent, AgentId, AgentProgram, DomainCommand, DomainEvent, HandoffMessageId, Name, TaskId,
     TaskState, Timestamp,
 };
-use crate::ipc::{AcceptedMessage, HandoffKind, MessageId, ProtocolCommand, ResponseStatus};
+use crate::ipc::{
+    AcceptedMessage, HandoffKind, MessageId, MessagePeer, ProtocolCommand, ResponseStatus,
+};
 use crate::workspaces::WorkspaceManager;
 
 fn timestamp(value: u64) -> Timestamp {
@@ -45,7 +47,7 @@ fn task(message: &str, title: &str) -> AcceptedMessage {
     AcceptedMessage {
         workspace_id: 1,
         sender_agent_id: 1,
-        recipient_agent_id: 2,
+        recipient: MessagePeer::Agent(2),
         command: ProtocolCommand::SendHandoff {
             message_id: message_id(message),
             recipient_agent_id: 2,
@@ -104,7 +106,7 @@ fn task_progress_and_response_update_state_and_preserve_mailbox_order() {
     let progress = AcceptedMessage {
         workspace_id: workspace_id.get(),
         sender_agent_id: 2,
-        recipient_agent_id: 1,
+        recipient: MessagePeer::Agent(1),
         command: ProtocolCommand::ReportHandoffProgress {
             message_id: message_id("progress-1"),
             handoff_message_id: message_id("task-1"),
@@ -127,7 +129,7 @@ fn task_progress_and_response_update_state_and_preserve_mailbox_order() {
     let response = AcceptedMessage {
         workspace_id: workspace_id.get(),
         sender_agent_id: 2,
-        recipient_agent_id: 1,
+        recipient: MessagePeer::Agent(1),
         command: ProtocolCommand::RespondToHandoff {
             outputs: std::collections::BTreeMap::new(),
             message_id: message_id("response-1"),
@@ -317,7 +319,7 @@ fn cancellation_discards_an_undelivered_task_and_delivers_only_the_cancellation(
     let cancellation = AcceptedMessage {
         workspace_id: workspace_id.get(),
         sender_agent_id: 1,
-        recipient_agent_id: 2,
+        recipient: MessagePeer::Agent(2),
         command: ProtocolCommand::CancelHandoff {
             message_id: message_id("cancel-1"),
             handoff_message_id: message_id("task-1"),
@@ -475,7 +477,7 @@ fn user_cancel_and_resume_follow_task_lifecycle_rules() {
     let blocked = AcceptedMessage {
         workspace_id: workspace_id.get(),
         sender_agent_id: 2,
-        recipient_agent_id: 1,
+        recipient: MessagePeer::Agent(1),
         command: ProtocolCommand::RespondToHandoff {
             outputs: std::collections::BTreeMap::new(),
             message_id: message_id("blocked-2"),
@@ -536,7 +538,7 @@ fn user_cancel_and_resume_follow_task_lifecycle_rules() {
     let completed = AcceptedMessage {
         workspace_id: workspace_id.get(),
         sender_agent_id: 2,
-        recipient_agent_id: 1,
+        recipient: MessagePeer::Agent(1),
         command: ProtocolCommand::RespondToHandoff {
             outputs: std::collections::BTreeMap::new(),
             message_id: message_id("completed-2"),

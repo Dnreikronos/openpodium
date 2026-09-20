@@ -26,7 +26,8 @@ pub use protocol::{
     ProtocolResponse, ProtocolResult, ProtocolValidationError, ResponseStatus,
 };
 pub use server::{
-    AcceptedMessage, AgentRegistration, ConnectionInfo, IpcService, PortalControl, ServiceError,
+    AcceptedMessage, AgentRegistration, ConnectionInfo, IpcService, MessagePeer, PortalControl,
+    ServiceError,
 };
 
 pub const PROTOCOL_NAME: &str = "openpodium-ipc";
