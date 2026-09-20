@@ -16,6 +16,8 @@ use super::{Camera, CanvasDocument, NodeKind, ViewportSize, WorldPoint, WorldRec
 
 const BASE_GRID_STEP: f64 = 40.0;
 const MIN_GRID_PIXELS: f64 = 24.0;
+/// Node bodies, including portal frames, are only drawn at or above this zoom.
+pub(super) const BODY_MIN_ZOOM: f64 = 0.4;
 
 pub(super) struct TerminalOverlay<'a> {
     pub(super) focused: Option<NodeId>,
@@ -248,7 +250,7 @@ fn draw_nodes(
             accent,
         );
 
-        if camera.zoom() >= 0.4 {
+        if camera.zoom() >= BODY_MIN_ZOOM {
             let padding = (12.0 * zoom).clamp(7.0, 16.0);
             frame.fill_text(canvas::Text {
                 content: label.title.clone(),

@@ -796,14 +796,9 @@ fn frame_captured(
                 state.portal_frames.insert(key.node_id, frame);
                 state.canvas_revision = state.canvas_revision.wrapping_add(1);
             }
-            let action = live.pending_actions.first().cloned().map(|action| {
-                live.pending_actions.remove(0);
-                let revision = state
-                    .portal_frames
-                    .get(&key.node_id)
-                    .map_or(0, PortalFrame::revision);
-                action_at_revision(action, revision)
-            });
+            // Queued input keeps the revision it was captured against, so the
+            // backend rejects it when this frame moved the content underneath.
+            let action = (!live.pending_actions.is_empty()).then(|| live.pending_actions.remove(0));
             action.map_or_else(Task::none, |action| {
                 start_action(state, key, portal_id, action)
             })
@@ -946,39 +941,6 @@ fn resolve_approval(
             })
         },
     )
-}
-
-fn action_at_revision(action: PortalAction, observation_revision: u64) -> PortalAction {
-    match action {
-        PortalAction::ClickCoordinate { x, y, .. } => PortalAction::ClickCoordinate {
-            observation_revision,
-            x,
-            y,
-        },
-        PortalAction::TypeFocused { text, .. } => PortalAction::TypeFocused {
-            observation_revision,
-            text,
-        },
-        PortalAction::Key { key, shift, .. } => PortalAction::Key {
-            observation_revision,
-            key,
-            shift,
-        },
-        PortalAction::ScrollCoordinate {
-            x,
-            y,
-            delta_x,
-            delta_y,
-            ..
-        } => PortalAction::ScrollCoordinate {
-            observation_revision,
-            x,
-            y,
-            delta_x,
-            delta_y,
-        },
-        action => action,
-    }
 }
 
 fn cleanup_task(state: &OpenPodium, key: PortalKey, portal_id: u64) -> Task<AppMessage> {
@@ -1129,27 +1091,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn queued_coordinate_input_uses_the_newest_frame_revision() {
-        let action = action_at_revision(
-            PortalAction::ClickCoordinate {
-                observation_revision: 1,
-                x: 10,
-                y: 20,
-            },
-            4,
-        );
-
-        assert_eq!(
-            action,
-            PortalAction::ClickCoordinate {
-                observation_revision: 4,
-                x: 10,
-                y: 20,
-            }
-        );
-    }
 
     #[test]
     fn empty_or_multiple_selection_has_no_selected_portal() {

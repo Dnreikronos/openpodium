@@ -699,6 +699,9 @@ impl PortalSession {
     pub fn disconnect(&mut self) {
         self.state = PortalSessionState::Disconnected;
         self.latest_observation = None;
+        // A reconnect keeps the session, so advancing the revision here stops
+        // references captured before the drop from passing afterwards.
+        self.observation_revision = self.observation_revision.wrapping_add(1);
     }
 
     pub fn accepts(&self, element: &PortalElementRef) -> Result<(), PortalSessionError> {
@@ -982,6 +985,27 @@ mod tests {
         assert!(
             PortalFrame::new(revision, viewport, PortalFrameEncoding::Png, Vec::new()).is_err()
         );
+    }
+
+    #[test]
+    fn a_reconnected_session_rejects_input_captured_before_the_drop() {
+        let mut session = PortalSession::new(3);
+        session.begin_connect().unwrap();
+        session.connected().unwrap();
+        assert_eq!(session.observe().unwrap(), 1);
+
+        session.disconnect();
+        session.begin_connect().unwrap();
+        session.connected().unwrap();
+
+        assert_eq!(
+            session.accepts_revision(1),
+            Err(PortalSessionError::StaleObservation {
+                expected: 2,
+                found: 1
+            })
+        );
+        assert_eq!(session.observe().unwrap(), 3);
     }
 
     #[test]

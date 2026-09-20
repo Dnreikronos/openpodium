@@ -739,6 +739,9 @@ impl Surface {
         position: Point,
         bounds: Rectangle,
     ) -> Option<(NodeId, u64, PortalPoint)> {
+        if self.camera.zoom() < scene::BODY_MIN_ZOOM {
+            return None;
+        }
         let node = self.hit_node(position, bounds)?;
         let CanvasNodeContent::Portal(config) = node.content() else {
             return None;
@@ -949,9 +952,7 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn portal_pointer_mapping_tracks_canvas_zoom() {
-        let node_id = NodeId::new(1);
+    fn portal_document(node_id: NodeId) -> CanvasDocument {
         let node = Node::with_content(
             node_id,
             CanvasNodeContent::Portal(PortalConfig::browser("https://example.test").unwrap()),
@@ -959,7 +960,7 @@ mod tests {
             CanvasSize::new(640.0, 420.0).unwrap(),
         );
         let workspace = Workspace::new(WorkspaceId::new(1), Name::new("Test").unwrap());
-        let document = CanvasDocument::new(
+        CanvasDocument::new(
             &workspace,
             CanvasLayout::new(vec![node], Vec::new(), Vec::new()),
             BTreeMap::new(),
@@ -973,19 +974,29 @@ mod tests {
                 vec![1],
             )
             .unwrap(),
-        )]));
+        )]))
+    }
+
+    fn portal_surface(camera: Camera, node_id: NodeId, document: CanvasDocument) -> Surface {
+        Surface {
+            camera,
+            document,
+            selection: Vec::new(),
+            focused_terminal: None,
+            focused_portal: Some(node_id),
+            application_shortcuts: Vec::new(),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn portal_pointer_mapping_tracks_canvas_zoom() {
+        let node_id = NodeId::new(1);
+        let document = portal_document(node_id);
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1_000.0, 800.0));
 
         for camera in [Camera::default(), Camera::default().zoom_centered(2.0)] {
-            let surface = Surface {
-                camera,
-                document: document.clone(),
-                selection: Vec::new(),
-                focused_terminal: None,
-                focused_portal: Some(node_id),
-                application_shortcuts: Vec::new(),
-                revision: 1,
-            };
+            let surface = portal_surface(camera, node_id, document.clone());
             let top_left =
                 camera.world_to_screen(WorldPoint::new(-320.0, -210.0), viewport(bounds));
             let zoom = camera.zoom() as f32;
@@ -1001,6 +1012,19 @@ mod tests {
             assert!((point.x() - 640.0).abs() < 0.001);
             assert!((point.y() - 360.0).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn a_portal_hidden_by_zoom_takes_no_pointer_input() {
+        let node_id = NodeId::new(1);
+        let camera = Camera::default().zoom_centered(0.25);
+        assert!(camera.zoom() < scene::BODY_MIN_ZOOM);
+        let surface = portal_surface(camera, node_id, portal_document(node_id));
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1_000.0, 800.0));
+        let center = Point::new(500.0, 400.0);
+
+        assert!(surface.hit_node(center, bounds).is_some());
+        assert_eq!(surface.portal_point_at(center, bounds), None);
     }
 
     #[test]

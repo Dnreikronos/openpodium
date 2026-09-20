@@ -166,7 +166,7 @@ impl CanvasDocument {
                     CanvasNodeContent::Portal(config) => NodeLabel {
                         title: "Portal".to_owned(),
                         subtitle: format!(
-                            "{:?} · {} · disconnected",
+                            "{:?} · {}",
                             config.target().kind(),
                             config.target().selector()
                         ),
