@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::portal::{PortalAction, PortalElementRef};
+use crate::portal::{PortalAction, PortalBackend, PortalConfig, PortalElementRef};
 
 use super::store::{InsertResult, MessageStore, StoreError, StoredMessage};
 use super::{
@@ -97,6 +97,53 @@ pub struct IpcService {
     worker_threads: Vec<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+pub struct PortalControl {
+    portals: Arc<Mutex<PortalDispatcher>>,
+}
+
+impl PortalControl {
+    pub fn register<B>(
+        &self,
+        scope: super::PortalScope,
+        config: PortalConfig,
+        backend: B,
+    ) -> Result<u64, PortalServiceError>
+    where
+        B: PortalBackend + Send + 'static,
+        B::Error: Send + Sync,
+    {
+        mutex_lock(&self.portals).register_auto(scope, config, backend)
+    }
+
+    pub fn replace_agents(
+        &self,
+        portal_id: u64,
+        agent_ids: impl IntoIterator<Item = u64>,
+    ) -> Result<(), PortalServiceError> {
+        mutex_lock(&self.portals).replace_agents(portal_id, agent_ids)
+    }
+
+    pub fn connect(&self, portal_id: u64) -> Result<(), PortalServiceError> {
+        mutex_lock(&self.portals).connect(portal_id)
+    }
+
+    pub fn close(&self, portal_id: u64) -> Result<(), PortalServiceError> {
+        mutex_lock(&self.portals).close(portal_id)
+    }
+
+    pub fn unregister(&self, portal_id: u64) -> Result<(), PortalServiceError> {
+        mutex_lock(&self.portals).unregister(portal_id)
+    }
+
+    pub fn observe(
+        &self,
+        portal_id: u64,
+    ) -> Result<super::PortalObservationResult, PortalServiceError> {
+        mutex_lock(&self.portals).observe_local(portal_id)
+    }
+}
+
 impl IpcService {
     pub fn start(data_directory: impl AsRef<Path>) -> Result<Self, ServiceError> {
         let data_directory = data_directory.as_ref();
@@ -167,6 +214,12 @@ impl IpcService {
 
     pub const fn endpoint(&self) -> SocketAddr {
         self.endpoint
+    }
+
+    pub fn portal_control(&self) -> PortalControl {
+        PortalControl {
+            portals: Arc::clone(&self.portals),
+        }
     }
 
     pub fn replace_workspace_agents(
@@ -665,6 +718,7 @@ fn portal_protocol_error(error: PortalServiceError) -> ProtocolError {
         PortalServiceError::Journal(_)
         | PortalServiceError::Backend(_)
         | PortalServiceError::Session(_)
+        | PortalServiceError::PortalIdsExhausted
         | PortalServiceError::MissingReceipt(_)
         | PortalServiceError::PendingActionUnavailable(_) => ErrorCode::ServiceUnavailable,
         PortalServiceError::InvalidPortalId

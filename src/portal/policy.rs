@@ -259,6 +259,14 @@ impl PortalPolicy {
             .retain(|_, approval| approval.request.agent_id != agent_id);
     }
 
+    pub fn revoke_connection(&mut self, agent_id: u64, portal_id: u64) {
+        self.grants
+            .retain(|_, grant| grant.agent_id != agent_id || grant.portal_id != portal_id);
+        self.pending.retain(|_, approval| {
+            approval.request.agent_id != agent_id || approval.request.portal_id != portal_id
+        });
+    }
+
     pub fn revoke_portal(&mut self, portal_id: u64) {
         self.grants.retain(|_, grant| grant.portal_id != portal_id);
         self.pending

@@ -71,6 +71,7 @@ pub struct PortalObservationResult {
 
 pub struct PortalDispatcher {
     portals: BTreeMap<u64, PortalEntry>,
+    next_portal_id: u64,
     policy: PortalPolicy,
     journal: PortalActionJournal,
     pending_actions: BTreeMap<(u64, MessageId), PendingAction>,
@@ -162,6 +163,7 @@ impl PortalDispatcher {
     pub fn open(data_directory: impl AsRef<Path>) -> Result<Self, PortalServiceError> {
         Ok(Self {
             portals: BTreeMap::new(),
+            next_portal_id: 1,
             policy: PortalPolicy::new(),
             journal: PortalActionJournal::open(data_directory.as_ref().join(JOURNAL_FILE_NAME))?,
             pending_actions: BTreeMap::new(),
@@ -200,6 +202,30 @@ impl PortalDispatcher {
         Ok(())
     }
 
+    pub fn register_auto<B>(
+        &mut self,
+        scope: PortalScope,
+        config: PortalConfig,
+        backend: B,
+    ) -> Result<u64, PortalServiceError>
+    where
+        B: PortalBackend + Send + 'static,
+        B::Error: Send + Sync,
+    {
+        let start = self.next_portal_id;
+        loop {
+            let portal_id = self.next_portal_id;
+            self.next_portal_id = self.next_portal_id.wrapping_add(1).max(1);
+            if !self.portals.contains_key(&portal_id) {
+                self.register(portal_id, scope, config, backend)?;
+                return Ok(portal_id);
+            }
+            if self.next_portal_id == start {
+                return Err(PortalServiceError::PortalIdsExhausted);
+            }
+        }
+    }
+
     pub fn attach_agent(
         &mut self,
         portal_id: u64,
@@ -216,11 +242,61 @@ impl PortalDispatcher {
         if let Some(entry) = self.portals.get_mut(&portal_id) {
             entry.attached_agents.remove(&agent_id);
         }
-        self.policy.revoke_agent(agent_id);
+        self.policy.revoke_connection(agent_id, portal_id);
+    }
+
+    pub fn replace_agents(
+        &mut self,
+        portal_id: u64,
+        agent_ids: impl IntoIterator<Item = u64>,
+    ) -> Result<(), PortalServiceError> {
+        let replacement = agent_ids.into_iter().collect::<BTreeSet<_>>();
+        if replacement.contains(&0) {
+            return Err(PortalServiceError::InvalidAgentId);
+        }
+        let removed = {
+            let entry = self.entry_mut(portal_id)?;
+            let removed = entry
+                .attached_agents
+                .difference(&replacement)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            entry.attached_agents = replacement;
+            removed
+        };
+        for agent_id in &removed {
+            self.policy.revoke_connection(*agent_id, portal_id);
+        }
+        let pending = self
+            .pending_actions
+            .iter()
+            .filter(|(_, action)| {
+                action.portal_id == portal_id && removed.contains(&action.agent_id)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for (workspace_id, action_id) in pending {
+            self.pending_actions
+                .remove(&(workspace_id, action_id.clone()));
+            self.journal.finish(
+                workspace_id,
+                &action_id,
+                "failed",
+                Some("agent disconnected from portal before approval".to_owned()),
+                now_ms(),
+            )?;
+        }
+        Ok(())
     }
 
     pub fn connect(&mut self, portal_id: u64) -> Result<(), PortalServiceError> {
         let entry = self.entry_mut(portal_id)?;
+        if entry.session.state() == PortalSessionState::Connected {
+            return Ok(());
+        }
+        if entry.session.state() == PortalSessionState::Closed {
+            entry.session = PortalSession::new(entry.session.generation().wrapping_add(1));
+        }
         entry.backend.connect(&entry.config, &mut entry.session)
     }
 
@@ -292,18 +368,24 @@ impl PortalDispatcher {
         portal_id: u64,
     ) -> Result<PortalObservationResult, PortalServiceError> {
         let entry = self.authorized_entry_mut(workspace_id, agent_id, portal_id)?;
-        let core = entry.backend.observe(&mut entry.session)?;
-        let accessibility = core
-            .accessibility()
-            .map(|snapshot| snapshot.json().to_owned())
-            .filter(|json| json.chars().count() <= MAX_OBSERVATION_CHARS);
-        let observation = PortalObservation {
-            portal_id,
-            revision: core.revision(),
-            accessibility,
-            frame_available: core.frame().is_some(),
-        };
-        Ok(PortalObservationResult { observation, core })
+        observe_entry(portal_id, entry)
+    }
+
+    pub fn observe_local(
+        &mut self,
+        portal_id: u64,
+    ) -> Result<PortalObservationResult, PortalServiceError> {
+        let entry = self.entry_mut(portal_id)?;
+        if entry.session.state() != PortalSessionState::Connected {
+            return Err(PortalServiceError::NotConnected(portal_id));
+        }
+        observe_entry(portal_id, entry)
+    }
+
+    pub fn unregister(&mut self, portal_id: u64) -> Result<(), PortalServiceError> {
+        self.close(portal_id)?;
+        self.portals.remove(&portal_id);
+        Ok(())
     }
 
     pub fn request_action(
@@ -585,6 +667,24 @@ fn authorize_entry(
     Ok(entry)
 }
 
+fn observe_entry(
+    portal_id: u64,
+    entry: &mut PortalEntry,
+) -> Result<PortalObservationResult, PortalServiceError> {
+    let core = entry.backend.observe(&mut entry.session)?;
+    let accessibility = core
+        .accessibility()
+        .map(|snapshot| snapshot.json().to_owned())
+        .filter(|json| json.chars().count() <= MAX_OBSERVATION_CHARS);
+    let observation = PortalObservation {
+        portal_id,
+        revision: core.revision(),
+        accessibility,
+        frame_available: core.frame().is_some(),
+    };
+    Ok(PortalObservationResult { observation, core })
+}
+
 fn capabilities_for(kind: PortalTargetKind) -> PortalCapabilities {
     let mut capabilities = PortalCapabilities::browser_defaults();
     if kind != PortalTargetKind::Browser {
@@ -705,6 +805,7 @@ pub enum PortalServiceError {
     InvalidAgentId,
     InvalidScope,
     DuplicatePortal(u64),
+    PortalIdsExhausted,
     UnknownPortal(u64),
     WrongWorkspace { portal_id: u64, workspace_id: u64 },
     AgentNotAttached { portal_id: u64, agent_id: u64 },
@@ -727,6 +828,7 @@ impl Display for PortalServiceError {
             Self::InvalidAgentId => formatter.write_str("agent ID must be greater than zero"),
             Self::InvalidScope => formatter.write_str("portal scope IDs must be positive"),
             Self::DuplicatePortal(id) => write!(formatter, "portal {id} is already registered"),
+            Self::PortalIdsExhausted => formatter.write_str("portal IDs are exhausted"),
             Self::UnknownPortal(id) => write!(formatter, "portal {id} is not registered"),
             Self::WrongWorkspace {
                 portal_id,
@@ -883,6 +985,28 @@ mod tests {
     }
 
     #[test]
+    fn allocated_portal_ids_are_unique_across_workspaces() {
+        let temp = TempDir::new().unwrap();
+        let mut dispatcher = PortalDispatcher::open(temp.path()).unwrap();
+        let first = dispatcher
+            .register_auto(
+                PortalScope::new(1, None, 1).unwrap(),
+                PortalConfig::browser("https://one.example").unwrap(),
+                FakeBackend::default(),
+            )
+            .unwrap();
+        let second = dispatcher
+            .register_auto(
+                PortalScope::new(2, None, 1).unwrap(),
+                PortalConfig::browser("https://two.example").unwrap(),
+                FakeBackend::default(),
+            )
+            .unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn allowed_observation_and_approval_required_actions_are_journaled() {
         let temp = TempDir::new().unwrap();
         let (mut dispatcher, executed) = dispatcher(&temp);
@@ -957,6 +1081,49 @@ mod tests {
             Some("portal closed before approval")
         );
         assert!(executed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn disconnecting_an_agent_cancels_its_pending_action() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, executed) = dispatcher(&temp);
+        let observation = dispatcher.observe(4, 7, 10).unwrap();
+        let action_id = MessageId::new("action-detach").unwrap();
+        dispatcher
+            .request_action_at(
+                4,
+                7,
+                action_id.clone(),
+                10,
+                PortalAction::Click(
+                    PortalElementRef::new(observation.observation.revision, "submit").unwrap(),
+                ),
+                100,
+            )
+            .unwrap();
+
+        dispatcher.replace_agents(10, []).unwrap();
+
+        let receipt = dispatcher.journal.receipt(4, &action_id).unwrap().unwrap();
+        assert_eq!(receipt.state, PortalActionState::Failed);
+        assert_eq!(
+            receipt.outcome.as_deref(),
+            Some("agent disconnected from portal before approval")
+        );
+        assert!(executed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_closed_portal_can_reconnect_with_a_new_generation() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, _) = dispatcher(&temp);
+
+        dispatcher.close(10).unwrap();
+        dispatcher.connect(10).unwrap();
+
+        let portals = dispatcher.list(4, 7).unwrap();
+        assert_eq!(portals.len(), 1);
+        assert_eq!(portals[0].generation, 2);
     }
 
     #[test]
