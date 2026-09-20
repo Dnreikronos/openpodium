@@ -76,21 +76,32 @@ impl BrowserBackend {
     }
 
     fn command(&mut self, method: &str, params: Value) -> Result<Value, BrowserError> {
+        self.command_with_timeout(method, params, COMMAND_TIMEOUT)
+    }
+
+    fn command_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, BrowserError> {
         let socket = self.socket.as_mut().ok_or(BrowserError::NotConnected)?;
+        configure_socket_timeout(socket, timeout)?;
         self.next_command_id = self.next_command_id.wrapping_add(1);
         let id = self.next_command_id;
         let request = json!({"id": id, "method": method, "params": params});
         socket
             .send(Message::Text(request.to_string().into()))
-            .map_err(|error| BrowserError::WebSocket(Box::new(error)))?;
-        let deadline = Instant::now() + COMMAND_TIMEOUT;
+            .map_err(|error| command_error(method, error))?;
+        let deadline = Instant::now() + timeout;
         loop {
             if Instant::now() >= deadline {
                 return Err(BrowserError::Timeout(method.to_owned()));
             }
+            configure_socket_timeout(socket, deadline.saturating_duration_since(Instant::now()))?;
             let message = socket
                 .read()
-                .map_err(|error| BrowserError::WebSocket(Box::new(error)))?;
+                .map_err(|error| command_error(method, error))?;
             let Message::Text(text) = message else {
                 continue;
             };
@@ -107,6 +118,47 @@ impl BrowserBackend {
             }
             return Ok(response.get("result").cloned().unwrap_or(Value::Null));
         }
+    }
+
+    fn capture_screenshot(&mut self, revision: u64) -> Result<PortalFrame, BrowserError> {
+        let screenshot = self.command(
+            "Page.captureScreenshot",
+            json!({"format": "png", "fromSurface": true}),
+        )?;
+        let encoded = screenshot
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BrowserError::Command {
+                method: "Page.captureScreenshot".to_owned(),
+                detail: "response did not contain base64 screenshot data".to_owned(),
+            })?;
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+            .map_err(|error| BrowserError::Base64(Box::new(error)))?;
+        PortalFrame::new(revision, self.viewport, PortalFrameEncoding::Png, bytes)
+            .map_err(BrowserError::Validation)
+    }
+
+    fn current_url(&mut self) -> Result<String, BrowserError> {
+        let history = self.command("Page.getNavigationHistory", Value::Null)?;
+        let index = history
+            .get("currentIndex")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or_else(|| BrowserError::Command {
+                method: "Page.getNavigationHistory".to_owned(),
+                detail: "response did not contain a current history index".to_owned(),
+            })?;
+        history
+            .get("entries")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.get(index))
+            .and_then(|entry| entry.get("url"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| BrowserError::Command {
+                method: "Page.getNavigationHistory".to_owned(),
+                detail: "response did not contain the current URL".to_owned(),
+            })
     }
 
     fn launch(&mut self) -> Result<String, BrowserError> {
@@ -211,6 +263,10 @@ impl BrowserBackend {
 impl PortalBackend for BrowserBackend {
     type Error = BrowserError;
 
+    fn policy_target(&mut self, _config: &PortalConfig) -> Result<String, Self::Error> {
+        self.current_url()
+    }
+
     fn connect(
         &mut self,
         config: &PortalConfig,
@@ -244,21 +300,7 @@ impl PortalBackend for BrowserBackend {
 
     fn observe(&mut self, session: &mut PortalSession) -> Result<PortalObservation, Self::Error> {
         let revision = session.observe().map_err(BrowserError::Session)?;
-        let screenshot = self.command(
-            "Page.captureScreenshot",
-            json!({"format": "png", "fromSurface": true}),
-        )?;
-        let encoded = screenshot
-            .get("data")
-            .and_then(Value::as_str)
-            .ok_or_else(|| BrowserError::Command {
-                method: "Page.captureScreenshot".to_owned(),
-                detail: "response did not contain base64 screenshot data".to_owned(),
-            })?;
-        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-            .map_err(|error| BrowserError::Base64(Box::new(error)))?;
-        let frame = PortalFrame::new(revision, self.viewport, PortalFrameEncoding::Png, bytes)
-            .map_err(BrowserError::Validation)?;
+        let frame = self.capture_screenshot(revision)?;
         let accessibility = self.command("Accessibility.getFullAXTree", Value::Null)?;
         let accessibility = PortalAccessibilitySnapshot::new(revision, accessibility.to_string())
             .map_err(BrowserError::Validation)?;
@@ -269,6 +311,14 @@ impl PortalBackend for BrowserBackend {
             .record_observation(observation.clone())
             .map_err(BrowserError::Session)?;
         Ok(observation)
+    }
+
+    fn capture_frame(
+        &mut self,
+        session: &PortalSession,
+    ) -> Result<Option<PortalFrame>, Self::Error> {
+        self.capture_screenshot(session.observation_revision())
+            .map(Some)
     }
 
     fn execute(
@@ -480,6 +530,37 @@ fn debug_websocket_url(port: u16) -> Result<Option<String>, BrowserError> {
     }))
 }
 
+fn configure_socket_timeout(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    timeout: Duration,
+) -> Result<(), BrowserError> {
+    let MaybeTlsStream::Plain(stream) = socket.get_mut() else {
+        return Err(BrowserError::UnsupportedTransport);
+    };
+    let timeout = timeout.max(Duration::from_millis(1));
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(BrowserError::ConfigureSocket)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(BrowserError::ConfigureSocket)
+}
+
+fn command_error(method: &str, error: tungstenite::Error) -> BrowserError {
+    if matches!(
+        &error,
+        tungstenite::Error::Io(io_error)
+            if matches!(
+                io_error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    ) {
+        BrowserError::Timeout(method.to_owned())
+    } else {
+        BrowserError::WebSocket(Box::new(error))
+    }
+}
+
 #[derive(Debug)]
 pub enum BrowserError {
     NotConnected,
@@ -487,12 +568,14 @@ pub enum BrowserError {
     Launch(std::io::Error),
     DebugEndpointBind(std::io::Error),
     DebugEndpoint(std::io::Error),
+    ConfigureSocket(std::io::Error),
     UserDataDirectory(std::io::Error),
     WebSocket(Box<tungstenite::Error>),
     Json(Box<serde_json::Error>),
     Base64(Box<base64::DecodeError>),
     Command { method: String, detail: String },
     Timeout(String),
+    UnsupportedTransport,
     InvalidElementReference(String),
     CoordinateOutsideViewport { x: u32, y: u32 },
     Session(PortalSessionError),
@@ -512,6 +595,9 @@ impl Display for BrowserError {
             Self::DebugEndpoint(error) => {
                 write!(formatter, "failed to query CDP endpoint: {error}")
             }
+            Self::ConfigureSocket(error) => {
+                write!(formatter, "failed to configure CDP socket timeout: {error}")
+            }
             Self::UserDataDirectory(error) => {
                 write!(
                     formatter,
@@ -523,6 +609,9 @@ impl Display for BrowserError {
             Self::Base64(error) => write!(formatter, "invalid CDP screenshot data: {error}"),
             Self::Command { method, detail } => write!(formatter, "CDP {method} failed: {detail}"),
             Self::Timeout(method) => write!(formatter, "CDP {method} timed out"),
+            Self::UnsupportedTransport => {
+                formatter.write_str("CDP endpoint did not use a local TCP transport")
+            }
             Self::InvalidElementReference(id) => {
                 write!(formatter, "invalid portal element reference {id:?}")
             }
@@ -543,6 +632,8 @@ impl std::error::Error for BrowserError {}
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::portal::{PortalBackend, PortalSessionState};
 
@@ -589,6 +680,28 @@ mod tests {
             debug_websocket_url(port).unwrap().as_deref(),
             Some("ws://127.0.0.1:1234/devtools/page/1")
         );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn silent_cdp_peer_is_interrupted_by_transport_timeout() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _socket = tungstenite::accept(stream).unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let mut backend = BrowserBackend::new("/unused/chromium");
+        backend.socket = Some(connect(endpoint).unwrap().0);
+
+        let started = Instant::now();
+        let error = backend
+            .command_with_timeout("Runtime.evaluate", Value::Null, Duration::from_millis(50))
+            .unwrap_err();
+
+        assert!(matches!(error, BrowserError::Timeout(method) if method == "Runtime.evaluate"));
+        assert!(started.elapsed() < Duration::from_secs(1));
         worker.join().unwrap();
     }
 
