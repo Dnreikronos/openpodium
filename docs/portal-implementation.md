@@ -71,5 +71,9 @@ clipboard shortcuts remain separate because clipboard access has its own policy.
 Device discovery now probes Appium, ADB, and Xcode independently. Recorded
 fixtures cover Android emulators and attached-device authorization states plus
 Apple simulators and attached devices. Missing host tools and unsupported Apple
-hosts produce explicit unavailable reasons. Appium session creation and device
-action execution remain to be implemented.
+hosts produce explicit unavailable reasons. Available targets can be added from
+the sidebar as durable portal nodes. The Appium adapter creates UiAutomator2 or
+XCUITest sessions, captures screenshots and semantic source, executes element
+and touch input, and deletes only its automation session when closed. Real
+emulator, simulator, and attached-device smoke tests still require the matching
+SDKs, drivers, and authorized hardware.

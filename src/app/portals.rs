@@ -7,7 +7,11 @@ use openpodium::domain::{
     WorkspaceId,
 };
 use openpodium::ipc::{PortalControl, PortalScope};
-use openpodium::portal::{BrowserBackend, PortalAction, PortalConfig, PortalFrame};
+use openpodium::portal::{
+    AppiumBackend, BrowserBackend, DeviceAvailability, DeviceDiscovery, DeviceDiscoveryReport,
+    PortalAction, PortalConfig, PortalFrame, PortalPresentation, PortalTarget, PortalTargetKind,
+    ToolProbe,
+};
 
 use super::{Message as AppMessage, OpenPodium, canvas_coordinate, next_node_id, now};
 
@@ -35,6 +39,8 @@ pub(super) struct UiState {
     url: String,
     sessions: BTreeMap<PortalKey, LivePortal>,
     tick: u64,
+    discovery: Option<DeviceDiscoveryReport>,
+    discovery_busy: bool,
 }
 
 impl Default for UiState {
@@ -43,6 +49,8 @@ impl Default for UiState {
             url: "https://".to_owned(),
             sessions: BTreeMap::new(),
             tick: 0,
+            discovery: None,
+            discovery_busy: false,
         }
     }
 }
@@ -51,6 +59,13 @@ impl Default for UiState {
 pub(super) enum Message {
     UrlChanged(String),
     Add,
+    DiscoverDevices,
+    DevicesDiscovered(Result<DeviceDiscoveryReport, String>),
+    AddDevice {
+        platform: PortalTargetKind,
+        id: String,
+        name: String,
+    },
     Connect(NodeId),
     Connected {
         key: PortalKey,
@@ -81,6 +96,16 @@ pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessag
             Task::none()
         }
         Message::Add => add(state),
+        Message::DiscoverDevices => discover_devices(state),
+        Message::DevicesDiscovered(result) => {
+            state.portal_ui.discovery_busy = false;
+            match result {
+                Ok(report) => state.portal_ui.discovery = Some(report),
+                Err(error) => state.notice = Some(error),
+            }
+            Task::none()
+        }
+        Message::AddDevice { platform, id, name } => add_device(state, platform, id, name),
         Message::Connect(node_id) => connect(state, node_id),
         Message::Connected { key, result } => connected(state, key, result),
         Message::Disconnect(node_id) => disconnect(state, node_id),
@@ -266,7 +291,7 @@ pub(super) fn shutdown(state: &mut OpenPodium) {
 }
 
 pub(super) fn creation_view(state: &OpenPodium) -> Element<'_, AppMessage> {
-    column![
+    let mut content = column![
         text("Browser portals").size(18),
         row![
             text_input("https://example.com", &state.portal_ui.url)
@@ -275,8 +300,43 @@ pub(super) fn creation_view(state: &OpenPodium) -> Element<'_, AppMessage> {
         ]
         .spacing(8),
     ]
-    .spacing(8)
-    .into()
+    .spacing(8);
+    content =
+        content
+            .push(text("Device portals").size(18))
+            .push(if state.portal_ui.discovery_busy {
+                button("Discovering devices…")
+            } else {
+                button("Discover devices").on_press(AppMessage::Portal(Message::DiscoverDevices))
+            });
+    if let Some(report) = &state.portal_ui.discovery {
+        content = content.push(
+            text(format!(
+                "Appium: {} · Android: {} · Apple: {}",
+                probe_label(&report.appium),
+                probe_label(&report.android),
+                probe_label(&report.apple),
+            ))
+            .size(12),
+        );
+        for device in &report.devices {
+            let mut add = button(text(format!(
+                "{:?} · {} · {:?}",
+                device.kind(),
+                device.name(),
+                device.availability()
+            )));
+            if device.availability() == &DeviceAvailability::Available {
+                add = add.on_press(AppMessage::Portal(Message::AddDevice {
+                    platform: device.platform(),
+                    id: device.id().to_owned(),
+                    name: device.name().to_owned(),
+                }));
+            }
+            content = content.push(add);
+        }
+    }
+    content.into()
 }
 
 pub(super) fn selected_view(state: &OpenPodium) -> Option<Element<'_, AppMessage>> {
@@ -288,13 +348,13 @@ pub(super) fn selected_view(state: &OpenPodium) -> Option<Element<'_, AppMessage
     .spacing(8);
     let content = match state.portal_ui.sessions.get(&key).map(|live| &live.phase) {
         None => content.push(
-            button("Connect browser").on_press(AppMessage::Portal(Message::Connect(key.node_id))),
+            button("Connect portal").on_press(AppMessage::Portal(Message::Connect(key.node_id))),
         ),
-        Some(Phase::Connecting) => content.push(text("Connecting isolated Chromium…")),
+        Some(Phase::Connecting) => content.push(text("Connecting portal…")),
         Some(Phase::Connected { portal_id, .. }) => content
             .push(text(format!("Connected as portal {portal_id}")))
             .push(
-                button("Disconnect browser")
+                button("Disconnect portal")
                     .on_press(AppMessage::Portal(Message::Disconnect(key.node_id))),
             ),
         Some(Phase::Disconnecting { .. }) => content.push(text("Disconnecting browser…")),
@@ -310,6 +370,30 @@ fn add(state: &mut OpenPodium) -> Task<AppMessage> {
             return Task::none();
         }
     };
+    add_config(state, config, "Browser portal added")
+}
+
+fn add_device(
+    state: &mut OpenPodium,
+    platform: PortalTargetKind,
+    id: String,
+    name: String,
+) -> Task<AppMessage> {
+    let target = match PortalTarget::new(platform, id) {
+        Ok(target) => target,
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            return Task::none();
+        }
+    };
+    add_config(
+        state,
+        PortalConfig::new(target, PortalPresentation::default()),
+        &format!("Device portal added for {name}"),
+    )
+}
+
+fn add_config(state: &mut OpenPodium, config: PortalConfig, notice: &str) -> Task<AppMessage> {
     let Some(workspace) = state
         .workspaces
         .as_ref()
@@ -354,11 +438,26 @@ fn add(state: &mut OpenPodium) -> Task<AppMessage> {
             state.canvas_selection = vec![node_id];
             state.canvas_preview = None;
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
-            state.notice = Some("Browser portal added".to_owned());
+            state.notice = Some(notice.to_owned());
         }
         Err(error) => state.notice = Some(error.to_string()),
     }
     Task::none()
+}
+
+fn discover_devices(state: &mut OpenPodium) -> Task<AppMessage> {
+    if state.portal_ui.discovery_busy {
+        return Task::none();
+    }
+    state.portal_ui.discovery_busy = true;
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(DeviceDiscovery::discover)
+                .await
+                .map_err(|error| error.to_string())
+        },
+        |result| AppMessage::Portal(Message::DevicesDiscovered(result)),
+    )
 }
 
 fn connect(state: &mut OpenPodium, node_id: NodeId) -> Task<AppMessage> {
@@ -399,7 +498,7 @@ fn connect(state: &mut OpenPodium, node_id: NodeId) -> Task<AppMessage> {
             pending_actions: Vec::new(),
         },
     );
-    state.notice = Some("Connecting isolated Chromium".to_owned());
+    state.notice = Some("Connecting portal".to_owned());
 
     Task::perform(
         async move {
@@ -433,7 +532,7 @@ fn connected(
                 portal_id,
                 busy: false,
             };
-            state.notice = Some("Browser portal connected".to_owned());
+            state.notice = Some("Portal connected".to_owned());
         }
         Err(error) => {
             state.portal_ui.sessions.remove(&key);
@@ -517,7 +616,7 @@ fn disconnected(
         state.canvas_revision = state.canvas_revision.wrapping_add(1);
     }
     state.notice = Some(match result {
-        Ok(()) => "Browser portal disconnected".to_owned(),
+        Ok(()) => "Portal disconnected".to_owned(),
         Err(error) => error,
     });
     Task::none()
@@ -711,10 +810,20 @@ fn connect_backend(
     config: PortalConfig,
     agents: Vec<u64>,
 ) -> Result<u64, String> {
-    let backend = BrowserBackend::discover().map_err(|error| error.to_string())?;
-    let portal_id = control
-        .register(scope, config, backend)
-        .map_err(|error| error.to_string())?;
+    let platform = config.target().kind();
+    let portal_id = match platform {
+        PortalTargetKind::Browser => control.register(
+            scope,
+            config,
+            BrowserBackend::discover().map_err(|error| error.to_string())?,
+        ),
+        PortalTargetKind::Android | PortalTargetKind::Ios => control.register(
+            scope,
+            config,
+            AppiumBackend::new(platform).map_err(|error| error.to_string())?,
+        ),
+    }
+    .map_err(|error| error.to_string())?;
     let result = control
         .replace_agents(portal_id, agents)
         .and_then(|()| control.connect(portal_id));
@@ -723,6 +832,13 @@ fn connect_backend(
         return Err(error.to_string());
     }
     Ok(portal_id)
+}
+
+fn probe_label(probe: &ToolProbe) -> &str {
+    match probe {
+        ToolProbe::Available => "available",
+        ToolProbe::Unavailable { reason } => reason,
+    }
 }
 
 fn capture(
