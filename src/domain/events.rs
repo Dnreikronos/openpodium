@@ -53,6 +53,15 @@ pub enum DomainCommand {
         before: Handoff,
         after: Handoff,
     },
+    CancelTask {
+        task_id: TaskId,
+        before: Handoff,
+        after: Handoff,
+    },
+    ResumeTask {
+        task_id: TaskId,
+        handoff: Handoff,
+    },
     AddNode(Node),
     AddAgentNode {
         agent: Agent,
@@ -131,6 +140,17 @@ pub enum DomainEvent {
     HandoffChanged {
         before: Handoff,
         after: Handoff,
+    },
+    TaskCancelled {
+        task_id: TaskId,
+        from: TaskState,
+        before: Handoff,
+        after: Handoff,
+    },
+    TaskResumed {
+        task_id: TaskId,
+        from: TaskState,
+        handoff: Handoff,
     },
     NodeAdded(Node),
     AgentNodeAdded {

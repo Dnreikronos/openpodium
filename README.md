@@ -35,7 +35,7 @@ OpenPodium is written in Rust. The desktop interface uses Iced and WGPU.
 
 ### Requirements
 
-- [Rustup](https://rustup.rs/). The repository pins Rust 1.88.0 and installs the `rustfmt` and `clippy` components automatically.
+- [Rustup](https://rustup.rs/). The repository pins Rust 1.89.0 and installs the `rustfmt` and `clippy` components automatically.
 - **macOS:** Xcode Command Line Tools (`xcode-select --install`).
 - **Linux:** a C toolchain, `pkg-config`, a working X11 or Wayland session, and current graphics drivers. Debian and Ubuntu users can start with `build-essential pkg-config`.
 - **Windows:** Visual Studio Build Tools with the **Desktop development with C++** workload.

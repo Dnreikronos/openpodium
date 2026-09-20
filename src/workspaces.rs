@@ -5,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::domain::{
-    Content, DomainCommand, Name, TimelineEvent, Timestamp, ValidationError, Workspace,
-    WorkspaceDirectory, WorkspaceIcon, WorkspaceId, WorkspaceSettings,
+    Content, DomainCommand, Name, TimelineEvent, TimelineEventId, Timestamp, ValidationError,
+    Workspace, WorkspaceDirectory, WorkspaceIcon, WorkspaceId, WorkspaceSettings,
 };
 use crate::persistence::Journal;
 
@@ -134,6 +134,26 @@ impl WorkspaceManager {
 
     pub fn workspace(&self, workspace_id: WorkspaceId) -> Option<&Workspace> {
         self.workspaces.get(&workspace_id)
+    }
+
+    pub fn timeline(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<TimelineEvent>, WorkspaceError> {
+        self.timeline_after(workspace_id, None)
+    }
+
+    pub fn timeline_after(
+        &self,
+        workspace_id: WorkspaceId,
+        after: Option<TimelineEventId>,
+    ) -> Result<Vec<TimelineEvent>, WorkspaceError> {
+        if !self.workspaces.contains_key(&workspace_id) {
+            return Err(WorkspaceError::UnknownWorkspace { workspace_id });
+        }
+        self.journal
+            .timeline_after(workspace_id, after)
+            .map_err(WorkspaceError::from)
     }
 
     pub fn recent_workspaces(&self) -> impl Iterator<Item = &Workspace> {

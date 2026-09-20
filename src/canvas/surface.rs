@@ -329,24 +329,24 @@ impl canvas::Program<Message> for Surface {
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let anchor = cursor.position_in(bounds)?;
                 let (x, y, zoom_sensitivity) = scroll_delta(*delta);
-                if !(state.modifiers.command() || state.modifiers.control()) {
-                    if let Some((node_id, row, column, _)) = self.terminal_cell_at(anchor, bounds) {
-                        let lines = (y / f64::from(CELL_HEIGHT)).round() as i32;
-                        if lines != 0 {
-                            if self.document.terminal(node_id)?.mode.mouse_reporting {
-                                return Some(
-                                    Action::publish(Message::TerminalInput {
-                                        node_id,
-                                        bytes: terminal::encode_mouse_wheel(row, column, lines > 0),
-                                    })
-                                    .and_capture(),
-                                );
-                            }
+                if !(state.modifiers.command() || state.modifiers.control())
+                    && let Some((node_id, row, column, _)) = self.terminal_cell_at(anchor, bounds)
+                {
+                    let lines = (y / f64::from(CELL_HEIGHT)).round() as i32;
+                    if lines != 0 {
+                        if self.document.terminal(node_id)?.mode.mouse_reporting {
                             return Some(
-                                Action::publish(Message::TerminalScrolled { node_id, lines })
-                                    .and_capture(),
+                                Action::publish(Message::TerminalInput {
+                                    node_id,
+                                    bytes: terminal::encode_mouse_wheel(row, column, lines > 0),
+                                })
+                                .and_capture(),
                             );
                         }
+                        return Some(
+                            Action::publish(Message::TerminalScrolled { node_id, lines })
+                                .and_capture(),
+                        );
                     }
                 }
                 let camera = if state.modifiers.command() || state.modifiers.control() {

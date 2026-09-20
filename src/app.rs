@@ -13,8 +13,8 @@ use openpodium::domain::{
     ChatDraft, ChatMessageId, ChatThread, ChatThreadId, CommandPreset, CommandPresetId,
     ContainerEnvironment, Content, CustomEnvironment, DomainCommand, EnvironmentKind,
     EnvironmentProfile, EnvironmentProfileId, Name, Node, NodeId, NodeTarget, Role, RoleColor,
-    RoleIcon, RoleId, SshEnvironment, ThreadColor, Timestamp, Workspace, WorkspaceDirectory,
-    WorkspaceId,
+    RoleIcon, RoleId, SshEnvironment, ThreadColor, TimelineEventId, Timestamp, Workspace,
+    WorkspaceDirectory, WorkspaceId,
 };
 use openpodium::ipc::{
     AGENT_ID_ENV, AVAILABLE_ENV, AgentCapabilities, AgentRegistration, CLI_ENV, ENDPOINT_ENV,
@@ -26,16 +26,23 @@ use openpodium::runtime::{
     EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, ProcessSpec,
     RuntimeError, check_agent_capability, check_environment, prepare_environment_process,
 };
+use openpodium::timeline::{self, AttentionLevel, NavigationTarget, RecoveryAction, TimelineItem};
 use openpodium::workspaces::{WorkspaceManager, WorkspaceSettingsInput};
 use tokio::sync::Mutex;
 
 use crate::canvas::{self, Alignment, Camera, History, ZOrder};
 use crate::chat::{self, AttachmentStore, LinkTarget};
+use crate::notifications::NotificationRequest;
 use crate::terminal;
 use crate::terminal::session::{self, Action as TerminalAction, ProcessStream, Session};
+use crate::timeline_panel;
 
 const APP_NAME: &str = "OpenPodium";
 const DATABASE_FILE: &str = "openpodium.sqlite";
+type TimelineState = (
+    BTreeMap<WorkspaceId, Vec<TimelineItem>>,
+    BTreeMap<WorkspaceId, TimelineEventId>,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TerminalKey {
@@ -61,6 +68,9 @@ struct OpenPodium {
     focused_terminal: Option<NodeId>,
     terminal_generation: u64,
     chat_ui: chat::UiState,
+    timeline_ui: timeline_panel::UiState,
+    timeline_items: BTreeMap<WorkspaceId, Vec<TimelineItem>>,
+    timeline_high_watermarks: BTreeMap<WorkspaceId, TimelineEventId>,
     attachment_store: Option<AttachmentStore>,
     ipc: Option<IpcService>,
     orchestrator: Orchestrator,
@@ -126,6 +136,15 @@ impl Default for OpenPodium {
             },
             None => Orchestrator::default(),
         };
+        let (timeline_items, timeline_high_watermarks) =
+            match workspaces.as_ref().map(load_timeline_state) {
+                Some(Ok(timeline)) => timeline,
+                Some(Err(error)) => {
+                    notice = Some(error);
+                    Default::default()
+                }
+                None => Default::default(),
+            };
         let mut state = Self {
             camera: Camera::default(),
             canvas_selection: Vec::new(),
@@ -136,6 +155,9 @@ impl Default for OpenPodium {
             focused_terminal: None,
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),
+            timeline_ui: timeline_panel::UiState::default(),
+            timeline_items,
+            timeline_high_watermarks,
             attachment_store,
             ipc,
             orchestrator,
@@ -177,6 +199,8 @@ enum Message {
     OrchestrationTick,
     Canvas(canvas::Message),
     Chat(chat::Message),
+    Timeline(timeline_panel::Message),
+    NotificationActivated(Option<NavigationTarget>),
     AddAgent(AgentProgram),
     PreviewAgent(AgentProgram),
     CanvasAction(CanvasAction),
@@ -269,9 +293,15 @@ pub(crate) fn run() -> iced::Result {
 
 fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
-        Message::OrchestrationTick => run_orchestration_tick(state),
+        Message::OrchestrationTick => {
+            run_orchestration_tick(state);
+            return refresh_timelines(state);
+        }
         Message::Canvas(message) => return handle_canvas_message(state, message),
         Message::Chat(message) => return handle_chat_message(state, message),
+        Message::Timeline(message) => return handle_timeline_message(state, message),
+        Message::NotificationActivated(Some(target)) => navigate_to_task(state, target),
+        Message::NotificationActivated(None) => {}
         Message::AddAgent(program) => return add_agent(state, program),
         Message::PreviewAgent(program) => preview_agent(state, program),
         Message::CanvasAction(action) => apply_canvas_action(state, action),
@@ -420,10 +450,10 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
                 workspace_id,
                 node_id,
             };
-            if let (Some(session), Some(contents)) = (state.terminals.get(&key), contents) {
-                if let Err(error) = session.paste(&contents) {
-                    state.notice = Some(error);
-                }
+            if let (Some(session), Some(contents)) = (state.terminals.get(&key), contents)
+                && let Err(error) = session.paste(&contents)
+            {
+                state.notice = Some(error);
             }
         }
     }
@@ -441,11 +471,19 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     if let Some(workspaces) = &state.workspaces {
         for workspace in workspaces.recent_workspaces() {
             let icon = workspace.settings().icon().map_or("", |icon| icon.as_str());
-            let label = if icon.is_empty() {
+            let mut label = if icon.is_empty() {
                 workspace.name().to_owned()
             } else {
                 format!("{icon} {}", workspace.name())
             };
+            let attention = timeline::attention_counts(workspace).total();
+            if attention > 0 {
+                label = if attention == 1 {
+                    format!("{label} · 1 needs attention")
+                } else {
+                    format!("{label} · {attention} need attention")
+                };
+            }
             workspace_list = workspace_list.push(
                 button(text(label))
                     .on_press(Message::SwitchWorkspace(workspace.id()))
@@ -565,6 +603,21 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     ]
     .spacing(12)
     .max_width(720);
+    if let Some(workspace) = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+    {
+        let items = state
+            .timeline_items
+            .get(&workspace.id())
+            .map_or(&[][..], Vec::as_slice);
+        settings = column![
+            timeline_panel::panel(workspace, items, &state.timeline_ui).map(Message::Timeline),
+            settings,
+        ]
+        .spacing(20);
+    }
     if let Some(workspace) = state
         .workspaces
         .as_ref()
@@ -930,6 +983,173 @@ impl Drop for OpenPodium {
     }
 }
 
+fn load_timeline_state(workspaces: &WorkspaceManager) -> Result<TimelineState, String> {
+    let mut items = BTreeMap::new();
+    let mut high_watermarks = BTreeMap::new();
+    for workspace in workspaces.recent_workspaces() {
+        let events = workspaces
+            .timeline(workspace.id())
+            .map_err(|error| error.to_string())?;
+        if let Some(event) = events.last() {
+            high_watermarks.insert(workspace.id(), event.id());
+        }
+        items.insert(workspace.id(), timeline::project(workspace, &events));
+    }
+    Ok((items, high_watermarks))
+}
+
+fn refresh_timelines(state: &mut OpenPodium) -> Task<Message> {
+    let workspace_ids = state
+        .workspaces
+        .as_ref()
+        .map(|workspaces| {
+            workspaces
+                .recent_workspaces()
+                .map(Workspace::id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut notifications = Vec::new();
+    for workspace_id in workspace_ids {
+        let update = (|| -> Result<_, String> {
+            let workspaces = state
+                .workspaces
+                .as_ref()
+                .ok_or_else(|| "workspace storage is unavailable".to_owned())?;
+            let events = workspaces
+                .timeline_after(
+                    workspace_id,
+                    state.timeline_high_watermarks.get(&workspace_id).copied(),
+                )
+                .map_err(|error| error.to_string())?;
+            let workspace = workspaces
+                .workspace(workspace_id)
+                .ok_or_else(|| format!("workspace {workspace_id} is unavailable"))?;
+            let items = timeline::project(workspace, &events);
+            let requests = items
+                .iter()
+                .filter(|item| item.attention() != AttentionLevel::None)
+                .filter_map(|item| {
+                    let task_id = item.task_id()?;
+                    Some(NotificationRequest {
+                        target: timeline::navigation_target(workspace, task_id)?,
+                        title: item.title().to_owned(),
+                        body: item.detail().to_owned(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((events.last().map(|event| event.id()), items, requests))
+        })();
+        let (high_watermark, items, requests) = match update {
+            Ok(update) => update,
+            Err(error) => {
+                state.notice = Some(format!("Timeline refresh failed: {error}"));
+                continue;
+            }
+        };
+        if let Some(high_watermark) = high_watermark {
+            state
+                .timeline_high_watermarks
+                .insert(workspace_id, high_watermark);
+        }
+        state
+            .timeline_items
+            .entry(workspace_id)
+            .or_default()
+            .extend(items);
+        notifications.extend(requests);
+    }
+    Task::batch(notifications.into_iter().map(|request| {
+        Task::perform(
+            crate::notifications::show(request),
+            Message::NotificationActivated,
+        )
+    }))
+}
+
+fn handle_timeline_message(
+    state: &mut OpenPodium,
+    message: timeline_panel::Message,
+) -> Task<Message> {
+    let Some(workspace_id) = active_workspace_id(state) else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return Task::none();
+    };
+    match message {
+        timeline_panel::Message::Filter(task_id) => {
+            state.timeline_ui.select_task(workspace_id, task_id);
+        }
+        timeline_panel::Message::Inspect(task_id) => {
+            let target = state
+                .workspaces
+                .as_ref()
+                .and_then(|workspaces| workspaces.workspace(workspace_id))
+                .and_then(|workspace| timeline::navigation_target(workspace, task_id));
+            if let Some(target) = target {
+                navigate_to_task(state, target);
+            } else {
+                state.notice = Some(format!("Task {task_id} is unavailable"));
+            }
+        }
+        timeline_panel::Message::Recover { task_id, action } => {
+            let result = state
+                .workspaces
+                .as_mut()
+                .ok_or_else(|| "workspace storage is unavailable".to_owned())
+                .and_then(|workspaces| {
+                    match action {
+                        RecoveryAction::Retry => state
+                            .orchestrator
+                            .retry_task(workspaces, workspace_id, task_id, now())
+                            .map(|retry_id| format!("Task retried as {retry_id}")),
+                        RecoveryAction::Cancel => state
+                            .orchestrator
+                            .cancel_task(workspaces, workspace_id, task_id, now())
+                            .map(|()| "Task cancelled".to_owned()),
+                        RecoveryAction::Resume => state
+                            .orchestrator
+                            .resume_task(workspaces, workspace_id, task_id, now())
+                            .map(|()| "Task resumed".to_owned()),
+                        RecoveryAction::Inspect => unreachable!("inspect has a dedicated message"),
+                    }
+                    .map_err(|error| error.to_string())
+                });
+            state.notice = Some(result.unwrap_or_else(|error| error));
+            return refresh_timelines(state);
+        }
+    }
+    Task::none()
+}
+
+fn navigate_to_task(state: &mut OpenPodium, target: NavigationTarget) {
+    if active_workspace_id(state) != Some(target.workspace_id) {
+        let result = state
+            .workspaces
+            .as_mut()
+            .expect("a notification target requires workspace storage")
+            .switch(target.workspace_id, now());
+        if let Err(error) = result {
+            state.notice = Some(error.to_string());
+            return;
+        }
+        state.reset_canvas_session();
+        state.load_active_settings();
+    }
+    state
+        .timeline_ui
+        .select_task(target.workspace_id, Some(target.task_id));
+    let current_node = state
+        .workspaces
+        .as_ref()
+        .and_then(|workspaces| workspaces.workspace(target.workspace_id))
+        .and_then(|workspace| timeline::navigation_target(workspace, target.task_id))
+        .and_then(|target| target.node_id);
+    state.canvas_selection = current_node.into_iter().collect();
+    state.focused_terminal = None;
+    state.canvas_revision = state.canvas_revision.wrapping_add(1);
+    state.notice = Some(format!("Inspecting task {}", target.task_id));
+}
+
 fn run_orchestration_tick(state: &mut OpenPodium) {
     const MAX_MESSAGES_PER_TICK: usize = 64;
     const MAX_DELIVERIES_PER_TICK: usize = 64;
@@ -1081,10 +1301,9 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
         canvas::Message::TerminalInput { node_id, bytes } => {
             if let Some(session) =
                 active_terminal_key(state, node_id).and_then(|key| state.terminals.get(&key))
+                && let Err(error) = session.write(&bytes)
             {
-                if let Err(error) = session.write(&bytes) {
-                    state.notice = Some(error);
-                }
+                state.notice = Some(error);
             }
         }
         canvas::Message::TerminalPasteRequested(node_id) => {
@@ -2404,15 +2623,13 @@ fn handle_terminal_event(
             TerminalAction::Bell => None,
         })
         .collect::<Vec<_>>();
-    if continues {
-        if let Some(stream) = session.stream() {
-            tasks.push(wait_for_terminal_event(
-                workspace_id,
-                node_id,
-                generation,
-                stream,
-            ));
-        }
+    if continues && let Some(stream) = session.stream() {
+        tasks.push(wait_for_terminal_event(
+            workspace_id,
+            node_id,
+            generation,
+            stream,
+        ));
     }
     state.canvas_revision = state.canvas_revision.wrapping_add(1);
     Task::batch(tasks)
@@ -2422,10 +2639,10 @@ fn stop_terminal(state: &mut OpenPodium, node_id: NodeId) {
     let Some(key) = active_terminal_key(state, node_id) else {
         return;
     };
-    if let Some(session) = state.terminals.get_mut(&key) {
-        if let Err(error) = session.stop() {
-            state.notice = Some(error);
-        }
+    if let Some(session) = state.terminals.get_mut(&key)
+        && let Err(error) = session.stop()
+    {
+        state.notice = Some(error);
     }
     if state.focused_terminal == Some(node_id) {
         state.focused_terminal = None;
@@ -2973,6 +3190,9 @@ mod tests {
             focused_terminal: None,
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),
+            timeline_ui: timeline_panel::UiState::default(),
+            timeline_items: BTreeMap::new(),
+            timeline_high_watermarks: BTreeMap::new(),
             attachment_store: None,
             ipc: None,
             orchestrator: Orchestrator::default(),
@@ -3260,6 +3480,117 @@ mod tests {
         assert_eq!(state.notice.as_deref(), Some("Terminal is already running"));
     }
 
+    #[test]
+    fn notification_navigation_selects_the_workspace_node_and_task() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let first_id = workspaces
+            .create_workspace(&first, Timestamp::from_unix_millis(1))
+            .unwrap();
+        let second_id = workspaces
+            .create_workspace(&second, Timestamp::from_unix_millis(2))
+            .unwrap();
+        workspaces
+            .execute(
+                second_id,
+                DomainCommand::AddAgent(Agent::new(
+                    AgentId::new(1),
+                    Name::new("Lead").unwrap(),
+                    None,
+                )),
+                Timestamp::from_unix_millis(3),
+            )
+            .unwrap();
+        workspaces
+            .execute(
+                second_id,
+                DomainCommand::AddAgentNode {
+                    agent: Agent::new(AgentId::new(2), Name::new("Builder").unwrap(), None),
+                    node: Node::new(
+                        NodeId::new(9),
+                        NodeTarget::Agent(AgentId::new(2)),
+                        CanvasPoint::new(0.0, 0.0).unwrap(),
+                        CanvasSize::new(400.0, 300.0).unwrap(),
+                    ),
+                },
+                Timestamp::from_unix_millis(4),
+            )
+            .unwrap();
+        let task_id = openpodium::domain::TaskId::new(1);
+        let task = openpodium::domain::Task::new(
+            task_id,
+            Name::new("Inspect me").unwrap(),
+            Content::new("Open the right target").unwrap(),
+            Some(AgentId::new(2)),
+            None,
+        );
+        let handoff = openpodium::domain::Handoff::tracked(
+            openpodium::domain::HandoffId::new(1),
+            openpodium::domain::HandoffMessageId::new("inspect-1").unwrap(),
+            AgentId::new(1),
+            AgentId::new(2),
+            openpodium::domain::HandoffPayload::Task(task_id),
+            None,
+            Timestamp::from_unix_millis(5),
+            None,
+        )
+        .unwrap();
+        workspaces
+            .execute(
+                second_id,
+                DomainCommand::AddTaskHandoff { task, handoff },
+                Timestamp::from_unix_millis(5),
+            )
+            .unwrap();
+        let target =
+            timeline::navigation_target(workspaces.workspace(second_id).unwrap(), task_id).unwrap();
+        workspaces
+            .switch(first_id, Timestamp::from_unix_millis(6))
+            .unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        navigate_to_task(&mut state, target);
+
+        assert_eq!(active_workspace_id(&state), Some(second_id));
+        assert_eq!(state.canvas_selection, vec![NodeId::new(9)]);
+        assert_eq!(state.timeline_ui.selected_task(second_id), Some(task_id));
+
+        let before = state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .workspace(second_id)
+            .unwrap()
+            .canvas_layout();
+        let reused_node = Node::new(
+            NodeId::new(9),
+            NodeTarget::Agent(AgentId::new(1)),
+            CanvasPoint::new(0.0, 0.0).unwrap(),
+            CanvasSize::new(400.0, 300.0).unwrap(),
+        );
+        state
+            .workspaces
+            .as_mut()
+            .unwrap()
+            .execute(
+                second_id,
+                DomainCommand::ReplaceCanvas {
+                    before,
+                    after: CanvasLayout::new(vec![reused_node], vec![], vec![]),
+                },
+                Timestamp::from_unix_millis(7),
+            )
+            .unwrap();
+
+        navigate_to_task(&mut state, target);
+
+        assert!(state.canvas_selection.is_empty());
+    }
+
     fn test_state(
         workspaces: WorkspaceManager,
         terminals: BTreeMap<TerminalKey, Session>,
@@ -3274,6 +3605,9 @@ mod tests {
             focused_terminal: None,
             terminal_generation: 0,
             chat_ui: chat::UiState::default(),
+            timeline_ui: timeline_panel::UiState::default(),
+            timeline_items: BTreeMap::new(),
+            timeline_high_watermarks: BTreeMap::new(),
             attachment_store: None,
             ipc: None,
             orchestrator: Orchestrator::default(),

@@ -93,6 +93,44 @@ fn failed_snapshot_write_rolls_back_event_and_memory() {
 }
 
 #[test]
+fn timeline_returns_verified_events_in_journal_order() {
+    let temp = TempDir::new().unwrap();
+    let mut journal = Journal::open(database_path(&temp)).unwrap();
+    let mut workspace = test_workspace();
+
+    persist(
+        &mut journal,
+        &mut workspace,
+        DomainCommand::AddRole(test_role()),
+        30,
+    );
+    persist(
+        &mut journal,
+        &mut workspace,
+        DomainCommand::AddAgent(Agent::new(
+            AgentId::new(1),
+            name("Ada"),
+            Some(RoleId::new(1)),
+        )),
+        10,
+    );
+
+    let timeline = journal.timeline(workspace.id()).unwrap();
+
+    assert_eq!(timeline.len(), 2);
+    assert!(timeline[0].id().get() < timeline[1].id().get());
+    assert_eq!(timeline[0].occurred_at(), timestamp(30));
+    assert_eq!(timeline[1].occurred_at(), timestamp(10));
+    assert!(matches!(timeline[0].event(), DomainEvent::RoleAdded(_)));
+    assert!(matches!(timeline[1].event(), DomainEvent::AgentAdded(_)));
+    let tail = journal
+        .timeline_after(workspace.id(), Some(timeline[0].id()))
+        .unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0], timeline[1]);
+}
+
+#[test]
 fn restart_restores_the_same_domain_state() {
     let temp = TempDir::new().unwrap();
     let path = database_path(&temp);

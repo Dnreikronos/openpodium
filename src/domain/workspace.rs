@@ -355,6 +355,33 @@ impl Workspace {
                 DomainCommand::UpdateHandoff { before, after } => {
                     DomainEvent::HandoffChanged { before, after }
                 }
+                DomainCommand::CancelTask {
+                    task_id,
+                    before,
+                    after,
+                } => {
+                    let task = self
+                        .tasks
+                        .get(&task_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Task(task_id)))?;
+                    DomainEvent::TaskCancelled {
+                        task_id,
+                        from: task.state(),
+                        before,
+                        after,
+                    }
+                }
+                DomainCommand::ResumeTask { task_id, handoff } => {
+                    let task = self
+                        .tasks
+                        .get(&task_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Task(task_id)))?;
+                    DomainEvent::TaskResumed {
+                        task_id,
+                        from: task.state(),
+                        handoff,
+                    }
+                }
                 DomainCommand::AddNode(node) => DomainEvent::NodeAdded(node),
                 DomainCommand::AddAgentNode { agent, node } => {
                     DomainEvent::AgentNodeAdded { agent, node }
@@ -712,6 +739,90 @@ impl Workspace {
                 }
                 after.validate_successor(before)?;
                 self.handoffs.insert(after.id(), after.clone());
+            }
+            DomainEvent::TaskCancelled {
+                task_id,
+                from,
+                before,
+                after,
+            } => {
+                let task = self
+                    .tasks
+                    .get(task_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Task(*task_id)))?;
+                if task.state() != *from {
+                    return Err(DomainError::TaskStateConflict {
+                        task_id: *task_id,
+                        expected: *from,
+                        actual: task.state(),
+                    });
+                }
+                if !from.can_transition_to(TaskState::Cancelled) {
+                    return Err(DomainError::InvalidTaskTransition {
+                        task_id: *task_id,
+                        from: *from,
+                        to: TaskState::Cancelled,
+                    });
+                }
+                let current = self
+                    .handoffs
+                    .get(&before.id())
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Handoff(before.id())))?;
+                if current != before {
+                    return Err(DomainError::HandoffConflict(before.id()));
+                }
+                if before.payload() != &HandoffPayload::Task(*task_id)
+                    || after.payload() != &HandoffPayload::Task(*task_id)
+                {
+                    return Err(DomainError::TaskHandoffMismatch {
+                        handoff_id: before.id(),
+                        task_id: *task_id,
+                    });
+                }
+                after.validate_successor(before)?;
+                self.handoffs.insert(after.id(), after.clone());
+                self.tasks
+                    .get_mut(task_id)
+                    .expect("task existence was checked before mutation")
+                    .set_state(TaskState::Cancelled);
+            }
+            DomainEvent::TaskResumed {
+                task_id,
+                from,
+                handoff,
+            } => {
+                let task = self
+                    .tasks
+                    .get(task_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Task(*task_id)))?;
+                if task.state() != *from {
+                    return Err(DomainError::TaskStateConflict {
+                        task_id: *task_id,
+                        expected: *from,
+                        actual: task.state(),
+                    });
+                }
+                if !from.can_transition_to(TaskState::Running) {
+                    return Err(DomainError::InvalidTaskTransition {
+                        task_id: *task_id,
+                        from: *from,
+                        to: TaskState::Running,
+                    });
+                }
+                if handoff.payload() != &HandoffPayload::Task(*task_id)
+                    || task.assignee() != Some(handoff.recipient())
+                {
+                    return Err(DomainError::TaskHandoffMismatch {
+                        handoff_id: handoff.id(),
+                        task_id: *task_id,
+                    });
+                }
+                self.validate_new_handoff(handoff, None)?;
+                self.handoffs.insert(handoff.id(), handoff.clone());
+                self.tasks
+                    .get_mut(task_id)
+                    .expect("task existence was checked before mutation")
+                    .set_state(TaskState::Running);
             }
             DomainEvent::NodeAdded(node) => {
                 self.ensure_absent(EntityRef::Node(node.id()))?;

@@ -248,6 +248,161 @@ impl Orchestrator {
         }
     }
 
+    pub fn cancel_task(
+        &mut self,
+        workspaces: &mut WorkspaceManager,
+        workspace_id: WorkspaceId,
+        task_id: TaskId,
+        cancelled_at: Timestamp,
+    ) -> Result<(), OrchestrationError> {
+        let before = task_handoff(workspace(workspaces, workspace_id)?, task_id)?.clone();
+        let root_message_id = before
+            .message_id()
+            .expect("orchestrated task handoffs have message IDs")
+            .clone();
+        let cancellation_id = recovery_message_id("cancel", workspace_id, task_id, cancelled_at)?;
+        let mut after = before.clone();
+        after.cancel(
+            cancellation_id.clone(),
+            content("Cancelled by the user")?,
+            cancelled_at,
+        )?;
+        execute_task_cancellation(
+            workspaces,
+            workspace_id,
+            task_id,
+            before.clone(),
+            after,
+            cancelled_at,
+        )?;
+        self.remove_pending(workspace_id, &root_message_id);
+        self.enqueue(
+            workspaces,
+            workspace_id,
+            before.id(),
+            &cancellation_id,
+            cancelled_at,
+        )
+    }
+
+    pub fn resume_task(
+        &mut self,
+        workspaces: &mut WorkspaceManager,
+        workspace_id: WorkspaceId,
+        task_id: TaskId,
+        resumed_at: Timestamp,
+    ) -> Result<(), OrchestrationError> {
+        let state = task_state(workspaces, workspace_id, task_id)?;
+        if state != TaskState::Blocked {
+            return Err(invalid_task_state(task_id, state, "resume"));
+        }
+        let workspace = workspace(workspaces, workspace_id)?;
+        let previous = task_handoff(workspace, task_id)?.clone();
+        let (handoff_id, message_id) =
+            if previous.response().is_none() && previous.termination().is_none() {
+                let message_id = previous
+                    .message_id()
+                    .expect("orchestrated task handoffs have message IDs")
+                    .clone();
+                transition_task(
+                    workspaces,
+                    workspace_id,
+                    task_id,
+                    TaskState::Running,
+                    resumed_at,
+                )?;
+                (previous.id(), message_id)
+            } else {
+                delivery_mechanism(workspace, previous.recipient())?;
+                let handoff_id = next_handoff_id(workspace)?;
+                let message_id = recovery_message_id("resume", workspace_id, task_id, resumed_at)?;
+                let handoff = Handoff::tracked(
+                    handoff_id,
+                    message_id.clone(),
+                    previous.source(),
+                    previous.recipient(),
+                    HandoffPayload::Task(task_id),
+                    None,
+                    resumed_at,
+                    None,
+                )?;
+                workspaces.execute(
+                    workspace_id,
+                    DomainCommand::ResumeTask { task_id, handoff },
+                    resumed_at,
+                )?;
+                (handoff_id, message_id)
+            };
+        self.enqueue(
+            workspaces,
+            workspace_id,
+            handoff_id,
+            &message_id,
+            resumed_at,
+        )
+    }
+
+    pub fn retry_task(
+        &mut self,
+        workspaces: &mut WorkspaceManager,
+        workspace_id: WorkspaceId,
+        task_id: TaskId,
+        retried_at: Timestamp,
+    ) -> Result<TaskId, OrchestrationError> {
+        let workspace = workspace(workspaces, workspace_id)?;
+        let original_task = workspace
+            .task(task_id)
+            .ok_or_else(|| {
+                OrchestrationError::InvalidMessage(format!("task {task_id} is missing"))
+            })?
+            .clone();
+        if !matches!(
+            original_task.state(),
+            TaskState::Failed | TaskState::Cancelled
+        ) {
+            return Err(invalid_task_state(task_id, original_task.state(), "retry"));
+        }
+        let original_handoff = task_handoff(workspace, task_id)?.clone();
+        delivery_mechanism(workspace, original_handoff.recipient())?;
+        let retry_task_id = next_task_id(workspace)?;
+        let retry_handoff_id = next_handoff_id(workspace)?;
+        let retry_message_id =
+            recovery_message_id("retry", workspace_id, retry_task_id, retried_at)?;
+        let retry = Task::new(
+            retry_task_id,
+            original_task.title().clone(),
+            original_task.prompt().clone(),
+            original_task.assignee(),
+            Some(task_id),
+        );
+        let handoff = Handoff::tracked(
+            retry_handoff_id,
+            retry_message_id.clone(),
+            original_handoff.source(),
+            original_handoff.recipient(),
+            HandoffPayload::Task(retry_task_id),
+            None,
+            retried_at,
+            None,
+        )?;
+        workspaces.execute(
+            workspace_id,
+            DomainCommand::AddTaskHandoff {
+                task: retry,
+                handoff,
+            },
+            retried_at,
+        )?;
+        self.enqueue(
+            workspaces,
+            workspace_id,
+            retry_handoff_id,
+            &retry_message_id,
+            retried_at,
+        )?;
+        Ok(retry_task_id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn accept_handoff(
         &mut self,
@@ -459,6 +614,10 @@ impl Orchestrator {
             .ok_or_else(|| OrchestrationError::UnknownHandoff(root_id.to_string()))?;
         let before = handoff(workspaces, workspace_id, handoff_id)?.clone();
         validate_routed_participants(&before, accepted, false)?;
+        let task_id = match before.payload() {
+            HandoffPayload::Task(task_id) => Some(*task_id),
+            HandoffPayload::Question(_) => None,
+        };
         if before.termination().is_none() {
             let mut after = before.clone();
             after.cancel(
@@ -466,12 +625,20 @@ impl Orchestrator {
                 Content::new(reason.to_owned())?,
                 accepted_at,
             )?;
-            execute_handoff_update(workspaces, workspace_id, before, after, accepted_at)?;
-        }
-        if let HandoffPayload::Task(task_id) =
-            handoff(workspaces, workspace_id, handoff_id)?.payload()
-        {
-            transition_task_cancelled(workspaces, workspace_id, *task_id, accepted_at)?;
+            if let Some(task_id) = task_id {
+                execute_task_cancellation(
+                    workspaces,
+                    workspace_id,
+                    task_id,
+                    before,
+                    after,
+                    accepted_at,
+                )?;
+            } else {
+                execute_handoff_update(workspaces, workspace_id, before, after, accepted_at)?;
+            }
+        } else if let Some(task_id) = task_id {
+            transition_task_cancelled(workspaces, workspace_id, task_id, accepted_at)?;
         }
         self.remove_pending(workspace_id, &root_id);
         self.enqueue(
@@ -1003,6 +1170,26 @@ fn execute_handoff_update(
     Ok(())
 }
 
+fn execute_task_cancellation(
+    workspaces: &mut WorkspaceManager,
+    workspace_id: WorkspaceId,
+    task_id: TaskId,
+    before: Handoff,
+    after: Handoff,
+    at: Timestamp,
+) -> Result<(), OrchestrationError> {
+    workspaces.execute(
+        workspace_id,
+        DomainCommand::CancelTask {
+            task_id,
+            before,
+            after,
+        },
+        at,
+    )?;
+    Ok(())
+}
+
 fn workspace(
     workspaces: &WorkspaceManager,
     workspace_id: WorkspaceId,
@@ -1020,6 +1207,14 @@ fn handoff(
     workspace(workspaces, workspace_id)?
         .handoff(handoff_id)
         .ok_or_else(|| OrchestrationError::UnknownHandoff(handoff_id.to_string()))
+}
+
+fn task_handoff(workspace: &Workspace, task_id: TaskId) -> Result<&Handoff, OrchestrationError> {
+    workspace
+        .handoffs()
+        .filter(|handoff| handoff.payload() == &HandoffPayload::Task(task_id))
+        .max_by_key(|handoff| handoff.id())
+        .ok_or_else(|| OrchestrationError::InvalidMessage(format!("task {task_id} has no handoff")))
 }
 
 fn find_handoff<'a>(
@@ -1059,6 +1254,21 @@ fn next_handoff_id(workspace: &Workspace) -> Result<HandoffId, OrchestrationErro
 
 fn domain_message_id(message_id: &MessageId) -> Result<HandoffMessageId, OrchestrationError> {
     HandoffMessageId::new(message_id.as_str()).map_err(OrchestrationError::from)
+}
+
+fn recovery_message_id(
+    action: &str,
+    workspace_id: WorkspaceId,
+    task_id: TaskId,
+    at: Timestamp,
+) -> Result<HandoffMessageId, OrchestrationError> {
+    HandoffMessageId::new(format!(
+        "ui-{action}-{}-{}-{}",
+        workspace_id.get(),
+        task_id.get(),
+        at.as_unix_millis()
+    ))
+    .map_err(OrchestrationError::from)
 }
 
 fn checked_timestamp_add(
