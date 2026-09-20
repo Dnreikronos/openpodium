@@ -256,12 +256,28 @@ impl PortalElementRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PortalAction {
     Click(PortalElementRef),
+    ClickCoordinate {
+        observation_revision: u64,
+        x: u32,
+        y: u32,
+    },
     TypeText {
         element: PortalElementRef,
         text: String,
     },
+    TypeFocused {
+        observation_revision: u64,
+        text: String,
+    },
     Scroll {
         element: Option<PortalElementRef>,
+        delta_x: i32,
+        delta_y: i32,
+    },
+    ScrollCoordinate {
+        observation_revision: u64,
+        x: u32,
+        y: u32,
         delta_x: i32,
         delta_y: i32,
     },
@@ -634,13 +650,17 @@ impl PortalSession {
     }
 
     pub fn accepts(&self, element: &PortalElementRef) -> Result<(), PortalSessionError> {
+        self.accepts_revision(element.observation_revision)
+    }
+
+    pub fn accepts_revision(&self, observation_revision: u64) -> Result<(), PortalSessionError> {
         if !matches!(self.state, PortalSessionState::Connected) {
             return Err(PortalSessionError::Unavailable(self.state));
         }
-        if element.observation_revision != self.observation_revision {
+        if observation_revision != self.observation_revision {
             return Err(PortalSessionError::StaleObservation {
                 expected: self.observation_revision,
-                found: element.observation_revision,
+                found: observation_revision,
             });
         }
         Ok(())
@@ -850,6 +870,23 @@ mod tests {
         assert_eq!(session.observe().unwrap(), 2);
         assert_eq!(
             session.accepts(&reference),
+            Err(PortalSessionError::StaleObservation {
+                expected: 2,
+                found: 1
+            })
+        );
+    }
+
+    #[test]
+    fn session_rejects_stale_coordinate_actions() {
+        let mut session = PortalSession::new(3);
+        session.begin_connect().unwrap();
+        session.connected().unwrap();
+        assert_eq!(session.observe().unwrap(), 1);
+        assert!(session.accepts_revision(1).is_ok());
+        assert_eq!(session.observe().unwrap(), 2);
+        assert_eq!(
+            session.accepts_revision(1),
             Err(PortalSessionError::StaleObservation {
                 expected: 2,
                 found: 1

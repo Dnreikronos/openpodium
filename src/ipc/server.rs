@@ -142,6 +142,10 @@ impl PortalControl {
     ) -> Result<super::PortalObservationResult, PortalServiceError> {
         mutex_lock(&self.portals).observe_local(portal_id)
     }
+
+    pub fn execute(&self, portal_id: u64, action: PortalAction) -> Result<(), PortalServiceError> {
+        mutex_lock(&self.portals).execute_local(portal_id, action)
+    }
 }
 
 impl IpcService {

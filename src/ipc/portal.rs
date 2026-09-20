@@ -382,6 +382,18 @@ impl PortalDispatcher {
         observe_entry(portal_id, entry)
     }
 
+    pub fn execute_local(
+        &mut self,
+        portal_id: u64,
+        action: PortalAction,
+    ) -> Result<(), PortalServiceError> {
+        let entry = self.entry_mut(portal_id)?;
+        if entry.session.state() != PortalSessionState::Connected {
+            return Err(PortalServiceError::NotConnected(portal_id));
+        }
+        entry.backend.execute(&mut entry.session, &action)
+    }
+
     pub fn unregister(&mut self, portal_id: u64) -> Result<(), PortalServiceError> {
         self.close(portal_id)?;
         self.portals.remove(&portal_id);
@@ -769,18 +781,24 @@ fn wire_target_kind(kind: PortalTargetKind) -> WireTargetKind {
 fn action_target<'a>(action: &'a PortalAction, current_target: &'a str) -> &'a str {
     match action {
         PortalAction::Navigate(target) => target,
-        PortalAction::Click(_) | PortalAction::TypeText { .. } | PortalAction::Scroll { .. } => {
-            current_target
-        }
+        PortalAction::Click(_)
+        | PortalAction::ClickCoordinate { .. }
+        | PortalAction::TypeText { .. }
+        | PortalAction::TypeFocused { .. }
+        | PortalAction::Scroll { .. }
+        | PortalAction::ScrollCoordinate { .. } => current_target,
     }
 }
 
 fn operation_for(action: &PortalAction) -> PortalOperation {
     match action {
         PortalAction::Navigate(_) => PortalOperation::Navigate,
-        PortalAction::Click(_) | PortalAction::TypeText { .. } | PortalAction::Scroll { .. } => {
-            PortalOperation::Input
-        }
+        PortalAction::Click(_)
+        | PortalAction::ClickCoordinate { .. }
+        | PortalAction::TypeText { .. }
+        | PortalAction::TypeFocused { .. }
+        | PortalAction::Scroll { .. }
+        | PortalAction::ScrollCoordinate { .. } => PortalOperation::Input,
     }
 }
 
@@ -1050,6 +1068,22 @@ mod tests {
             dispatcher.result(4, 7, &action_id).unwrap().state,
             PortalActionState::Completed
         );
+    }
+
+    #[test]
+    fn local_coordinate_input_uses_the_connected_backend() {
+        let temp = TempDir::new().unwrap();
+        let (mut dispatcher, executed) = dispatcher(&temp);
+        let observation = dispatcher.observe_local(10).unwrap();
+        let action = PortalAction::ClickCoordinate {
+            observation_revision: observation.observation.revision,
+            x: 4,
+            y: 6,
+        };
+
+        dispatcher.execute_local(10, action.clone()).unwrap();
+
+        assert_eq!(executed.lock().unwrap().as_slice(), &[action]);
     }
 
     #[test]

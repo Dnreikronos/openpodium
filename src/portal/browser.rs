@@ -188,6 +188,10 @@ impl BrowserBackend {
             .map(|point| point[1].as_f64().unwrap_or_default())
             .sum::<f64>()
             / 4.0;
+        self.click_coordinate(x, y)
+    }
+
+    fn click_coordinate(&mut self, x: f64, y: f64) -> Result<(), BrowserError> {
         for event_type in ["mousePressed", "mouseReleased"] {
             self.command(
                 "Input.dispatchMouseEvent",
@@ -277,10 +281,31 @@ impl PortalBackend for BrowserBackend {
                 session.accepts(element).map_err(BrowserError::Session)?;
                 self.click(element)
             }
+            PortalAction::ClickCoordinate {
+                observation_revision,
+                x,
+                y,
+            } => {
+                session
+                    .accepts_revision(*observation_revision)
+                    .map_err(BrowserError::Session)?;
+                self.validate_coordinate(*x, *y)?;
+                self.click_coordinate(f64::from(*x), f64::from(*y))
+            }
             PortalAction::TypeText { element, text } => {
                 session.accepts(element).map_err(BrowserError::Session)?;
                 let backend_node_id = Self::element_backend_id(element)?;
                 self.command("DOM.focus", json!({"backendNodeId": backend_node_id}))?;
+                self.command("Input.insertText", json!({"text": text}))?;
+                Ok(())
+            }
+            PortalAction::TypeFocused {
+                observation_revision,
+                text,
+            } => {
+                session
+                    .accepts_revision(*observation_revision)
+                    .map_err(BrowserError::Session)?;
                 self.command("Input.insertText", json!({"text": text}))?;
                 Ok(())
             }
@@ -304,6 +329,29 @@ impl PortalBackend for BrowserBackend {
                 )?;
                 Ok(())
             }
+            PortalAction::ScrollCoordinate {
+                observation_revision,
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => {
+                session
+                    .accepts_revision(*observation_revision)
+                    .map_err(BrowserError::Session)?;
+                self.validate_coordinate(*x, *y)?;
+                self.command(
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": "mouseWheel",
+                        "x": x,
+                        "y": y,
+                        "deltaX": delta_x,
+                        "deltaY": delta_y
+                    }),
+                )?;
+                Ok(())
+            }
             PortalAction::Navigate(url) => {
                 self.command("Page.navigate", json!({"url": url}))?;
                 Ok(())
@@ -320,6 +368,13 @@ impl PortalBackend for BrowserBackend {
 }
 
 impl BrowserBackend {
+    fn validate_coordinate(&self, x: u32, y: u32) -> Result<(), BrowserError> {
+        if x >= self.viewport.width() || y >= self.viewport.height() {
+            return Err(BrowserError::CoordinateOutsideViewport { x, y });
+        }
+        Ok(())
+    }
+
     fn shutdown(&mut self) -> Result<(), BrowserError> {
         if let Some(mut socket) = self.socket.take() {
             let _ = socket.close(None);
@@ -393,6 +448,7 @@ pub enum BrowserError {
     Command { method: String, detail: String },
     Timeout(String),
     InvalidElementReference(String),
+    CoordinateOutsideViewport { x: u32, y: u32 },
     Session(PortalSessionError),
     Validation(super::PortalValidationError),
     StartupTimeout,
@@ -423,6 +479,12 @@ impl Display for BrowserError {
             Self::Timeout(method) => write!(formatter, "CDP {method} timed out"),
             Self::InvalidElementReference(id) => {
                 write!(formatter, "invalid portal element reference {id:?}")
+            }
+            Self::CoordinateOutsideViewport { x, y } => {
+                write!(
+                    formatter,
+                    "portal coordinate ({x}, {y}) is outside the viewport"
+                )
             }
             Self::Session(error) => Display::fmt(error, formatter),
             Self::Validation(error) => Display::fmt(error, formatter),
