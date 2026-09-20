@@ -8,7 +8,12 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 mod browser;
+mod policy;
 pub use browser::{BrowserBackend, BrowserError};
+pub use policy::{
+    DEFAULT_GRANT_LIFETIME_MS, PendingApproval, PolicyDecision, PolicyRequest, PolicyRule,
+    PortalGrant, PortalPolicy, PortalPolicyError,
+};
 
 const MAX_SELECTOR_CHARS: usize = 2_048;
 const MAX_ELEMENT_ID_CHARS: usize = 256;
@@ -116,7 +121,7 @@ impl PortalConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PortalOperation {
     Observe,
     Screenshot,
@@ -189,6 +194,20 @@ impl PortalCapabilities {
             PortalOperation::Download => &self.download,
             PortalOperation::Clipboard => &self.clipboard,
             PortalOperation::SensitivePermission => &self.sensitive_permission,
+        }
+    }
+
+    pub fn set_status(&mut self, operation: PortalOperation, status: CapabilityStatus) {
+        match operation {
+            PortalOperation::Observe => self.observe = status,
+            PortalOperation::Screenshot => self.screenshot = status,
+            PortalOperation::Navigate => self.navigate = status,
+            PortalOperation::Input => self.input = status,
+            PortalOperation::CoordinateFallback => self.coordinate_fallback = status,
+            PortalOperation::Upload => self.upload = status,
+            PortalOperation::Download => self.download = status,
+            PortalOperation::Clipboard => self.clipboard = status,
+            PortalOperation::SensitivePermission => self.sensitive_permission = status,
         }
     }
 }
