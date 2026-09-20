@@ -3,8 +3,8 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
 
 use super::{
-    ClientError, ConnectionConfig, ErrorCode, HandoffKind, IpcClient, MessageId, ProtocolCommand,
-    ProtocolResponse, ResponseStatus,
+    ClientError, ConnectionConfig, ErrorCode, HandoffKind, IpcClient, MessageId,
+    PortalActionRequest, ProtocolCommand, ProtocolResponse, ResponseStatus,
 };
 
 const EXIT_SUCCESS: u8 = 0;
@@ -15,7 +15,21 @@ const EXIT_AUTHENTICATION: u8 = 5;
 const EXIT_COMPATIBILITY: u8 = 6;
 const EXIT_REJECTED: u8 = 7;
 
-const USAGE: &str = "Usage:\n  openpodium ipc agents list\n  openpodium ipc task send --to <agent-id> --title <title> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]\n  openpodium ipc question send --to <agent-id> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]\n  openpodium ipc progress report --handoff <message-id> --body <text> [--message-id <id>]\n  openpodium ipc respond --handoff <message-id> --status <completed|failed|blocked> --body <text> [--message-id <id>]\n  openpodium ipc cancel --handoff <message-id> --reason <text> [--message-id <id>]";
+const USAGE: &str = "Usage:
+  openpodium ipc agents list
+  openpodium ipc portals list
+  openpodium ipc portal inspect --portal <portal-id>
+  openpodium ipc portal observe --portal <portal-id>
+  openpodium ipc portal click --portal <portal-id> --element <element-id> --revision <revision> [--action-id <id>]
+  openpodium ipc portal type --portal <portal-id> --element <element-id> --revision <revision> --text <text> [--action-id <id>]
+  openpodium ipc portal scroll --portal <portal-id> --revision <revision> --delta-x <pixels> --delta-y <pixels> [--element <element-id>] [--action-id <id>]
+  openpodium ipc portal navigate --portal <portal-id> --target <url> [--action-id <id>]
+  openpodium ipc portal result --action <action-id>
+  openpodium ipc task send --to <agent-id> --title <title> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]
+  openpodium ipc question send --to <agent-id> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]
+  openpodium ipc progress report --handoff <message-id> --body <text> [--message-id <id>]
+  openpodium ipc respond --handoff <message-id> --status <completed|failed|blocked> --body <text> [--message-id <id>]
+  openpodium ipc cancel --handoff <message-id> --reason <text> [--message-id <id>]";
 
 pub fn run_cli(arguments: impl IntoIterator<Item = String>) -> u8 {
     let mut stdout = io::stdout().lock();
@@ -97,6 +111,93 @@ fn parse_command(arguments: &[String]) -> Result<ProtocolCommand, CliUsageError>
     let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
     match words.as_slice() {
         ["ipc", "agents", "list"] => Ok(ProtocolCommand::ListAgents),
+        ["ipc", "portals", "list"] => Ok(ProtocolCommand::ListPortals),
+        ["ipc", "portal", "inspect", options @ ..] => {
+            let options = parse_options(options, &["--portal"])?;
+            Ok(ProtocolCommand::InspectPortal {
+                portal_id: portal_id(&options)?,
+            })
+        }
+        ["ipc", "portal", "observe", options @ ..] => {
+            let options = parse_options(options, &["--portal"])?;
+            Ok(ProtocolCommand::ObservePortal {
+                portal_id: portal_id(&options)?,
+            })
+        }
+        ["ipc", "portal", "click", options @ ..] => {
+            let options = parse_options(
+                options,
+                &["--portal", "--element", "--revision", "--action-id"],
+            )?;
+            Ok(ProtocolCommand::RequestPortalAction {
+                action_id: action_id(&options)?,
+                portal_id: portal_id(&options)?,
+                action: PortalActionRequest::Click {
+                    element_id: required(&options, "--element")?.to_owned(),
+                    observation_revision: positive_u64(&options, "--revision", "revision")?,
+                },
+            })
+        }
+        ["ipc", "portal", "type", options @ ..] => {
+            let options = parse_options(
+                options,
+                &[
+                    "--portal",
+                    "--element",
+                    "--revision",
+                    "--text",
+                    "--action-id",
+                ],
+            )?;
+            Ok(ProtocolCommand::RequestPortalAction {
+                action_id: action_id(&options)?,
+                portal_id: portal_id(&options)?,
+                action: PortalActionRequest::TypeText {
+                    element_id: required(&options, "--element")?.to_owned(),
+                    observation_revision: positive_u64(&options, "--revision", "revision")?,
+                    text: required(&options, "--text")?.to_owned(),
+                },
+            })
+        }
+        ["ipc", "portal", "scroll", options @ ..] => {
+            let options = parse_options(
+                options,
+                &[
+                    "--portal",
+                    "--element",
+                    "--revision",
+                    "--delta-x",
+                    "--delta-y",
+                    "--action-id",
+                ],
+            )?;
+            Ok(ProtocolCommand::RequestPortalAction {
+                action_id: action_id(&options)?,
+                portal_id: portal_id(&options)?,
+                action: PortalActionRequest::Scroll {
+                    element_id: options.get("--element").map(|value| (*value).to_owned()),
+                    observation_revision: positive_u64(&options, "--revision", "revision")?,
+                    delta_x: signed_i32(&options, "--delta-x")?,
+                    delta_y: signed_i32(&options, "--delta-y")?,
+                },
+            })
+        }
+        ["ipc", "portal", "navigate", options @ ..] => {
+            let options = parse_options(options, &["--portal", "--target", "--action-id"])?;
+            Ok(ProtocolCommand::RequestPortalAction {
+                action_id: action_id(&options)?,
+                portal_id: portal_id(&options)?,
+                action: PortalActionRequest::Navigate {
+                    target: required(&options, "--target")?.to_owned(),
+                },
+            })
+        }
+        ["ipc", "portal", "result", options @ ..] => {
+            let options = parse_options(options, &["--action"])?;
+            Ok(ProtocolCommand::GetPortalResult {
+                action_id: required_id(&options, "--action")?,
+            })
+        }
         ["ipc", "task", "send", options @ ..] => {
             let options = parse_options(
                 options,
@@ -218,6 +319,38 @@ fn message_id(options: &BTreeMap<&str, &str>, prefix: &str) -> Result<MessageId,
                 .map_err(|error| CliUsageError(format!("invalid --message-id: {error}")))
         },
     )
+}
+
+fn action_id(options: &BTreeMap<&str, &str>) -> Result<MessageId, CliUsageError> {
+    options.get("--action-id").map_or_else(
+        || random_id("portal-action").map_err(|error| CliUsageError(error.to_string())),
+        |value| {
+            MessageId::new((*value).to_owned())
+                .map_err(|error| CliUsageError(format!("invalid --action-id: {error}")))
+        },
+    )
+}
+
+fn portal_id(options: &BTreeMap<&str, &str>) -> Result<u64, CliUsageError> {
+    positive_u64(options, "--portal", "portal ID")
+}
+
+fn positive_u64(
+    options: &BTreeMap<&str, &str>,
+    name: &str,
+    label: &str,
+) -> Result<u64, CliUsageError> {
+    required(options, name)?
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| CliUsageError(format!("{name} must be a positive {label}")))
+}
+
+fn signed_i32(options: &BTreeMap<&str, &str>, name: &str) -> Result<i32, CliUsageError> {
+    required(options, name)?
+        .parse::<i32>()
+        .map_err(|_| CliUsageError(format!("{name} must be a 32-bit integer")))
 }
 
 fn recipient_id(options: &BTreeMap<&str, &str>) -> Result<u64, CliUsageError> {
@@ -409,6 +542,123 @@ mod tests {
     }
 
     #[test]
+    fn parses_portal_commands_with_semantic_references() {
+        assert_eq!(
+            parse_command(&arguments(&["ipc", "portals", "list"])).unwrap(),
+            ProtocolCommand::ListPortals
+        );
+        assert_eq!(
+            parse_command(&arguments(&["ipc", "portal", "inspect", "--portal", "9"])).unwrap(),
+            ProtocolCommand::InspectPortal { portal_id: 9 }
+        );
+        assert_eq!(
+            parse_command(&arguments(&["ipc", "portal", "observe", "--portal", "9"])).unwrap(),
+            ProtocolCommand::ObservePortal { portal_id: 9 }
+        );
+        assert_eq!(
+            parse_command(&arguments(&[
+                "ipc",
+                "portal",
+                "click",
+                "--portal",
+                "9",
+                "--element",
+                "submit",
+                "--revision",
+                "4",
+                "--action-id",
+                "action-1",
+            ]))
+            .unwrap(),
+            ProtocolCommand::RequestPortalAction {
+                action_id: MessageId::new("action-1").unwrap(),
+                portal_id: 9,
+                action: PortalActionRequest::Click {
+                    element_id: "submit".to_owned(),
+                    observation_revision: 4,
+                },
+            }
+        );
+        assert!(matches!(
+            parse_command(&arguments(&[
+                "ipc",
+                "portal",
+                "type",
+                "--portal",
+                "9",
+                "--element",
+                "search",
+                "--revision",
+                "4",
+                "--text",
+                "$(touch /tmp/unsafe)",
+                "--action-id",
+                "action-2",
+            ]))
+            .unwrap(),
+            ProtocolCommand::RequestPortalAction {
+                action: PortalActionRequest::TypeText { text, .. },
+                ..
+            } if text == "$(touch /tmp/unsafe)"
+        ));
+        assert_eq!(
+            parse_command(&arguments(&[
+                "ipc",
+                "portal",
+                "scroll",
+                "--portal",
+                "9",
+                "--revision",
+                "4",
+                "--delta-x",
+                "0",
+                "--delta-y",
+                "-120",
+                "--action-id",
+                "action-3",
+            ]))
+            .unwrap(),
+            ProtocolCommand::RequestPortalAction {
+                action_id: MessageId::new("action-3").unwrap(),
+                portal_id: 9,
+                action: PortalActionRequest::Scroll {
+                    element_id: None,
+                    observation_revision: 4,
+                    delta_x: 0,
+                    delta_y: -120,
+                },
+            }
+        );
+        assert!(matches!(
+            parse_command(&arguments(&[
+                "ipc",
+                "portal",
+                "navigate",
+                "--portal",
+                "9",
+                "--target",
+                "https://example.test",
+                "--action-id",
+                "action-4",
+            ]))
+            .unwrap(),
+            ProtocolCommand::RequestPortalAction {
+                action: PortalActionRequest::Navigate { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            parse_command(&arguments(&[
+                "ipc", "portal", "result", "--action", "action-4",
+            ]))
+            .unwrap(),
+            ProtocolCommand::GetPortalResult {
+                action_id: MessageId::new("action-4").unwrap(),
+            }
+        );
+    }
+
+    #[test]
     fn rejects_missing_duplicate_and_unknown_options() {
         let missing = parse_command(&arguments(&[
             "ipc", "task", "send", "--to", "8", "--title", "Review",
@@ -438,6 +688,13 @@ mod tests {
         assert_eq!(
             unknown.unwrap_err(),
             CliUsageError("unknown IPC command".to_owned())
+        );
+
+        let invalid_portal =
+            parse_command(&arguments(&["ipc", "portal", "observe", "--portal", "0"]));
+        assert_eq!(
+            invalid_portal.unwrap_err(),
+            CliUsageError("--portal must be a positive portal ID".to_owned())
         );
     }
 }
