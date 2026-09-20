@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use super::{Name, NodeTarget};
+use super::{Name, NodeTarget, PortalConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectPath(String);
@@ -107,6 +107,7 @@ pub enum CanvasNodeContent {
     Text {
         markdown: CanvasText,
     },
+    Portal(PortalConfig),
     Shape(Shape),
     Arrow(Arrow),
     Freehand(Freehand),
@@ -127,6 +128,7 @@ impl CanvasNodeContent {
             | Self::Artifact { .. }
             | Self::Diff { .. }
             | Self::Text { .. }
+            | Self::Portal(_)
             | Self::Shape(_)
             | Self::Arrow(_)
             | Self::Freehand(_) => None,

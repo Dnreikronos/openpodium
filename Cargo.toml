@@ -9,6 +9,7 @@ repository = "https://github.com/Dnreikronos/openpodium"
 
 [dependencies]
 alacritty_terminal = { version = "0.26.0", default-features = false }
+base64 = "0.22.1"
 blake3 = "1.8.2"
 dunce = "1.0.5"
 getrandom = "0.3.3"
@@ -16,11 +17,13 @@ iced = { version = "0.14.0", features = ["advanced", "canvas", "highlighter", "i
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 notify-rust = "=4.18.0"
 portable-pty = "0.9.0"
+quick-xml = "0.42.0"
 rusqlite = { version = "0.37.0", features = ["backup", "bundled"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 tempfile = "3.21.0"
 tokio = { version = "1.47.1", features = ["sync"] }
+tungstenite = "0.27.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.175"

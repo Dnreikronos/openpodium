@@ -12,9 +12,9 @@ use crate::domain::{
     DiffComparison, DomainCommand, DomainEvent, EnvironmentKind, EnvironmentProfile,
     EnvironmentProfileId, Freehand, Handoff, HandoffId, HandoffMessageId, HandoffPayload,
     HandoffProgress, HandoffResponse, HandoffResponseStatus, Name, Node, NodeGroup, NodeGroupId,
-    NodeId, NodeTarget, NormalizedPoint, ProjectPath, Role, RoleColor, RoleIcon, RoleId, Shape,
-    ShapeKind, SshEnvironment, StrokeWidth, Task, TaskId, TaskState, ThreadColor, Timestamp,
-    Workspace, WorkspaceId,
+    NodeId, NodeTarget, NormalizedPoint, PortalConfig, ProjectPath, Role, RoleColor, RoleIcon,
+    RoleId, Shape, ShapeKind, SshEnvironment, StrokeWidth, Task, TaskId, TaskState, ThreadColor,
+    Timestamp, Workspace, WorkspaceId,
 };
 
 use super::codec::{EVENT_FORMAT_VERSION, decode_event, decode_workspace};
@@ -543,6 +543,7 @@ fn context_and_drawing_nodes_survive_restart() {
             CanvasNodeContent::Text {
                 markdown: CanvasText::new("Decision").unwrap(),
             },
+            CanvasNodeContent::Portal(PortalConfig::browser("https://example.test").unwrap()),
             CanvasNodeContent::Shape(Shape::new(
                 ShapeKind::Ellipse,
                 CanvasColor::rgba(59, 130, 246, 48),

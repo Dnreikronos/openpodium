@@ -1,7 +1,7 @@
 # Authenticated local IPC and command-line client
 
-Status: Issue #12 base contract, extended by issue #13
-Updated: 2026-09-19
+Status: Issue #12 base contract, extended by issues #13 and #20
+Updated: 2026-09-20
 
 ## Boundary
 
@@ -63,7 +63,7 @@ A request envelope has this shape:
 ```json
 {
   "protocol": "openpodium-ipc",
-  "supported_versions": [2, 1],
+  "supported_versions": [3, 2, 1],
   "request_id": "request-7d3464d3",
   "credentials": {
     "workspace_id": 4,
@@ -87,6 +87,12 @@ Command payloads are:
 {"type":"report_handoff_progress","message_id":"progress-2","handoff_message_id":"question-1","body":"Checking the domain model."}
 {"type":"respond_to_handoff","message_id":"response-2","handoff_message_id":"question-1","status":"completed","body":"Use the workspace aggregate."}
 {"type":"cancel_handoff","message_id":"cancel-1","handoff_message_id":"question-1","reason":"Answered elsewhere."}
+{"type":"list_portals"}
+{"type":"inspect_portal","portal_id":10}
+{"type":"observe_portal","portal_id":10}
+{"type":"get_portal_frame","portal_id":10,"observation_revision":4,"offset":0,"max_bytes":524288}
+{"type":"request_portal_action","action_id":"action-1","portal_id":10,"action":{"type":"click","element_id":"submit","observation_revision":4}}
+{"type":"get_portal_result","action_id":"action-1"}
 ```
 
 `status` is `completed`, `failed`, or `blocked`. IDs contain 1–128 ASCII
@@ -103,8 +109,10 @@ then returns either an agent list or an acknowledgement:
 Failures omit `result` and return an error object. Stable protocol error codes are
 `malformed_request`, `frame_too_large`, `incompatible_protocol`, `unauthorized`,
 `invalid_request`, `agent_not_visible`, `idempotency_conflict`, and
-`service_unavailable`. Compatibility failures also include
-`supported_versions`.
+`service_unavailable`. Portal commands may also return `portal_unavailable`,
+`portal_policy_denied`, `portal_approval_required`,
+`stale_portal_observation`, or `unknown_portal_action`. Compatibility failures
+also include `supported_versions`.
 
 Version 1 supports:
 
@@ -123,6 +131,29 @@ It distinguishes tasks from questions, supports parent-message correlation and
 optional response deadlines, and generalizes progress and responses to either
 handoff kind. Version 1 remains available to existing clients; orchestration
 normalizes both versions into the same durable domain model.
+
+Version 3 adds authenticated portal listing, capability inspection,
+observations, bounded frame retrieval, semantic actions, and durable result retrieval. Portal visibility
+is checked against the authenticated workspace and the agent's current canvas
+attachment on every request. Input and navigation return an
+`awaiting_approval` receipt until the desktop user grants the exact
+agent/portal/target/operation request. The dispatcher rechecks that binding
+immediately before execution. Action intent is journaled before dispatch;
+in-flight work recovered after a crash is reported as `unknown` and is never
+replayed automatically. Approval state is not durable, so a request still
+awaiting approval at restart is recovered as `failed` rather than left for an
+approval that can no longer arrive. An approval that expires before the desktop
+user answers finalizes its action the same way.
+
+`get_portal_result` reads the journal, so an outcome stays retrievable after the
+portal it ran against is closed or unregistered. The journalled sender is what
+authorizes retrieval; to any other agent the action does not exist.
+
+`observe_portal` returns accessibility data and reports whether a frame exists.
+`get_portal_frame` retrieves that frame in authenticated, revision-bound chunks
+of at most 512 KiB. Each chunk includes the viewport, encoding, byte offset,
+total byte length, base64 payload, and completion flag. A newer observation
+invalidates retrieval by the prior revision.
 
 Each structured message has a client-generated opaque ID. The server validates
 IDs and text sizes before publishing. The first accepted `(workspace, message
@@ -147,6 +178,17 @@ arguments and exposes these non-interactive commands:
 
 ```text
 openpodium ipc agents list
+openpodium ipc portals list
+openpodium ipc portal inspect --portal <portal-id>
+openpodium ipc portal observe --portal <portal-id>
+openpodium ipc portal frame --portal <portal-id> --revision <revision> [--offset <bytes>] [--max-bytes <bytes>]
+openpodium ipc portal click --portal <portal-id> --element <element-id> --revision <revision> [--action-id <id>]
+openpodium ipc portal click-coordinate --portal <portal-id> --x <pixels> --y <pixels> --revision <revision> [--action-id <id>]
+openpodium ipc portal type --portal <portal-id> --element <element-id> --revision <revision> --text <text> [--action-id <id>]
+openpodium ipc portal scroll --portal <portal-id> --revision <revision> --delta-x <pixels> --delta-y <pixels> [--element <element-id>] [--action-id <id>]
+openpodium ipc portal scroll-coordinate --portal <portal-id> --x <pixels> --y <pixels> --revision <revision> --delta-x <pixels> --delta-y <pixels> [--action-id <id>]
+openpodium ipc portal navigate --portal <portal-id> --target <url> [--action-id <id>]
+openpodium ipc portal result --action <action-id>
 openpodium ipc task send --to <agent-id> --title <title> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]
 openpodium ipc question send --to <agent-id> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]
 openpodium ipc progress report --handoff <message-id> --body <text> [--message-id <id>]
@@ -167,7 +209,10 @@ codes. Temporary-directory service tests prove secret-file permissions where
 supported, invalid-token rejection, cross-workspace isolation, exact retry
 deduplication, conflicting ID reuse, concurrent clients, malformed input,
 oversized frames, durable restart recovery, unavailable recipient adapters, and
-clean shutdown. CLI tests exercise argument parsing and environment discovery
-without opening the desktop window. Adapter tests verify that supported local
-launches receive scoped connection metadata while remote and unsafe launches do
-not receive the endpoint or token.
+clean shutdown. Portal coverage proves workspace and attachment isolation,
+observation revision checks, approval-bound execution, duplicate action
+handling, durable result retrieval, and unknown crash outcomes. CLI tests
+exercise argument parsing and environment discovery without opening the desktop
+window. Adapter tests verify that supported local launches receive scoped
+connection metadata while remote and unsafe launches do not receive the
+endpoint or token.

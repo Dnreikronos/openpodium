@@ -62,6 +62,34 @@ fn binary_dispatches_ipc_commands_without_opening_the_desktop() {
 }
 
 #[test]
+fn binary_dispatches_version_three_portal_commands() {
+    let (_temp, service) = service();
+    let connection = service.connection_info(4, 7).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openpodium"))
+        .args(["ipc", "portals", "list"])
+        .env(AVAILABLE_ENV, "1")
+        .env(ENDPOINT_ENV, connection.endpoint().to_string())
+        .env(TOKEN_ENV, connection.token())
+        .env(VERSIONS_ENV, "3,2,1")
+        .env(WORKSPACE_ID_ENV, "4")
+        .env(AGENT_ID_ENV, "7")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: ProtocolResponse = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(matches!(
+        response.result,
+        Some(ProtocolResult::Portals { portals }) if portals.is_empty()
+    ));
+}
+
+#[test]
 fn binary_uses_distinct_exit_status_for_rejected_authentication() {
     let (_temp, service) = service();
     let connection = service.connection_info(4, 7).unwrap();

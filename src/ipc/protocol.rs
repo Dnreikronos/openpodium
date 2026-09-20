@@ -8,6 +8,9 @@ use super::{PROTOCOL_NAME, SUPPORTED_VERSIONS};
 const MAX_ID_CHARS: usize = 128;
 const MAX_TITLE_CHARS: usize = 255;
 const MAX_BODY_CHARS: usize = 32_768;
+const MAX_PORTAL_TARGET_CHARS: usize = 2_048;
+const MAX_PORTAL_ELEMENT_CHARS: usize = 256;
+pub(crate) const MAX_PORTAL_FRAME_CHUNK_BYTES: u32 = 512 * 1024;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -102,6 +105,27 @@ impl ProtocolRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProtocolCommand {
     ListAgents,
+    ListPortals,
+    InspectPortal {
+        portal_id: u64,
+    },
+    ObservePortal {
+        portal_id: u64,
+    },
+    GetPortalFrame {
+        portal_id: u64,
+        observation_revision: u64,
+        offset: u64,
+        max_bytes: u32,
+    },
+    RequestPortalAction {
+        action_id: MessageId,
+        portal_id: u64,
+        action: PortalActionRequest,
+    },
+    GetPortalResult {
+        action_id: MessageId,
+    },
     SendTask {
         message_id: MessageId,
         recipient_agent_id: u64,
@@ -153,6 +177,12 @@ impl ProtocolCommand {
     pub fn message_id(&self) -> Option<&MessageId> {
         match self {
             Self::ListAgents => None,
+            Self::ListPortals
+            | Self::InspectPortal { .. }
+            | Self::ObservePortal { .. }
+            | Self::GetPortalFrame { .. } => None,
+            Self::RequestPortalAction { action_id, .. } => Some(action_id),
+            Self::GetPortalResult { .. } => None,
             Self::SendTask { message_id, .. }
             | Self::SendHandoff { message_id, .. }
             | Self::ReportProgress { message_id, .. }
@@ -173,12 +203,56 @@ impl ProtocolCommand {
             | Self::ReportHandoffProgress { .. }
             | Self::RespondToHandoff { .. }
             | Self::CancelHandoff { .. } => 2,
+            Self::ListPortals
+            | Self::InspectPortal { .. }
+            | Self::ObservePortal { .. }
+            | Self::GetPortalFrame { .. }
+            | Self::RequestPortalAction { .. }
+            | Self::GetPortalResult { .. } => 3,
         }
+    }
+
+    pub const fn is_portal(&self) -> bool {
+        matches!(
+            self,
+            Self::ListPortals
+                | Self::InspectPortal { .. }
+                | Self::ObservePortal { .. }
+                | Self::GetPortalFrame { .. }
+                | Self::RequestPortalAction { .. }
+                | Self::GetPortalResult { .. }
+        )
     }
 
     pub fn validate(&self) -> Result<(), ProtocolValidationError> {
         match self {
             Self::ListAgents => Ok(()),
+            Self::ListPortals => Ok(()),
+            Self::InspectPortal { portal_id } | Self::ObservePortal { portal_id } => {
+                validate_portal_id(*portal_id)
+            }
+            Self::GetPortalFrame {
+                portal_id,
+                observation_revision,
+                max_bytes,
+                ..
+            } => {
+                validate_portal_id(*portal_id)?;
+                if *observation_revision == 0 {
+                    return Err(ProtocolValidationError::InvalidObservationRevision);
+                }
+                if *max_bytes == 0 || *max_bytes > MAX_PORTAL_FRAME_CHUNK_BYTES {
+                    return Err(ProtocolValidationError::InvalidPortalFrameChunk);
+                }
+                Ok(())
+            }
+            Self::RequestPortalAction {
+                portal_id, action, ..
+            } => {
+                validate_portal_id(*portal_id)?;
+                action.validate()
+            }
+            Self::GetPortalResult { .. } => Ok(()),
             Self::SendTask {
                 recipient_agent_id,
                 title,
@@ -230,6 +304,129 @@ impl ProtocolCommand {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PortalActionRequest {
+    Click {
+        element_id: String,
+        observation_revision: u64,
+    },
+    ClickCoordinate {
+        observation_revision: u64,
+        x: u32,
+        y: u32,
+    },
+    TypeText {
+        element_id: String,
+        observation_revision: u64,
+        text: String,
+    },
+    Scroll {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        element_id: Option<String>,
+        observation_revision: u64,
+        delta_x: i32,
+        delta_y: i32,
+    },
+    ScrollCoordinate {
+        observation_revision: u64,
+        x: u32,
+        y: u32,
+        delta_x: i32,
+        delta_y: i32,
+    },
+    Navigate {
+        target: String,
+    },
+}
+
+impl PortalActionRequest {
+    fn validate(&self) -> Result<(), ProtocolValidationError> {
+        match self {
+            Self::Click {
+                element_id,
+                observation_revision,
+            } => validate_element(element_id, *observation_revision),
+            Self::ClickCoordinate {
+                observation_revision,
+                ..
+            } => validate_observation_revision(*observation_revision),
+            Self::TypeText {
+                element_id,
+                observation_revision,
+                text,
+            } => {
+                validate_element(element_id, *observation_revision)?;
+                validate_text(text, MAX_BODY_CHARS, "portal input")
+            }
+            Self::Scroll {
+                element_id,
+                observation_revision,
+                delta_x,
+                delta_y,
+            } => {
+                if let Some(element_id) = element_id {
+                    validate_element(element_id, *observation_revision)?;
+                } else if *observation_revision == 0 {
+                    return Err(ProtocolValidationError::InvalidObservationRevision);
+                }
+                if *delta_x == 0 && *delta_y == 0 {
+                    return Err(ProtocolValidationError::EmptyPortalScroll);
+                }
+                Ok(())
+            }
+            Self::ScrollCoordinate {
+                observation_revision,
+                delta_x,
+                delta_y,
+                ..
+            } => {
+                validate_observation_revision(*observation_revision)?;
+                if *delta_x == 0 && *delta_y == 0 {
+                    return Err(ProtocolValidationError::EmptyPortalScroll);
+                }
+                Ok(())
+            }
+            Self::Navigate { target } => {
+                validate_text(target, MAX_PORTAL_TARGET_CHARS, "portal navigation target")
+            }
+        }
+    }
+}
+
+fn validate_portal_id(portal_id: u64) -> Result<(), ProtocolValidationError> {
+    portal_id_is_positive(portal_id)
+        .then_some(())
+        .ok_or(ProtocolValidationError::InvalidPortalId)
+}
+
+fn validate_observation_revision(revision: u64) -> Result<(), ProtocolValidationError> {
+    if revision == 0 {
+        Err(ProtocolValidationError::InvalidObservationRevision)
+    } else {
+        Ok(())
+    }
+}
+
+fn portal_id_is_positive(portal_id: u64) -> bool {
+    portal_id > 0
+}
+
+fn validate_element(
+    element_id: &str,
+    observation_revision: u64,
+) -> Result<(), ProtocolValidationError> {
+    validate_text(
+        element_id,
+        MAX_PORTAL_ELEMENT_CHARS,
+        "portal element reference",
+    )?;
+    if observation_revision == 0 {
+        return Err(ProtocolValidationError::InvalidObservationRevision);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +483,93 @@ pub struct AgentDescriptor {
     pub capabilities: AgentCapabilities,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortalTargetKind {
+    Browser,
+    Android,
+    Ios,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalDescriptor {
+    pub id: u64,
+    pub target_kind: PortalTargetKind,
+    pub target: String,
+    pub state: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalCapability {
+    pub operation: String,
+    pub status: PortalCapabilityStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PortalCapabilityStatus {
+    Supported,
+    Unavailable { reason: String },
+    PermissionRequired { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalObservation {
+    pub portal_id: u64,
+    pub revision: u64,
+    pub accessibility: Option<String>,
+    pub frame_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalFrameChunk {
+    pub portal_id: u64,
+    pub revision: u64,
+    pub width: u32,
+    pub height: u32,
+    pub encoding: String,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub data_base64: String,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortalActionState {
+    Queued,
+    AwaitingApproval,
+    Dispatched,
+    Completed,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PortalPolicyOutcome {
+    Allowed,
+    ApprovalRequired { approval_id: u64, reason: String },
+    Denied { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalActionReceipt {
+    pub action_id: MessageId,
+    pub portal_id: u64,
+    pub duplicate: bool,
+    pub state: PortalActionState,
+    pub policy: PortalPolicyOutcome,
+    pub created_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatched_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolResponse {
     pub protocol: String,
@@ -331,6 +615,17 @@ pub enum ProtocolResult {
     Agents {
         agents: Vec<AgentDescriptor>,
     },
+    Portals {
+        portals: Vec<PortalDescriptor>,
+    },
+    PortalCapabilities {
+        portal_id: u64,
+        descriptor: PortalDescriptor,
+        capabilities: Vec<PortalCapability>,
+    },
+    PortalObservation(PortalObservation),
+    PortalFrame(PortalFrameChunk),
+    PortalReceipt(PortalActionReceipt),
     Accepted {
         message_id: MessageId,
         duplicate: bool,
@@ -374,12 +669,21 @@ pub enum ErrorCode {
     AgentNotVisible,
     IdempotencyConflict,
     ServiceUnavailable,
+    PortalUnavailable,
+    PortalPolicyDenied,
+    PortalApprovalRequired,
+    StalePortalObservation,
+    UnknownPortalAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolValidationError {
     InvalidIdentifier,
     InvalidAgentId,
+    InvalidPortalId,
+    InvalidObservationRevision,
+    InvalidPortalFrameChunk,
+    EmptyPortalScroll,
     MissingTaskTitle,
     UnexpectedQuestionTitle,
     InvalidResponseTimeout,
@@ -402,6 +706,17 @@ impl Display for ProtocolValidationError {
                 "identifier must contain 1 to 128 ASCII letters, digits, dots, dashes, or underscores",
             ),
             Self::InvalidAgentId => formatter.write_str("agent ID must be greater than zero"),
+            Self::InvalidPortalId => formatter.write_str("portal ID must be greater than zero"),
+            Self::InvalidObservationRevision => {
+                formatter.write_str("portal observation revision must be greater than zero")
+            }
+            Self::InvalidPortalFrameChunk => write!(
+                formatter,
+                "portal frame chunk size must be between 1 and {MAX_PORTAL_FRAME_CHUNK_BYTES} bytes"
+            ),
+            Self::EmptyPortalScroll => {
+                formatter.write_str("portal scroll must move along at least one axis")
+            }
             Self::MissingTaskTitle => formatter.write_str("task handoffs require a title"),
             Self::UnexpectedQuestionTitle => {
                 formatter.write_str("question handoffs cannot include a title")
@@ -518,6 +833,72 @@ mod tests {
             missing_title.validate(),
             Err(ProtocolValidationError::MissingTaskTitle)
         );
+    }
+
+    #[test]
+    fn version_three_portal_actions_require_current_observations() {
+        let action = ProtocolCommand::RequestPortalAction {
+            action_id: MessageId::new("action-1").unwrap(),
+            portal_id: 9,
+            action: PortalActionRequest::Click {
+                element_id: "submit-button".to_owned(),
+                observation_revision: 4,
+            },
+        };
+        assert_eq!(action.minimum_version(), 3);
+        assert_eq!(action.validate(), Ok(()));
+
+        let frame = ProtocolCommand::GetPortalFrame {
+            portal_id: 9,
+            observation_revision: 4,
+            offset: 0,
+            max_bytes: MAX_PORTAL_FRAME_CHUNK_BYTES,
+        };
+        assert_eq!(frame.minimum_version(), 3);
+        assert_eq!(frame.validate(), Ok(()));
+        assert_eq!(
+            ProtocolCommand::GetPortalFrame {
+                portal_id: 9,
+                observation_revision: 4,
+                offset: 0,
+                max_bytes: MAX_PORTAL_FRAME_CHUNK_BYTES + 1,
+            }
+            .validate(),
+            Err(ProtocolValidationError::InvalidPortalFrameChunk)
+        );
+
+        let encoded = serde_json::to_string(&action).unwrap();
+        assert!(encoded.contains("request_portal_action"));
+        assert!(encoded.contains("click"));
+
+        let stale = ProtocolCommand::RequestPortalAction {
+            action_id: MessageId::new("action-2").unwrap(),
+            portal_id: 9,
+            action: PortalActionRequest::Click {
+                element_id: "submit-button".to_owned(),
+                observation_revision: 0,
+            },
+        };
+        assert_eq!(
+            stale.validate(),
+            Err(ProtocolValidationError::InvalidObservationRevision)
+        );
+    }
+
+    #[test]
+    fn portal_read_commands_have_no_message_id_for_agent_routing() {
+        for command in [
+            ProtocolCommand::ListPortals,
+            ProtocolCommand::InspectPortal { portal_id: 9 },
+            ProtocolCommand::ObservePortal { portal_id: 9 },
+            ProtocolCommand::GetPortalResult {
+                action_id: MessageId::new("action-1").unwrap(),
+            },
+        ] {
+            assert!(command.is_portal());
+            assert_eq!(command.message_id(), None);
+            assert_eq!(command.minimum_version(), 3);
+        }
     }
 
     #[test]

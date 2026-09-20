@@ -1,9 +1,17 @@
-use std::sync::Barrier;
+use std::convert::Infallible;
+use std::sync::{Arc, Barrier, Mutex};
 
 use tempfile::TempDir;
 
 use super::*;
-use crate::ipc::{HandoffKind, LEGACY_PROTOCOL_VERSION, ResponseStatus};
+use crate::ipc::{
+    HandoffKind, LEGACY_PROTOCOL_VERSION, PortalActionRequest, PortalActionState,
+    PortalPolicyOutcome, PortalScope, ResponseStatus,
+};
+use crate::portal::{
+    PortalAction as CoreAction, PortalBackend, PortalCapabilities, PortalConfig, PortalFrame,
+    PortalFrameEncoding, PortalObservation as CoreObservation, PortalSession, PortalViewport,
+};
 
 fn registration(id: u64, name: &str) -> AgentRegistration {
     AgentRegistration {
@@ -49,6 +57,73 @@ fn service() -> (TempDir, IpcService) {
     (temp, service)
 }
 
+#[derive(Clone, Default)]
+struct RecordingPortalBackend {
+    executed: Arc<Mutex<Vec<CoreAction>>>,
+}
+
+impl PortalBackend for RecordingPortalBackend {
+    type Error = Infallible;
+
+    fn connect(
+        &mut self,
+        _config: &PortalConfig,
+        session: &mut PortalSession,
+    ) -> Result<(), Self::Error> {
+        session.begin_connect().unwrap();
+        session.connected().unwrap();
+        Ok(())
+    }
+
+    fn observe(&mut self, session: &mut PortalSession) -> Result<CoreObservation, Self::Error> {
+        let revision = session.observe().unwrap();
+        let observation = CoreObservation::new(revision, PortalCapabilities::browser_defaults())
+            .with_frame(
+                PortalFrame::new(
+                    revision,
+                    PortalViewport::new(2, 2).unwrap(),
+                    PortalFrameEncoding::Png,
+                    vec![1, 2, 3, 4],
+                )
+                .unwrap(),
+            );
+        session.record_observation(observation.clone()).unwrap();
+        Ok(observation)
+    }
+
+    fn execute(
+        &mut self,
+        _session: &mut PortalSession,
+        action: &CoreAction,
+    ) -> Result<(), Self::Error> {
+        self.executed.lock().unwrap().push(action.clone());
+        Ok(())
+    }
+
+    fn close(&mut self, session: &mut PortalSession) -> Result<(), Self::Error> {
+        session.begin_close().unwrap();
+        session.closed();
+        Ok(())
+    }
+}
+
+fn connect_test_portal(service: &IpcService) -> Arc<Mutex<Vec<CoreAction>>> {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    service
+        .register_portal(
+            10,
+            PortalScope::new(1, None, 99).unwrap(),
+            PortalConfig::browser("https://example.test").unwrap(),
+            RecordingPortalBackend {
+                executed: Arc::clone(&executed),
+            },
+        )
+        .unwrap();
+    service.attach_portal_agent(10, 1).unwrap();
+    service.connect_portal(10).unwrap();
+    executed
+}
+
 #[test]
 fn agent_listing_is_scoped_to_the_authenticated_workspace() {
     let (_temp, service) = service();
@@ -63,6 +138,156 @@ fn agent_listing_is_scoped_to_the_authenticated_workspace() {
     assert_eq!(agents.len(), 2);
     assert!(agents.iter().all(|agent| agent.id != 3));
     assert!(agents.iter().any(|agent| agent.id == 1 && agent.is_self));
+}
+
+#[test]
+fn portal_listing_is_scoped_to_the_authenticated_agent() {
+    let (_temp, service) = service();
+    let response = round_trip(
+        service.endpoint(),
+        &request(
+            &service,
+            1,
+            1,
+            "portal-list-1",
+            ProtocolCommand::ListPortals,
+        ),
+    );
+
+    assert_eq!(response.version, Some(PROTOCOL_VERSION));
+    assert!(matches!(
+        response.result,
+        Some(ProtocolResult::Portals { portals }) if portals.is_empty()
+    ));
+    assert!(service.try_recv().is_none());
+}
+
+#[test]
+fn connected_portals_reject_other_agents_and_workspaces() {
+    let (_temp, service) = service();
+    connect_test_portal(&service);
+
+    let visible = round_trip(
+        service.endpoint(),
+        &request(
+            &service,
+            1,
+            1,
+            "portal-list-visible",
+            ProtocolCommand::ListPortals,
+        ),
+    );
+    assert!(matches!(
+        visible.result,
+        Some(ProtocolResult::Portals { portals }) if portals.len() == 1
+    ));
+
+    for (workspace_id, agent_id, request_id) in [
+        (1, 2, "portal-inspect-unattached"),
+        (2, 3, "portal-inspect-workspace"),
+    ] {
+        let response = round_trip(
+            service.endpoint(),
+            &request(
+                &service,
+                workspace_id,
+                agent_id,
+                request_id,
+                ProtocolCommand::InspectPortal { portal_id: 10 },
+            ),
+        );
+        assert_eq!(response.error.unwrap().code, ErrorCode::PortalUnavailable);
+    }
+}
+
+#[test]
+fn portal_action_flows_from_observation_through_approval_to_receipt() {
+    let (_temp, service) = service();
+    let executed = connect_test_portal(&service);
+
+    let observed = round_trip(
+        service.endpoint(),
+        &request(
+            &service,
+            1,
+            1,
+            "portal-observe",
+            ProtocolCommand::ObservePortal { portal_id: 10 },
+        ),
+    );
+    let Some(ProtocolResult::PortalObservation(observation)) = observed.result else {
+        panic!("expected a portal observation: {observed:?}");
+    };
+
+    let frame = round_trip(
+        service.endpoint(),
+        &request(
+            &service,
+            1,
+            1,
+            "portal-frame",
+            ProtocolCommand::GetPortalFrame {
+                portal_id: 10,
+                observation_revision: observation.revision,
+                offset: 0,
+                max_bytes: 2,
+            },
+        ),
+    );
+    assert!(matches!(
+        frame.result,
+        Some(ProtocolResult::PortalFrame(chunk))
+            if chunk.data_base64 == "AQI=" && !chunk.complete && chunk.total_bytes == 4
+    ));
+
+    let action_id = MessageId::new("portal-action-1").unwrap();
+    let requested = round_trip(
+        service.endpoint(),
+        &request(
+            &service,
+            1,
+            1,
+            "portal-action-request",
+            ProtocolCommand::RequestPortalAction {
+                action_id: action_id.clone(),
+                portal_id: 10,
+                action: PortalActionRequest::Click {
+                    element_id: "submit".to_owned(),
+                    observation_revision: observation.revision,
+                },
+            },
+        ),
+    );
+    let Some(ProtocolResult::PortalReceipt(receipt)) = requested.result else {
+        panic!("expected an approval receipt: {requested:?}");
+    };
+    assert_eq!(receipt.state, PortalActionState::AwaitingApproval);
+    let approval_id = match receipt.policy {
+        PortalPolicyOutcome::ApprovalRequired { approval_id, .. } => approval_id,
+        policy => panic!("unexpected portal policy: {policy:?}"),
+    };
+
+    let approved = service
+        .approve_portal_action(1, &action_id, approval_id, 1_000)
+        .unwrap();
+    assert_eq!(approved.state, PortalActionState::Completed);
+    assert_eq!(executed.lock().unwrap().len(), 1);
+
+    let fetched = round_trip(
+        service.endpoint(),
+        &request(
+            &service,
+            1,
+            1,
+            "portal-result",
+            ProtocolCommand::GetPortalResult { action_id },
+        ),
+    );
+    assert!(matches!(
+        fetched.result,
+        Some(ProtocolResult::PortalReceipt(receipt))
+            if receipt.state == PortalActionState::Completed
+    ));
 }
 
 #[test]
@@ -262,7 +487,7 @@ fn version_two_questions_progress_responses_and_cancellation_are_routed() {
         service.endpoint(),
         &request(&service, 1, 1, "request-1", question),
     );
-    assert_eq!(sent.version, Some(2));
+    assert_eq!(sent.version, Some(PROTOCOL_VERSION));
 
     for (request_id, command) in [
         (

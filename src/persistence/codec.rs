@@ -9,15 +9,16 @@ use crate::domain::{
     DomainEvent, EnvironmentKind, EnvironmentProfile, EnvironmentProfileId, Freehand, Handoff,
     HandoffId, HandoffMessageId, HandoffPayload, HandoffProgress, HandoffResponse,
     HandoffResponseStatus, HandoffTermination, Name, Node, NodeGroup, NodeGroupId, NodeId,
-    NodeTarget, NormalizedPoint, ProjectPath, Role, RoleColor, RoleIcon, RoleId, Shape, ShapeKind,
-    SshEnvironment, StrokeWidth, Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace,
-    WorkspaceDirectory, WorkspaceIcon, WorkspaceId, WorkspaceSettings,
+    NodeTarget, NormalizedPoint, PortalConfig, PortalPresentation, PortalTarget, PortalTargetKind,
+    ProjectPath, Role, RoleColor, RoleIcon, RoleId, Shape, ShapeKind, SshEnvironment, StrokeWidth,
+    Task, TaskId, TaskState, ThreadColor, Timestamp, Workspace, WorkspaceDirectory, WorkspaceIcon,
+    WorkspaceId, WorkspaceSettings,
 };
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 10;
-pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 9;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 11;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 10;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
     serde_json::to_vec(&StoredEvent::from(event)).map_err(|source| {
@@ -102,6 +103,13 @@ pub(crate) fn decode_event(
             "domain event",
             sequence,
             "canvas context and drawing nodes require event format version 10",
+        ));
+    }
+    if format_version < 11 && stored.requires_version_eleven() {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "portal canvas nodes require event format version 11",
         ));
     }
     stored
@@ -492,6 +500,18 @@ impl StoredEvent {
         }
     }
 
+    fn requires_version_eleven(&self) -> bool {
+        match self {
+            Self::NodeAdded { node } | Self::AgentNodeAdded { node, .. } => {
+                node.has_portal_content()
+            }
+            Self::CanvasReplaced { before, after } => {
+                before.has_portal_content() || after.has_portal_content()
+            }
+            _ => false,
+        }
+    }
+
     fn into_domain(self) -> Result<DomainEvent, String> {
         match self {
             Self::FloorsChanged { before, after } => Ok(DomainEvent::FloorsChanged {
@@ -802,6 +822,9 @@ impl StoredWorkspace {
             return Err(
                 "canvas context and drawing nodes require snapshot format version 9".to_owned(),
             );
+        }
+        if format_version < 10 && self.nodes.iter().any(NodeV1::has_portal_content) {
+            return Err("portal canvas nodes require snapshot format version 10".to_owned());
         }
 
         let settings = StoredWorkspaceSettings {
@@ -1994,6 +2017,12 @@ impl From<&Node> for NodeV1 {
 }
 
 impl NodeV1 {
+    fn has_portal_content(&self) -> bool {
+        self.content
+            .as_ref()
+            .is_some_and(CanvasNodeContentV1::is_portal)
+    }
+
     fn into_domain(self) -> Result<Node, String> {
         let content = match (self.target, self.content) {
             (Some(target), None) => CanvasNodeContent::Reference(target.into()),
@@ -2133,6 +2162,10 @@ impl CanvasLayoutV1 {
         self.nodes.iter().any(|node| node.content.is_some())
     }
 
+    fn has_portal_content(&self) -> bool {
+        self.nodes.iter().any(NodeV1::has_portal_content)
+    }
+
     pub(super) fn into_domain(self) -> Result<CanvasLayout, String> {
         Ok(CanvasLayout::new(
             self.nodes
@@ -2170,6 +2203,12 @@ enum CanvasNodeContentV1 {
     },
     Text {
         markdown: String,
+    },
+    Portal {
+        kind: PortalTargetKindV1,
+        selector: String,
+        preserve_aspect_ratio: bool,
+        frame_rate_limit: u16,
     },
     Shape {
         kind: ShapeKindV1,
@@ -2214,6 +2253,12 @@ impl From<&CanvasNodeContent> for CanvasNodeContentV1 {
             CanvasNodeContent::Text { markdown } => Self::Text {
                 markdown: markdown.as_str().to_owned(),
             },
+            CanvasNodeContent::Portal(config) => Self::Portal {
+                kind: config.target().kind().into(),
+                selector: config.target().selector().to_owned(),
+                preserve_aspect_ratio: config.presentation().preserve_aspect_ratio(),
+                frame_rate_limit: config.presentation().frame_rate_limit(),
+            },
             CanvasNodeContent::Shape(shape) => Self::Shape {
                 kind: shape.kind().into(),
                 fill: shape.fill().channels(),
@@ -2237,6 +2282,10 @@ impl From<&CanvasNodeContent> for CanvasNodeContentV1 {
 }
 
 impl CanvasNodeContentV1 {
+    fn is_portal(&self) -> bool {
+        matches!(self, Self::Portal { .. })
+    }
+
     fn into_domain(self) -> Result<CanvasNodeContent, String> {
         match self {
             Self::Note { path, title } => Ok(CanvasNodeContent::Note {
@@ -2256,6 +2305,23 @@ impl CanvasNodeContentV1 {
             Self::Text { markdown } => Ok(CanvasNodeContent::Text {
                 markdown: CanvasText::new(markdown).map_err(|error| error.to_string())?,
             }),
+            Self::Portal {
+                kind,
+                selector,
+                preserve_aspect_ratio,
+                frame_rate_limit,
+            } => {
+                let target =
+                    PortalTarget::new(kind.into(), selector).map_err(|error| error.to_string())?;
+                let presentation = PortalPresentation::new(preserve_aspect_ratio, frame_rate_limit)
+                    .ok_or_else(|| {
+                        "portal frame rate limit must be greater than zero".to_owned()
+                    })?;
+                Ok(CanvasNodeContent::Portal(PortalConfig::new(
+                    target,
+                    presentation,
+                )))
+            }
             Self::Shape {
                 kind,
                 fill,
@@ -2298,6 +2364,34 @@ impl CanvasNodeContentV1 {
                 )
                 .map_err(|error| error.to_string())?,
             )),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PortalTargetKindV1 {
+    Browser,
+    Android,
+    Ios,
+}
+
+impl From<PortalTargetKind> for PortalTargetKindV1 {
+    fn from(kind: PortalTargetKind) -> Self {
+        match kind {
+            PortalTargetKind::Browser => Self::Browser,
+            PortalTargetKind::Android => Self::Android,
+            PortalTargetKind::Ios => Self::Ios,
+        }
+    }
+}
+
+impl From<PortalTargetKindV1> for PortalTargetKind {
+    fn from(kind: PortalTargetKindV1) -> Self {
+        match kind {
+            PortalTargetKindV1::Browser => Self::Browser,
+            PortalTargetKindV1::Android => Self::Android,
+            PortalTargetKindV1::Ios => Self::Ios,
         }
     }
 }
