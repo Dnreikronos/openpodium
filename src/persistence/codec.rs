@@ -15,8 +15,8 @@ use crate::domain::{
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 8;
-pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 7;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 9;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 8;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
     serde_json::to_vec(&StoredEvent::from(event)).map_err(|source| {
@@ -89,6 +89,13 @@ pub(crate) fn decode_event(
         ));
     }
 
+    if format_version < 9 && matches!(stored, StoredEvent::FloorsChanged { .. }) {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "floors require event format version 9",
+        ));
+    }
     stored
         .into_domain()
         .map_err(|detail| PersistenceError::invalid_record("domain event", sequence, detail))
@@ -132,6 +139,10 @@ pub(crate) fn checksum(parts: &[&[u8]]) -> [u8; 32] {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum StoredEvent {
+    FloorsChanged {
+        before: FloorsV1,
+        after: FloorsV1,
+    },
     WorkspaceSettingsChanged {
         from: StoredWorkspaceSettings,
         to: StoredWorkspaceSettings,
@@ -251,6 +262,10 @@ enum StoredEvent {
 impl From<&DomainEvent> for StoredEvent {
     fn from(event: &DomainEvent) -> Self {
         match event {
+            DomainEvent::FloorsChanged { before, after } => Self::FloorsChanged {
+                before: before.into(),
+                after: after.into(),
+            },
             DomainEvent::WorkspaceSettingsChanged { from, to } => Self::WorkspaceSettingsChanged {
                 from: StoredWorkspaceSettings::from(from),
                 to: StoredWorkspaceSettings::from(to),
@@ -461,6 +476,10 @@ impl StoredEvent {
 
     fn into_domain(self) -> Result<DomainEvent, String> {
         match self {
+            Self::FloorsChanged { before, after } => Ok(DomainEvent::FloorsChanged {
+                before: before.into_domain()?,
+                after: after.into_domain()?,
+            }),
             Self::WorkspaceSettingsChanged { from, to } => {
                 Ok(DomainEvent::WorkspaceSettingsChanged {
                     from: from.into_domain()?,
@@ -623,6 +642,8 @@ impl StoredEvent {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredWorkspace {
+    #[serde(default)]
+    floors: FloorsV1,
     id: u64,
     name: String,
     #[serde(default)]
@@ -653,6 +674,7 @@ struct StoredWorkspace {
 impl From<&Workspace> for StoredWorkspace {
     fn from(workspace: &Workspace) -> Self {
         Self {
+            floors: workspace.floors().into(),
             id: workspace.id().get(),
             name: workspace.name().to_owned(),
             icon: workspace
@@ -902,6 +924,20 @@ impl StoredWorkspace {
             }
         }
 
+        let floors = self.floors.into_domain()?;
+        if floors != crate::domain::Floors::default() {
+            if format_version < 8 {
+                return Err("floors require snapshot format version 8".to_owned());
+            }
+            let before = workspace.floors().clone();
+            apply_snapshot_command(
+                &mut workspace,
+                DomainCommand::ReplaceFloors {
+                    before,
+                    after: floors,
+                },
+            )?;
+        }
         Ok(workspace)
     }
 }
@@ -2210,5 +2246,133 @@ impl From<TaskStateV1> for TaskState {
             TaskStateV1::Failed => Self::Failed,
             TaskStateV1::Cancelled => Self::Cancelled,
         }
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FloorsV1 {
+    entries: Vec<(u64, FloorV1)>,
+    node_floors: Vec<(u64, u64)>,
+    active: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FloorV1 {
+    name: String,
+    directory: String,
+    repository: String,
+    branch: Option<String>,
+    base_revision: String,
+    base_branch: Option<String>,
+    managed: bool,
+    #[serde(default)]
+    ownership_token: Option<String>,
+    owner: Option<FloorOwnerV1>,
+    dirty: bool,
+    lifecycle: FloorLifecycleV1,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FloorOwnerV1 {
+    Agent(u64),
+    Task(u64),
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FloorLifecycleV1 {
+    Available,
+    Missing,
+    Removed,
+}
+
+impl From<&crate::domain::Floors> for FloorsV1 {
+    fn from(floors: &crate::domain::Floors) -> Self {
+        use crate::domain::{FloorLifecycle, FloorOwner};
+        Self {
+            active: floors.active,
+            node_floors: floors
+                .node_floors
+                .iter()
+                .map(|(n, f)| (n.get(), *f))
+                .collect(),
+            entries: floors
+                .entries
+                .iter()
+                .map(|(id, f)| {
+                    (
+                        *id,
+                        FloorV1 {
+                            name: f.name.as_str().to_owned(),
+                            directory: f.directory.as_str().to_owned(),
+                            repository: f.repository.as_str().to_owned(),
+                            branch: f.branch.clone(),
+                            base_revision: f.base_revision.clone(),
+                            base_branch: f.base_branch.clone(),
+                            managed: f.managed,
+                            ownership_token: f.ownership_token.clone(),
+                            dirty: f.dirty,
+                            owner: f.owner.map(|o| match o {
+                                FloorOwner::Agent(id) => FloorOwnerV1::Agent(id.get()),
+                                FloorOwner::Task(id) => FloorOwnerV1::Task(id.get()),
+                            }),
+                            lifecycle: match f.lifecycle {
+                                FloorLifecycle::Available => FloorLifecycleV1::Available,
+                                FloorLifecycle::Missing => FloorLifecycleV1::Missing,
+                                FloorLifecycle::Removed => FloorLifecycleV1::Removed,
+                            },
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl FloorsV1 {
+    fn into_domain(self) -> Result<crate::domain::Floors, String> {
+        use crate::domain::{Floor, FloorLifecycle, FloorOwner, Floors};
+        let entries = self
+            .entries
+            .into_iter()
+            .map(|(id, f)| {
+                Ok((
+                    id,
+                    Floor {
+                        name: Name::new(f.name).map_err(|e| e.to_string())?,
+                        directory: WorkspaceDirectory::new(f.directory)
+                            .map_err(|e| e.to_string())?,
+                        repository: WorkspaceDirectory::new(f.repository)
+                            .map_err(|e| e.to_string())?,
+                        branch: f.branch,
+                        base_revision: f.base_revision,
+                        base_branch: f.base_branch,
+                        managed: f.managed,
+                        ownership_token: f.ownership_token,
+                        dirty: f.dirty,
+                        owner: f.owner.map(|o| match o {
+                            FloorOwnerV1::Agent(id) => FloorOwner::Agent(AgentId::new(id)),
+                            FloorOwnerV1::Task(id) => FloorOwner::Task(TaskId::new(id)),
+                        }),
+                        lifecycle: match f.lifecycle {
+                            FloorLifecycleV1::Available => FloorLifecycle::Available,
+                            FloorLifecycleV1::Missing => FloorLifecycle::Missing,
+                            FloorLifecycleV1::Removed => FloorLifecycle::Removed,
+                        },
+                    },
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(Floors {
+            entries,
+            node_floors: self
+                .node_floors
+                .into_iter()
+                .map(|(n, f)| (NodeId::new(n), f))
+                .collect(),
+            active: self.active,
+        })
     }
 }

@@ -11,6 +11,10 @@ use super::{
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainCommand {
+    ReplaceFloors {
+        before: super::Floors,
+        after: super::Floors,
+    },
     UpdateWorkspaceSettings(WorkspaceSettings),
     AddEnvironmentProfile(EnvironmentProfile),
     UpdateEnvironmentProfile(EnvironmentProfile),
@@ -83,6 +87,10 @@ pub enum DomainCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainEvent {
+    FloorsChanged {
+        before: super::Floors,
+        after: super::Floors,
+    },
     WorkspaceSettingsChanged {
         from: WorkspaceSettings,
         to: WorkspaceSettings,
@@ -264,6 +272,7 @@ impl From<NodeTarget> for EntityRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
+    FloorConflict,
     UnchangedWorkspaceSettings,
     WorkspaceSettingsConflict,
     UnchangedEnvironmentProfile,
@@ -387,6 +396,7 @@ pub enum DomainError {
 impl Display for DomainError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FloorConflict => formatter.write_str("floor state conflicts with the workspace"),
             Self::UnchangedWorkspaceSettings => {
                 formatter.write_str("workspace settings are unchanged")
             }

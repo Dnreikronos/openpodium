@@ -11,7 +11,9 @@ use crate::domain::{
 use crate::persistence::Journal;
 
 mod error;
+mod floors;
 pub use error::WorkspaceError;
+pub use floors::{FloorJob, FloorOperation, FloorResult};
 
 pub struct WorkspaceManager {
     journal: Journal,
