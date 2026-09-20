@@ -177,11 +177,24 @@ impl PortalPolicy {
     }
 
     pub fn set_rule(&mut self, operation: PortalOperation, rule: PolicyRule) {
+        if matches!(rule, PolicyRule::Deny { .. }) {
+            self.grants.retain(|_, grant| grant.operation != operation);
+        }
         self.rules.insert(operation, rule);
     }
 
     pub fn evaluate(&mut self, request: &PolicyRequest, now_ms: u64) -> PolicyDecision {
         self.grants.retain(|_, grant| grant.expires_at_ms > now_ms);
+        if let Some(CapabilityStatus::Unavailable { reason }) = capability_status(request) {
+            return PolicyDecision::Denied {
+                reason: reason.clone(),
+            };
+        }
+        if let Some(PolicyRule::Deny { reason }) = self.rules.get(&request.operation) {
+            return PolicyDecision::Denied {
+                reason: reason.clone(),
+            };
+        }
         if let Some(grant) = self
             .grants
             .values()
@@ -253,6 +266,13 @@ impl PortalPolicy {
         self.grants.remove(&grant_id).is_some()
     }
 
+    pub fn reject(&mut self, approval_id: u64) -> Result<(), PortalPolicyError> {
+        self.pending
+            .remove(&approval_id)
+            .map(|_| ())
+            .ok_or(PortalPolicyError::UnknownApproval(approval_id))
+    }
+
     pub fn revoke_agent(&mut self, agent_id: u64) {
         self.grants.retain(|_, grant| grant.agent_id != agent_id);
         self.pending
@@ -271,6 +291,10 @@ impl PortalPolicy {
         self.grants.retain(|_, grant| grant.portal_id != portal_id);
         self.pending
             .retain(|_, approval| approval.request.portal_id != portal_id);
+    }
+
+    pub fn revoke_portal_grants(&mut self, portal_id: u64) {
+        self.grants.retain(|_, grant| grant.portal_id != portal_id);
     }
 
     pub fn pending_approval(&self, approval_id: u64) -> Option<&PendingApproval> {
@@ -450,16 +474,33 @@ mod tests {
         .unwrap();
         assert!(matches!(
             policy.evaluate(&request, 0),
-            PolicyDecision::ApprovalRequired { .. }
+            PolicyDecision::Denied { reason } if reason == "driver missing"
         ));
+    }
+
+    #[test]
+    fn explicit_denial_invalidates_existing_grants() {
+        let mut policy = PortalPolicy::new();
+        let request = request(PortalOperation::Input, "https://example.test");
         let approval_id = match policy.evaluate(&request, 0) {
             PolicyDecision::ApprovalRequired { approval_id, .. } => approval_id,
             decision => panic!("unexpected decision: {decision:?}"),
         };
-        assert!(matches!(
-            policy.approve(approval_id, &request, 1, 100),
-            Err(PortalPolicyError::Unavailable(_))
-        ));
+        policy.approve(approval_id, &request, 1, 1_000).unwrap();
+
+        policy.set_rule(
+            PortalOperation::Input,
+            PolicyRule::Deny {
+                reason: "input disabled".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            policy.evaluate(&request, 2),
+            PolicyDecision::Denied {
+                reason: "input disabled".to_owned(),
+            }
+        );
     }
 
     #[test]
