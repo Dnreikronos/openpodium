@@ -508,8 +508,9 @@ fn android_keycode(key: PortalKeyInput) -> Result<u16, AppiumError> {
         PortalKeyInput::ArrowDown => Ok(20),
         PortalKeyInput::ArrowLeft => Ok(21),
         PortalKeyInput::ArrowRight => Ok(22),
-        PortalKeyInput::Home => Ok(3),
-        PortalKeyInput::End | PortalKeyInput::PageUp | PortalKeyInput::PageDown => {
+        PortalKeyInput::Home => Ok(122),
+        PortalKeyInput::End => Ok(123),
+        PortalKeyInput::PageUp | PortalKeyInput::PageDown => {
             Err(AppiumError::UnsupportedAction("this Android key"))
         }
     }
@@ -669,6 +670,10 @@ mod tests {
             Err(AppiumError::UnsupportedPlatform(PortalTargetKind::Browser))
         ));
         assert_eq!(android_keycode(PortalKeyInput::Enter).unwrap(), 66);
+        // Text navigation, not KEYCODE_HOME, which would background the app.
+        assert_eq!(android_keycode(PortalKeyInput::Home).unwrap(), 122);
+        assert_eq!(android_keycode(PortalKeyInput::End).unwrap(), 123);
+        assert!(android_keycode(PortalKeyInput::PageUp).is_err());
     }
 
     #[test]

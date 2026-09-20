@@ -177,7 +177,6 @@ impl BrowserBackend {
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-gpu",
-                "--remote-allow-origins=*",
             ])
             .arg(format!("--remote-debugging-port={port}"))
             .arg(format!(
@@ -288,7 +287,9 @@ impl PortalBackend for BrowserBackend {
                     "mobile": false
                 }),
             )?;
-            self.command("Page.navigate", json!({"url": config.target().selector()}))?;
+            let url = config.target().selector();
+            validate_navigable_url(url)?;
+            self.command("Page.navigate", json!({"url": url}))?;
             session.connected().map_err(BrowserError::Session)
         })();
         if result.is_err() {
@@ -413,6 +414,7 @@ impl PortalBackend for BrowserBackend {
                 Ok(())
             }
             PortalAction::Navigate(url) => {
+                validate_navigable_url(url)?;
                 self.command("Page.navigate", json!({"url": url}))?;
                 Ok(())
             }
@@ -530,6 +532,20 @@ fn debug_websocket_url(port: u16) -> Result<Option<String>, BrowserError> {
     }))
 }
 
+/// Keeps a portal on the web. Without this an approved navigation could read
+/// `file://` or `chrome://` content and hand it back as an observation.
+fn validate_navigable_url(url: &str) -> Result<(), BrowserError> {
+    let scheme = url
+        .split_once("://")
+        .map_or("", |(scheme, _)| scheme)
+        .to_ascii_lowercase();
+    if matches!(scheme.as_str(), "http" | "https") {
+        Ok(())
+    } else {
+        Err(BrowserError::UnsupportedUrlScheme(url.to_owned()))
+    }
+}
+
 fn configure_socket_timeout(
     socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     timeout: Duration,
@@ -580,6 +596,7 @@ pub enum BrowserError {
     CoordinateOutsideViewport { x: u32, y: u32 },
     Session(PortalSessionError),
     Validation(super::PortalValidationError),
+    UnsupportedUrlScheme(String),
     StartupTimeout,
 }
 
@@ -623,6 +640,12 @@ impl Display for BrowserError {
             }
             Self::Session(error) => Display::fmt(error, formatter),
             Self::Validation(error) => Display::fmt(error, formatter),
+            Self::UnsupportedUrlScheme(url) => {
+                write!(
+                    formatter,
+                    "a browser portal only navigates http and https URLs, not {url:?}"
+                )
+            }
             Self::StartupTimeout => formatter.write_str("Chromium did not expose CDP in time"),
         }
     }
@@ -645,6 +668,25 @@ mod tests {
 
         assert!(backend.connect(&config, &mut session).is_err());
         assert_eq!(session.state(), PortalSessionState::Disconnected);
+    }
+
+    #[test]
+    fn navigation_is_limited_to_web_urls() {
+        assert!(validate_navigable_url("https://example.test/page").is_ok());
+        assert!(validate_navigable_url("HTTP://example.test").is_ok());
+        for url in [
+            "file:///etc/passwd",
+            "chrome://settings",
+            "devtools://devtools/bundled",
+            "data:text/html,<p>hi</p>",
+            "javascript:alert(1)",
+            "example.test",
+        ] {
+            assert!(
+                matches!(validate_navigable_url(url), Err(BrowserError::UnsupportedUrlScheme(rejected)) if rejected == url),
+                "{url} should not be navigable"
+            );
+        }
     }
 
     #[test]
