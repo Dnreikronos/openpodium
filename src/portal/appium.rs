@@ -114,14 +114,21 @@ impl AppiumBackend {
     }
 
     /// Resolves an observed token against the live tree by identity, never by
-    /// the position it held when it was observed. A target that vanished or
-    /// that more than one element now answers to is refused rather than
-    /// guessed at.
+    /// the position it held when it was observed. A target that vanished, that
+    /// more than one element now answers to, or that never named a single
+    /// element in the first place is refused rather than guessed at.
     fn resolve_element(&self, element_id: &str) -> Result<String, AppiumError> {
         let binding = self
             .element_bindings
             .get(element_id)
             .ok_or_else(|| AppiumError::InvalidElementId(element_id.to_owned()))?;
+        // The observation has to have identified one element to begin with.
+        // Two rows that looked alike then stay ambiguous for the life of the
+        // token: one of them disappearing must not promote the survivor into
+        // a target the user never picked.
+        if identity_count(self.element_bindings.values(), &binding.identity) > 1 {
+            return Err(AppiumError::AmbiguousElement(element_id.to_owned()));
+        }
         let (live, _) = appium_elements(&self.page_source()?)?;
         let mut matches = live
             .into_values()
@@ -596,6 +603,12 @@ fn subtree_content(elements: &[ParsedElement]) -> Vec<Vec<String>> {
     content
 }
 
+fn identity_count<'a>(bindings: impl Iterator<Item = &'a ElementBinding>, identity: &str) -> usize {
+    bindings
+        .filter(|binding| binding.identity == identity)
+        .count()
+}
+
 /// What the element claims to be, ignoring the state attributes a platform
 /// updates as the user interacts with it.
 fn element_identity(element: &ParsedElement) -> String {
@@ -955,11 +968,12 @@ mod tests {
     }
 
     /// Serves canned Appium responses and records the requests that arrived.
-    fn appium_server(responses: Vec<&'static str>) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    fn appium_server<S: Into<String>>(responses: Vec<S>) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured_requests = Arc::clone(&requests);
+        let responses = responses.into_iter().map(Into::into).collect::<Vec<_>>();
         thread::spawn(move || {
             for response in responses {
                 let Ok((mut stream, _)) = listener.accept() else {
@@ -1101,6 +1115,68 @@ mod tests {
                 .iter()
                 .any(|request| request.contains("/click")),
             "a replaced element must never be clicked"
+        );
+    }
+
+    /// Two rows whose labels sit further from the control than the context
+    /// window reaches, so both Delete buttons carry the same identity.
+    fn nested_rows(records: &[&str]) -> String {
+        let rows = records
+            .iter()
+            .map(|record| {
+                format!(
+                    "<android.widget.LinearLayout><android.widget.TextView text=\\\"{record}\\\"/>\
+                     <android.widget.FrameLayout><android.widget.FrameLayout>\
+                     <android.widget.Button content-desc=\\\"Delete\\\"/>\
+                     </android.widget.FrameLayout></android.widget.FrameLayout>\
+                     </android.widget.LinearLayout>"
+                )
+            })
+            .collect::<String>();
+        format!(r#"{{"value":"<hierarchy>{rows}</hierarchy>"}}"#)
+    }
+
+    #[test]
+    fn a_token_that_was_ambiguous_when_observed_stays_ambiguous() {
+        let observed = nested_rows(&["Alice", "Bob"]);
+        // Alice's row is gone by the time the token is used, leaving Bob's
+        // Delete as the only element answering to that identity.
+        let live = nested_rows(&["Bob"]);
+        let (address, requests) = appium_server(vec![
+            r#"{"value":{"sessionId":"session-1"}}"#.to_owned(),
+            r#"{"value":{"width":800,"height":600}}"#.to_owned(),
+            r#"{"value":"AQ=="}"#.to_owned(),
+            observed,
+            live,
+            // Left unconsumed by design: without the guard the token would
+            // resolve here and click the row that survived.
+            r#"{"value":{"element-6066-11e4-a52e-4f735466cecf":"bob-delete"}}"#.to_owned(),
+            r#"{"value":null}"#.to_owned(),
+        ]);
+        let (mut backend, mut session) = connected_backend(address);
+
+        let observation = backend.observe(&mut session).unwrap();
+        // appium-5 is Alice's Delete: row, label, two wrappers, then button.
+        let error = backend
+            .execute(
+                &mut session,
+                &PortalAction::Click(
+                    PortalElementRef::new(observation.revision(), "appium-5").unwrap(),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, AppiumError::AmbiguousElement(id) if id == "appium-5"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("/click")),
+            "the surviving row must never inherit another row's token"
         );
     }
 
