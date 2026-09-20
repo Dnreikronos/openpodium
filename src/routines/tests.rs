@@ -1736,3 +1736,55 @@ fn a_git_trigger_records_the_revisions_it_observed_and_holds_its_baseline() {
         "the run records the revision the trigger observed"
     );
 }
+
+// Regression cover for the ways a run could lose track of live work.
+#[test]
+fn a_restart_does_not_paste_an_interrupted_prompt_again() {
+    let (temp, mut manager, workspace_id) = manager();
+    let routine_id = simple_routine(&mut manager, workspace_id);
+    let mut scheduler = RoutineScheduler::default();
+    let mut orchestrator = Orchestrator::default();
+    let run_id = scheduler
+        .start_run(
+            &mut manager,
+            workspace_id,
+            routine_id,
+            RunRequest::default(),
+            timestamp(20),
+        )
+        .unwrap();
+    scheduler
+        .tick(&mut manager, &mut orchestrator, timestamp(21))
+        .unwrap();
+
+    // Crash partway through pasting the prompt: the attempt is recorded as
+    // started and nobody can say whether the agent received it.
+    let _request = orchestrator
+        .prepare_next(&mut manager, timestamp(22))
+        .unwrap()
+        .unwrap();
+    drop(manager);
+
+    let mut reopened = WorkspaceManager::open(temp.path().join("openpodium.sqlite")).unwrap();
+    let mut recovered_orchestrator = Orchestrator::recover(&mut reopened, timestamp(50)).unwrap();
+    let _ = RoutineScheduler::recover(&mut reopened, timestamp(50)).unwrap();
+
+    assert!(
+        recovered_orchestrator
+            .prepare_next(&mut reopened, timestamp(51))
+            .unwrap()
+            .is_none(),
+        "recovery must not redeliver a routine prompt whose outcome is unknown"
+    );
+    assert_eq!(
+        reopened
+            .workspace(workspace_id)
+            .unwrap()
+            .routine_run(run_id)
+            .unwrap()
+            .step(RoutineStepId::new(1))
+            .unwrap()
+            .state(),
+        RoutineStepState::Interrupted
+    );
+}

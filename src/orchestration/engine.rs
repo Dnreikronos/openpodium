@@ -111,7 +111,7 @@ impl Orchestrator {
             .recent_workspaces()
             .flat_map(|workspace| {
                 workspace.handoffs().flat_map(move |handoff| {
-                    delivery_message_ids(handoff)
+                    recovery_message_ids(handoff)
                         .into_iter()
                         .map(move |message_id| (workspace.id(), handoff.id(), message_id))
                 })
@@ -1019,6 +1019,20 @@ fn delivery_details(
         "message {message_id} is not part of handoff {}",
         handoff.id()
     )))
+}
+
+/// The messages of a handoff that still need delivering after a restart.
+///
+/// Work the routine scheduler dispatched is deliberately excluded once an
+/// attempt exists. That attempt's outcome is unknown, the scheduler marks its
+/// step interrupted, and pasting the prompt a second time would ask an agent
+/// that may already be working to start over. The scheduler re-submits it
+/// itself once a person confirms the previous run stopped.
+fn recovery_message_ids(handoff: &Handoff) -> Vec<HandoffMessageId> {
+    if handoff.origin().run().is_some() && !handoff.delivery_attempts().is_empty() {
+        return Vec::new();
+    }
+    delivery_message_ids(handoff)
 }
 
 fn delivery_message_ids(handoff: &Handoff) -> Vec<HandoffMessageId> {
