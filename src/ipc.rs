@@ -30,11 +30,13 @@ pub use server::{
 };
 
 pub const PROTOCOL_NAME: &str = "openpodium-ipc";
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
+pub const PORTAL_PROTOCOL_VERSION: u16 = 3;
 pub const PREVIOUS_PROTOCOL_VERSION: u16 = 2;
 pub const LEGACY_PROTOCOL_VERSION: u16 = 1;
 pub const SUPPORTED_VERSIONS: &[u16] = &[
     PROTOCOL_VERSION,
+    PORTAL_PROTOCOL_VERSION,
     PREVIOUS_PROTOCOL_VERSION,
     LEGACY_PROTOCOL_VERSION,
 ];

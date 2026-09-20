@@ -212,6 +212,7 @@ impl Orchestrator {
                 task_message_id,
                 *status,
                 body,
+                &BTreeMap::new(),
                 accepted_at,
             ),
             ProtocolCommand::RespondToHandoff {
@@ -219,6 +220,7 @@ impl Orchestrator {
                 handoff_message_id,
                 status,
                 body,
+                outputs,
             } => self.accept_response(
                 workspaces,
                 workspace_id,
@@ -227,6 +229,7 @@ impl Orchestrator {
                 handoff_message_id,
                 *status,
                 body,
+                outputs,
                 accepted_at,
             ),
             ProtocolCommand::CancelHandoff {
@@ -566,6 +569,7 @@ impl Orchestrator {
         handoff_message_id: &MessageId,
         status: ResponseStatus,
         body: &str,
+        outputs: &BTreeMap<String, String>,
         accepted_at: Timestamp,
     ) -> Result<(), OrchestrationError> {
         let root_id = domain_message_id(handoff_message_id)?;
@@ -580,12 +584,15 @@ impl Orchestrator {
             .is_none_or(|response| response.message_id() != &response_id)
         {
             let mut after = before.clone();
-            after.respond(HandoffResponse::new(
-                response_id.clone(),
-                response_status(status),
-                Content::new(body.to_owned())?,
-                accepted_at,
-            ))?;
+            after.respond(
+                HandoffResponse::new(
+                    response_id.clone(),
+                    response_status(status),
+                    Content::new(body.to_owned())?,
+                    accepted_at,
+                )
+                .with_outputs(domain_outputs(outputs)?),
+            )?;
             execute_handoff_update(workspaces, workspace_id, before, after, accepted_at)?;
         }
         if let HandoffPayload::Task(task_id) =
@@ -1046,6 +1053,21 @@ fn originating_agent(handoff: &Handoff) -> Result<AgentId, OrchestrationError> {
     })
 }
 
+fn domain_outputs(
+    outputs: &BTreeMap<String, String>,
+) -> Result<BTreeMap<crate::domain::RoutineOutputKey, crate::domain::RoutineValue>, OrchestrationError>
+{
+    outputs
+        .iter()
+        .map(|(key, value)| {
+            Ok((
+                crate::domain::RoutineOutputKey::new(key.clone())?,
+                crate::domain::RoutineValue::new(value.clone())?,
+            ))
+        })
+        .collect()
+}
+
 fn response_status(status: ResponseStatus) -> HandoffResponseStatus {
     match status {
         ResponseStatus::Completed => HandoffResponseStatus::Completed,
@@ -1314,6 +1336,7 @@ pub enum OrchestrationError {
     UnknownWorkspace(WorkspaceId),
     UnknownHandoff(String),
     UnsafeAdapter { agent_id: AgentId, program: String },
+    Routine(crate::domain::RoutineError),
     IdentifierExhausted(&'static str),
     TimeOverflow(&'static str),
     InvalidMessage(String),
@@ -1342,6 +1365,7 @@ impl Display for OrchestrationError {
                 formatter,
                 "agent {agent_id} uses {program}, which has no safe automatic prompt delivery"
             ),
+            Self::Routine(source) => source.fmt(formatter),
             Self::IdentifierExhausted(entity) => {
                 write!(formatter, "cannot allocate another {entity} identifier")
             }
@@ -1357,6 +1381,7 @@ impl Error for OrchestrationError {
             Self::Workspace(source) => Some(source),
             Self::Validation(source) => Some(source),
             Self::Handoff(source) => Some(source),
+            Self::Routine(source) => Some(source),
             Self::UnknownWorkspace(_)
             | Self::UnknownHandoff(_)
             | Self::UnsafeAdapter { .. }
@@ -1382,5 +1407,11 @@ impl From<crate::domain::ValidationError> for OrchestrationError {
 impl From<crate::domain::HandoffMutationError> for OrchestrationError {
     fn from(error: crate::domain::HandoffMutationError) -> Self {
         Self::Handoff(error)
+    }
+}
+
+impl From<crate::domain::RoutineError> for OrchestrationError {
+    fn from(error: crate::domain::RoutineError) -> Self {
+        Self::Routine(error)
     }
 }

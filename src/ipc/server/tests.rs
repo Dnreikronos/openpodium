@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -501,6 +502,7 @@ fn version_two_questions_progress_responses_and_cancellation_are_routed() {
         (
             "request-3",
             ProtocolCommand::RespondToHandoff {
+                outputs: BTreeMap::new(),
                 message_id: MessageId::new("response-1").unwrap(),
                 handoff_message_id: MessageId::new("question-1").unwrap(),
                 status: ResponseStatus::Completed,

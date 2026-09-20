@@ -1964,6 +1964,10 @@ impl HandoffV1 {
     /// Whether the record needs the routine-aware event format.
     fn uses_routine_fields(&self) -> bool {
         self.routine_origin.is_some()
+            || self
+                .response
+                .as_ref()
+                .is_some_and(|response| !response.outputs.is_empty())
     }
 
     fn has_orchestration_fields(&self) -> bool {
@@ -2142,6 +2146,8 @@ struct HandoffResponseV1 {
     status: HandoffResponseStatusV1,
     body: String,
     responded_at: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    outputs: Vec<RoutineValueEntryV1>,
 }
 
 impl From<&HandoffResponse> for HandoffResponseV1 {
@@ -2151,18 +2157,38 @@ impl From<&HandoffResponse> for HandoffResponseV1 {
             status: response.status().into(),
             body: response.body().as_str().to_owned(),
             responded_at: response.responded_at().as_unix_millis(),
+            outputs: response
+                .outputs()
+                .iter()
+                .map(|(key, value)| RoutineValueEntryV1 {
+                    key: key.as_str().to_owned(),
+                    value: value.as_str().to_owned(),
+                })
+                .collect(),
         }
     }
 }
 
 impl HandoffResponseV1 {
     fn into_domain(self) -> Result<HandoffResponse, String> {
+        let outputs = self
+            .outputs
+            .into_iter()
+            .map(|entry| {
+                Ok((
+                    RoutineOutputKey::new(entry.key)
+                        .map_err(|e: crate::domain::RoutineError| e.to_string())?,
+                    RoutineValue::new(entry.value).map_err(|e| e.to_string())?,
+                ))
+            })
+            .collect::<Result<_, String>>()?;
         Ok(HandoffResponse::new(
             HandoffMessageId::new(self.message_id).map_err(|error| error.to_string())?,
             self.status.into(),
             Content::new(self.body).map_err(|error| error.to_string())?,
             Timestamp::from_unix_millis(self.responded_at),
-        ))
+        )
+        .with_outputs(outputs))
     }
 }
 

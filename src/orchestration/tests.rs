@@ -129,6 +129,7 @@ fn task_progress_and_response_update_state_and_preserve_mailbox_order() {
         sender_agent_id: 2,
         recipient_agent_id: 1,
         command: ProtocolCommand::RespondToHandoff {
+            outputs: std::collections::BTreeMap::new(),
             message_id: message_id("response-1"),
             handoff_message_id: message_id("task-1"),
             status: ResponseStatus::Completed,
@@ -476,6 +477,7 @@ fn user_cancel_and_resume_follow_task_lifecycle_rules() {
         sender_agent_id: 2,
         recipient_agent_id: 1,
         command: ProtocolCommand::RespondToHandoff {
+            outputs: std::collections::BTreeMap::new(),
             message_id: message_id("blocked-2"),
             handoff_message_id: message_id("task-2"),
             status: ResponseStatus::Blocked,
@@ -536,6 +538,7 @@ fn user_cancel_and_resume_follow_task_lifecycle_rules() {
         sender_agent_id: 2,
         recipient_agent_id: 1,
         command: ProtocolCommand::RespondToHandoff {
+            outputs: std::collections::BTreeMap::new(),
             message_id: message_id("completed-2"),
             handoff_message_id: message_id(&resumed_message_id),
             status: ResponseStatus::Completed,

@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use super::{Content, Handoff, HandoffId, Timestamp};
+use super::{Content, Handoff, HandoffId, RoutineOutputKey, RoutineValue, Timestamp};
 
 pub const MAX_HANDOFF_DEPTH: usize = 16;
 const MAX_MESSAGE_ID_CHARS: usize = 128;
@@ -137,6 +138,7 @@ pub struct HandoffResponse {
     status: HandoffResponseStatus,
     body: Content,
     responded_at: Timestamp,
+    outputs: BTreeMap<RoutineOutputKey, RoutineValue>,
 }
 
 impl HandoffResponse {
@@ -151,7 +153,19 @@ impl HandoffResponse {
             status,
             body,
             responded_at,
+            outputs: BTreeMap::new(),
         }
+    }
+
+    /// Structured outputs an agent returned with its completion. Routine steps
+    /// bind these; nothing is ever parsed out of terminal text.
+    pub fn with_outputs(mut self, outputs: BTreeMap<RoutineOutputKey, RoutineValue>) -> Self {
+        self.outputs = outputs;
+        self
+    }
+
+    pub const fn outputs(&self) -> &BTreeMap<RoutineOutputKey, RoutineValue> {
+        &self.outputs
     }
 
     pub const fn message_id(&self) -> &HandoffMessageId {
