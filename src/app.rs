@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,9 +16,9 @@ use openpodium::domain::{
     Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, ChatAttachmentId,
     ChatDraft, ChatMessageId, ChatThread, ChatThreadId, CommandPreset, CommandPresetId,
     ContainerEnvironment, Content, CustomEnvironment, DomainCommand, EnvironmentKind,
-    EnvironmentProfile, EnvironmentProfileId, Name, Node, NodeId, NodeTarget, Role, RoleColor,
-    RoleIcon, RoleId, SshEnvironment, ThreadColor, TimelineEventId, Timestamp, Workspace,
-    WorkspaceDirectory, WorkspaceId,
+    EnvironmentProfile, EnvironmentProfileId, Name, Node, NodeId, NodeTarget, ProjectPath, Role,
+    RoleColor, RoleIcon, RoleId, SshEnvironment, ThreadColor, TimelineEventId, Timestamp,
+    Workspace, WorkspaceDirectory, WorkspaceId,
 };
 use openpodium::ipc::{
     AGENT_ID_ENV, AVAILABLE_ENV, AgentCapabilities, AgentRegistration, CLI_ENV, ENDPOINT_ENV,
@@ -81,6 +81,7 @@ struct PortableImportDraft {
     payload: String,
     preview: ImportPreview,
     launcher_mappings: BTreeMap<String, CommandPresetId>,
+    path_mappings: BTreeMap<String, String>,
 }
 
 struct OpenPodium {
@@ -271,6 +272,10 @@ enum Message {
         launcher_id: String,
         preset_id: CommandPresetId,
     },
+    MapPortablePath {
+        source: String,
+        destination: String,
+    },
     ConfirmPortableImport,
     CancelPortableImport,
     ContextPathChanged(String),
@@ -401,6 +406,18 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         } => {
             if let Some(draft) = state.portable_import.as_mut() {
                 draft.launcher_mappings.insert(launcher_id, preset_id);
+            }
+        }
+        Message::MapPortablePath {
+            source,
+            destination,
+        } => {
+            if let Some(draft) = state.portable_import.as_mut() {
+                if destination.trim().is_empty() {
+                    draft.path_mappings.remove(&source);
+                } else {
+                    draft.path_mappings.insert(source, destination);
+                }
             }
         }
         Message::ConfirmPortableImport => confirm_portable_import(state),
@@ -781,22 +798,58 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         };
         settings = settings
             .push(text(format!(
-                "Import preview: {kind} · {} roles · {} agents · {} tasks · {} nodes",
+                "Import preview: {kind} · {} roles · {} agents · {} tasks · {} handoffs · {} nodes · {} groups · {} connections",
                 draft.preview.counts.roles,
                 draft.preview.counts.agents,
                 draft.preview.counts.tasks,
+                draft.preview.counts.handoffs,
                 draft.preview.counts.nodes,
+                draft.preview.counts.groups,
+                draft.preview.counts.connections,
             )))
-            .push(text(if draft.preview.referenced_paths.is_empty() {
-                "No project paths referenced"
-            } else {
-                "Project paths will be revalidated at import time"
-            }))
             .push(text(if draft.preview.unresolved_launchers.is_empty() {
                 "All launchers resolved"
             } else {
                 "Custom launchers require an explicit mapping before import"
             }));
+        let destination = state
+            .workspaces
+            .as_ref()
+            .and_then(|manager| manager.workspace(draft.workspace_id));
+        if draft.preview.referenced_paths.is_empty() {
+            settings = settings.push(text("No project paths referenced"));
+        } else {
+            settings = settings.push(text("Referenced project paths:"));
+            for source in &draft.preview.referenced_paths {
+                let mapped = draft
+                    .path_mappings
+                    .get(source)
+                    .map(String::as_str)
+                    .unwrap_or(source.as_str());
+                let status = destination
+                    .map(|workspace| portable_path_status(workspace, mapped))
+                    .unwrap_or_else(|| "destination unavailable".to_owned());
+                let source_for_message = source.clone();
+                settings = settings.push(
+                    row![
+                        text(format!("{source} → {mapped} · {status}")),
+                        text_input("Destination project-relative path", mapped).on_input(
+                            move |destination| Message::MapPortablePath {
+                                source: source_for_message.clone(),
+                                destination,
+                            },
+                        ),
+                    ]
+                    .spacing(8),
+                );
+            }
+        }
+        for conflict in &draft.preview.role_conflicts {
+            settings = settings.push(text(format!("Role conflict: {conflict}")));
+        }
+        for warning in &draft.preview.warnings {
+            settings = settings.push(text(format!("Warning: {warning}")));
+        }
         let presets = state
             .workspaces
             .as_ref()
@@ -2577,6 +2630,7 @@ fn preview_template_from_clipboard(state: &mut OpenPodium, payload: Option<Strin
             payload,
             preview,
             launcher_mappings: BTreeMap::new(),
+            path_mappings: BTreeMap::new(),
         }),
         Err(error) => {
             state.notice = Some(error.to_string());
@@ -2615,6 +2669,7 @@ fn preview_workspace_archive_from_clipboard(state: &mut OpenPodium, payload: Opt
             payload,
             preview,
             launcher_mappings: BTreeMap::new(),
+            path_mappings: BTreeMap::new(),
         }),
         Err(error) => {
             state.notice = Some(error.to_string());
@@ -2656,6 +2711,7 @@ fn confirm_portable_import(state: &mut OpenPodium) {
             draft.destination_floor,
             origin,
             &draft.launcher_mappings,
+            &draft.path_mappings,
             now(),
         ),
         PortableImportKind::WorkspaceArchive => workspaces.import_workspace_archive(
@@ -2663,6 +2719,7 @@ fn confirm_portable_import(state: &mut OpenPodium) {
             &draft.payload,
             draft.destination_floor,
             &draft.launcher_mappings,
+            &draft.path_mappings,
             now(),
         ),
     };
@@ -2670,12 +2727,28 @@ fn confirm_portable_import(state: &mut OpenPodium) {
         Ok(_) => {
             state.reset_canvas_session();
             state.navigation_ui.mark_stale(workspace_id);
+            state.sync_ipc_directory();
             state.notice = Some("Portable import committed".to_owned());
         }
         Err(error) => {
             state.notice = Some(error.to_string());
             state.portable_import = Some(draft);
         }
+    }
+}
+
+fn portable_path_status(workspace: &Workspace, path: &str) -> String {
+    let Some(checkout) = workspace.active_directory() else {
+        return "no destination checkout".to_owned();
+    };
+    let Ok(project_path) = ProjectPath::new(path.to_owned()) else {
+        return "invalid project-relative path".to_owned();
+    };
+    match openpodium::context::resolve_project_path(Path::new(checkout.as_str()), &project_path) {
+        Ok(resolved) if resolved.is_file() => "present file".to_owned(),
+        Ok(resolved) if resolved.is_dir() => "present directory".to_owned(),
+        Ok(_) => "missing".to_owned(),
+        Err(error) => format!("unsafe: {error}"),
     }
 }
 

@@ -204,6 +204,7 @@ fn template_import_preview_then_batch_import_allocates_fresh_ids() {
             None,
             PointV1 { x: 500.0, y: 600.0 },
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             timestamp(5),
         )
         .unwrap();
@@ -218,6 +219,60 @@ fn template_import_preview_then_batch_import_allocates_fresh_ids() {
         workspace.node(NodeId::new(71)).unwrap().position().x(),
         500.0
     );
+}
+
+#[test]
+fn template_import_applies_relative_path_mapping() {
+    let temp = TempDir::new().unwrap();
+    let directory = temp.path().join("project");
+    fs::create_dir(&directory).unwrap();
+    let mut manager = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+    let workspace_id = manager.create_workspace(&directory, timestamp(1)).unwrap();
+    manager
+        .execute(
+            workspace_id,
+            DomainCommand::AddNode(Node::with_content(
+                NodeId::new(1),
+                CanvasNodeContent::Note {
+                    path: ProjectPath::new("notes/source.md").unwrap(),
+                    title: Name::new("Source note").unwrap(),
+                },
+                CanvasPoint::new(0.0, 0.0).unwrap(),
+                CanvasSize::new(240.0, 160.0).unwrap(),
+            )),
+            timestamp(2),
+        )
+        .unwrap();
+    let payload = manager
+        .export_template(workspace_id, &[NodeId::new(1)])
+        .unwrap();
+    let mut path_mappings = std::collections::BTreeMap::new();
+    path_mappings.insert(
+        "notes/source.md".to_owned(),
+        "notes/destination.md".to_owned(),
+    );
+
+    manager
+        .import_template(
+            workspace_id,
+            &payload,
+            None,
+            PointV1 { x: 400.0, y: 500.0 },
+            &std::collections::BTreeMap::new(),
+            &path_mappings,
+            timestamp(3),
+        )
+        .unwrap();
+
+    let node = manager
+        .workspace(workspace_id)
+        .unwrap()
+        .node(NodeId::new(2))
+        .unwrap();
+    match node.content() {
+        CanvasNodeContent::Note { path, .. } => assert_eq!(path.as_str(), "notes/destination.md"),
+        content => panic!("expected a note, found {content:?}"),
+    }
 }
 
 #[cfg(unix)]
@@ -270,6 +325,7 @@ fn template_import_rejects_a_symlinked_destination_path_before_journaling() {
             &payload,
             None,
             PointV1 { x: 0.0, y: 0.0 },
+            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             timestamp(4),
         )

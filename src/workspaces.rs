@@ -10,8 +10,9 @@ use crate::domain::{
 };
 use crate::persistence::{
     ImportPreview, Journal, PointV1, PortableError, PortableImport, decode_template,
-    decode_workspace_archive, export_template, export_workspace_archive, import_template,
-    import_workspace_archive, preview_template_import, preview_workspace_archive_import,
+    decode_workspace_archive, export_template, export_workspace_archive,
+    import_template_with_mappings, import_workspace_archive_with_mappings, preview_template_import,
+    preview_workspace_archive_import,
 };
 
 mod error;
@@ -136,13 +137,15 @@ impl WorkspaceManager {
         preview_template_import(&document, workspace).map_err(WorkspaceError::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn import_template(
         &mut self,
         workspace_id: WorkspaceId,
         payload: &str,
         destination_floor: Option<u64>,
         destination_origin: PointV1,
-        launcher_mappings: &std::collections::BTreeMap<String, crate::domain::CommandPresetId>,
+        launcher_mappings: &BTreeMap<String, crate::domain::CommandPresetId>,
+        path_mappings: &BTreeMap<String, String>,
         occurred_at: Timestamp,
     ) -> Result<Vec<TimelineEvent>, WorkspaceError> {
         let plan = {
@@ -151,12 +154,19 @@ impl WorkspaceManager {
                 .ok_or(WorkspaceError::UnknownWorkspace { workspace_id })?;
             validate_destination_floor(workspace, destination_floor)?;
             let document = decode_template(payload).map_err(WorkspaceError::from)?;
-            import_template(&document, workspace, destination_origin, launcher_mappings)
-                .map_err(WorkspaceError::from)?
+            import_template_with_mappings(
+                &document,
+                workspace,
+                destination_origin,
+                launcher_mappings,
+                path_mappings,
+            )
+            .map_err(WorkspaceError::from)?
         };
         validate_import_paths(
             self.workspace(workspace_id).expect("workspace was checked"),
             &plan.preview,
+            path_mappings,
         )?;
         self.execute_import(workspace_id, plan, occurred_at)
     }
@@ -188,7 +198,8 @@ impl WorkspaceManager {
         workspace_id: WorkspaceId,
         payload: &str,
         destination_floor: Option<u64>,
-        launcher_mappings: &std::collections::BTreeMap<String, crate::domain::CommandPresetId>,
+        launcher_mappings: &BTreeMap<String, crate::domain::CommandPresetId>,
+        path_mappings: &BTreeMap<String, String>,
         occurred_at: Timestamp,
     ) -> Result<Vec<TimelineEvent>, WorkspaceError> {
         let plan = {
@@ -197,12 +208,18 @@ impl WorkspaceManager {
                 .ok_or(WorkspaceError::UnknownWorkspace { workspace_id })?;
             validate_destination_floor(workspace, destination_floor)?;
             let archive = decode_workspace_archive(payload).map_err(WorkspaceError::from)?;
-            import_workspace_archive(&archive, workspace, launcher_mappings)
-                .map_err(WorkspaceError::from)?
+            import_workspace_archive_with_mappings(
+                &archive,
+                workspace,
+                launcher_mappings,
+                path_mappings,
+            )
+            .map_err(WorkspaceError::from)?
         };
         validate_import_paths(
             self.workspace(workspace_id).expect("workspace was checked"),
             &plan.preview,
+            path_mappings,
         )?;
         self.execute_import(workspace_id, plan, occurred_at)
     }
@@ -366,6 +383,7 @@ fn validate_destination_floor(
 fn validate_import_paths(
     workspace: &Workspace,
     preview: &ImportPreview,
+    path_mappings: &BTreeMap<String, String>,
 ) -> Result<(), WorkspaceError> {
     if preview.referenced_paths.is_empty() {
         return Ok(());
@@ -376,16 +394,20 @@ fn validate_import_paths(
                 .to_owned(),
         ))
     })?;
-    for value in &preview.referenced_paths {
-        let path = crate::domain::ProjectPath::new(value.clone()).map_err(|error| {
+    for source in &preview.referenced_paths {
+        let value = path_mappings
+            .get(source)
+            .map(String::as_str)
+            .unwrap_or(source);
+        let path = crate::domain::ProjectPath::new(value.to_owned()).map_err(|error| {
             WorkspaceError::Portable(PortableError::InvalidDocument(format!(
-                "referenced path {value:?} is invalid: {error}"
+                "referenced path {source:?} mapped to {value:?} is invalid: {error}"
             )))
         })?;
         crate::context::resolve_project_path(Path::new(checkout.as_str()), &path).map_err(
             |error| {
                 WorkspaceError::Portable(PortableError::InvalidDocument(format!(
-                    "referenced path {value:?} is unsafe for the destination checkout: {error}"
+                    "referenced path {source:?} mapped to {value:?} is unsafe for the destination checkout: {error}"
                 )))
             },
         )?;

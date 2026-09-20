@@ -17,7 +17,7 @@ use crate::domain::{
     CanvasSize, CanvasText, Connection, ConnectionId, ConnectionKind, Content, DiffComparison,
     DomainCommand, Handoff, HandoffId, HandoffPayload, Name, Node, NodeGroup, NodeGroupId, NodeId,
     NodeTarget, NormalizedPoint, ProjectPath, Role, RoleColor, RoleIcon, RoleId, Shape, ShapeKind,
-    StrokeWidth, Task, TaskId, Workspace, WorkspaceIcon,
+    StrokeWidth, Task, TaskId, TaskState, Workspace, WorkspaceIcon,
 };
 
 const TEMPLATE_FORMAT: &str = "openpodium-template";
@@ -128,6 +128,15 @@ pub struct TaskV1 {
     pub assignee: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_source_state: Option<RetrySourceStateV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrySourceStateV1 {
+    Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -354,6 +363,10 @@ pub fn export_template(
 
     let references = referenced_entities(workspace, &layout)?;
     let body = build_body(workspace, &layout, references, Some(origin))?;
+    let warnings = scan_template(&body);
+    if !warnings.is_empty() {
+        return Err(PortableError::SecretDetected(warnings));
+    }
     encode(&TemplateDocumentV1 {
         format: TEMPLATE_FORMAT.to_owned(),
         version: DOCUMENT_VERSION,
@@ -366,6 +379,10 @@ pub fn decode_template(payload: &str) -> Result<TemplateDocumentV1, PortableErro
         serde_json::from_value(value).map_err(PortableError::InvalidJson)
     })?;
     validate_template(&document)?;
+    let warnings = scan_template(&document.template);
+    if !warnings.is_empty() {
+        return Err(PortableError::SecretDetected(warnings));
+    }
     Ok(document)
 }
 
@@ -465,6 +482,22 @@ pub fn import_template(
     destination_origin: PointV1,
     launcher_mappings: &BTreeMap<String, crate::domain::CommandPresetId>,
 ) -> Result<PortableImport, PortableError> {
+    import_template_with_mappings(
+        document,
+        workspace,
+        destination_origin,
+        launcher_mappings,
+        &BTreeMap::new(),
+    )
+}
+
+pub fn import_template_with_mappings(
+    document: &TemplateDocumentV1,
+    workspace: &Workspace,
+    destination_origin: PointV1,
+    launcher_mappings: &BTreeMap<String, crate::domain::CommandPresetId>,
+    path_mappings: &BTreeMap<String, String>,
+) -> Result<PortableImport, PortableError> {
     validate_template(document)?;
     let preview = preview_template_import(document, workspace)?;
     ensure_launchers_resolved(&preview, workspace, launcher_mappings)?;
@@ -477,6 +510,7 @@ pub fn import_template(
         &document.template.canvas,
         destination_origin,
         launcher_mappings,
+        path_mappings,
         None,
     )?;
     Ok(PortableImport { commands, preview })
@@ -486,6 +520,15 @@ pub fn import_workspace_archive(
     archive: &WorkspaceArchiveV1,
     workspace: &Workspace,
     launcher_mappings: &BTreeMap<String, crate::domain::CommandPresetId>,
+) -> Result<PortableImport, PortableError> {
+    import_workspace_archive_with_mappings(archive, workspace, launcher_mappings, &BTreeMap::new())
+}
+
+pub fn import_workspace_archive_with_mappings(
+    archive: &WorkspaceArchiveV1,
+    workspace: &Workspace,
+    launcher_mappings: &BTreeMap<String, crate::domain::CommandPresetId>,
+    path_mappings: &BTreeMap<String, String>,
 ) -> Result<PortableImport, PortableError> {
     validate_archive(archive)?;
     let preview = preview_workspace_archive_import(archive, workspace)?;
@@ -499,6 +542,7 @@ pub fn import_workspace_archive(
         &archive.archive.canvas,
         PointV1 { x: 0.0, y: 0.0 },
         launcher_mappings,
+        path_mappings,
         Some(&archive.archive.settings),
     )?;
     Ok(PortableImport { commands, preview })
@@ -662,8 +706,8 @@ fn build_body(
         tasks: workspace
             .tasks()
             .filter(|task| references.tasks.contains(&task.id()))
-            .map(task_record)
-            .collect(),
+            .map(|task| task_record(workspace, task))
+            .collect::<Result<_, _>>()?,
         handoffs: workspace
             .handoffs()
             .filter(|handoff| references.handoffs.contains(&handoff.id()))
@@ -701,14 +745,32 @@ fn agent_record(agent: &Agent) -> AgentV1 {
     }
 }
 
-fn task_record(task: &Task) -> TaskV1 {
-    TaskV1 {
+fn task_record(workspace: &Workspace, task: &Task) -> Result<TaskV1, PortableError> {
+    let retry_source_state = task
+        .retry_of()
+        .map(|retry_of| {
+            workspace
+                .task(retry_of)
+                .ok_or_else(|| PortableError::MissingReference(format!("task {retry_of}")))
+                .and_then(|source| match source.state() {
+                    TaskState::Failed => Ok(RetrySourceStateV1::Failed),
+                    TaskState::Cancelled => Ok(RetrySourceStateV1::Cancelled),
+                    state => Err(PortableError::InvalidDocument(format!(
+                        "task {} has retry source {} in unsupported state {state}",
+                        task.id(),
+                        retry_of
+                    ))),
+                })
+        })
+        .transpose()?;
+    Ok(TaskV1 {
         id: symbolic("task", task.id().get()),
         title: task.title().as_str().to_owned(),
         prompt: task.prompt().as_str().to_owned(),
         assignee: task.assignee().map(|id| symbolic("agent", id.get())),
         retry_of: task.retry_of().map(|id| symbolic("task", id.get())),
-    }
+        retry_source_state,
+    })
 }
 
 fn handoff_record(handoff: &Handoff) -> Result<HandoffV1, PortableError> {
@@ -842,6 +904,7 @@ fn build_commands(
     canvas: &CanvasV1,
     origin: PointV1,
     launcher_mappings: &BTreeMap<String, crate::domain::CommandPresetId>,
+    path_mappings: &BTreeMap<String, String>,
     settings: Option<&PortableSettingsV1>,
 ) -> Result<Vec<DomainCommand>, PortableError> {
     let mut commands = Vec::new();
@@ -945,8 +1008,56 @@ fn build_commands(
             program,
         )));
     }
+    let task_by_id = tasks
+        .iter()
+        .map(|task| (task.id.clone(), task))
+        .collect::<BTreeMap<_, _>>();
     for task in tasks {
-        let id = task_ids.allocate();
+        task_map.insert(task.id.clone(), TaskId::new(task_ids.allocate()));
+    }
+    let mut retry_source_states = BTreeMap::new();
+    for task in tasks {
+        let Some(retry_of) = &task.retry_of else {
+            if task.retry_source_state.is_some() {
+                return Err(PortableError::InvalidDocument(format!(
+                    "task {} has retry source state without a retry predecessor",
+                    task.id
+                )));
+            }
+            continue;
+        };
+        if !task_map.contains_key(retry_of) {
+            return Err(PortableError::MissingReference(retry_of.clone()));
+        }
+        let source_state = task
+            .retry_source_state
+            .unwrap_or(RetrySourceStateV1::Failed);
+        if let Some(previous) = retry_source_states.insert(retry_of.clone(), source_state)
+            && previous != source_state
+        {
+            return Err(PortableError::InvalidDocument(format!(
+                "retry predecessor {retry_of} has conflicting terminal states"
+            )));
+        }
+    }
+    let mut task_order = Vec::with_capacity(tasks.len());
+    let mut task_marks = BTreeMap::new();
+    for task in tasks {
+        append_task_order(
+            task.id.as_str(),
+            &task_by_id,
+            &mut task_marks,
+            &mut task_order,
+        )?;
+    }
+    for task_id in task_order {
+        let task = task_by_id
+            .get(&task_id)
+            .copied()
+            .expect("task order contains known task");
+        let task_id = *task_map
+            .get(&task.id)
+            .expect("task map contains known task");
         let assignee = task
             .assignee
             .as_ref()
@@ -967,14 +1078,8 @@ fn build_commands(
                     .ok_or_else(|| PortableError::MissingReference(retry.clone()))
             })
             .transpose()?;
-        if retry_of.is_some() {
-            return Err(PortableError::InvalidDocument(
-                "portable imports cannot restore runtime retry state".to_owned(),
-            ));
-        }
-        task_map.insert(task.id.clone(), TaskId::new(id));
         commands.push(DomainCommand::AddTask(Task::new(
-            TaskId::new(id),
+            task_id,
             Name::new(task.title.clone())
                 .map_err(|error| PortableError::InvalidDomain(error.to_string()))?,
             Content::new(task.prompt.clone())
@@ -982,6 +1087,15 @@ fn build_commands(
             assignee,
             retry_of,
         )));
+        if let Some(source_state) = retry_source_states.get(&task.id) {
+            commands.push(DomainCommand::TransitionTask {
+                task_id,
+                to: match source_state {
+                    RetrySourceStateV1::Failed => TaskState::Failed,
+                    RetrySourceStateV1::Cancelled => TaskState::Cancelled,
+                },
+            });
+        }
     }
     for handoff in handoffs {
         let id = handoff_ids.allocate();
@@ -1020,11 +1134,12 @@ fn build_commands(
         &agent_map,
         &task_map,
         &handoff_map,
+        path_mappings,
         &mut node_ids,
         &mut group_ids,
         &mut connection_ids,
     )?;
-    let current = workspace.all_canvas_layout();
+    let current = workspace.canvas_layout();
     let combined = CanvasLayout::new(
         current
             .nodes()
@@ -1052,6 +1167,34 @@ fn build_commands(
     Ok(commands)
 }
 
+fn append_task_order(
+    id: &str,
+    tasks: &BTreeMap<String, &TaskV1>,
+    marks: &mut BTreeMap<String, u8>,
+    order: &mut Vec<String>,
+) -> Result<(), PortableError> {
+    match marks.get(id).copied() {
+        Some(2) => return Ok(()),
+        Some(1) => {
+            return Err(PortableError::InvalidDocument(format!(
+                "task retry relationship contains a cycle at {id}"
+            )));
+        }
+        _ => {}
+    }
+    let task = tasks
+        .get(id)
+        .copied()
+        .ok_or_else(|| PortableError::MissingReference(id.to_owned()))?;
+    marks.insert(id.to_owned(), 1);
+    if let Some(retry_of) = &task.retry_of {
+        append_task_order(retry_of, tasks, marks, order)?;
+    }
+    marks.insert(id.to_owned(), 2);
+    order.push(id.to_owned());
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn canvas_domain(
     canvas: &CanvasV1,
@@ -1060,6 +1203,7 @@ fn canvas_domain(
     agents: &BTreeMap<String, AgentId>,
     tasks: &BTreeMap<String, TaskId>,
     handoffs: &BTreeMap<String, HandoffId>,
+    path_mappings: &BTreeMap<String, String>,
     node_ids: &mut IdAllocator,
     group_ids: &mut IdAllocator,
     connection_ids: &mut IdAllocator,
@@ -1073,7 +1217,7 @@ fn canvas_domain(
             (Some(target), None) => {
                 CanvasNodeContent::Reference(target_domain(target, agents, tasks, handoffs)?)
             }
-            (None, Some(content)) => content_domain(content)?,
+            (None, Some(content)) => content_domain(content, path_mappings)?,
             _ => {
                 return Err(PortableError::InvalidDocument(format!(
                     "node {} has invalid content",
@@ -1154,20 +1298,23 @@ fn target_id(target: &NodeTargetV1) -> &str {
     }
 }
 
-fn content_domain(content: &CanvasContentV1) -> Result<CanvasNodeContent, PortableError> {
+fn content_domain(
+    content: &CanvasContentV1,
+    path_mappings: &BTreeMap<String, String>,
+) -> Result<CanvasNodeContent, PortableError> {
     Ok(match content {
         CanvasContentV1::Note { path, title } => CanvasNodeContent::Note {
-            path: project_path(path)?,
+            path: mapped_project_path(path, path_mappings)?,
             title: name(title)?,
         },
         CanvasContentV1::FileTree { root } => CanvasNodeContent::FileTree {
-            root: project_path(root)?,
+            root: mapped_project_path(root, path_mappings)?,
         },
         CanvasContentV1::Artifact { path } => CanvasNodeContent::Artifact {
-            path: project_path(path)?,
+            path: mapped_project_path(path, path_mappings)?,
         },
         CanvasContentV1::Diff { path, comparison } => CanvasNodeContent::Diff {
-            path: project_path(path)?,
+            path: mapped_project_path(path, path_mappings)?,
             comparison: (*comparison).into(),
         },
         CanvasContentV1::Text { markdown } => CanvasNodeContent::Text {
@@ -1224,6 +1371,18 @@ fn content_domain(content: &CanvasContentV1) -> Result<CanvasNodeContent, Portab
 fn project_path(value: &str) -> Result<ProjectPath, PortableError> {
     ProjectPath::new(value.to_owned())
         .map_err(|error| PortableError::InvalidDomain(error.to_string()))
+}
+
+fn mapped_project_path(
+    source: &str,
+    path_mappings: &BTreeMap<String, String>,
+) -> Result<ProjectPath, PortableError> {
+    project_path(
+        path_mappings
+            .get(source)
+            .map(String::as_str)
+            .unwrap_or(source),
+    )
 }
 
 fn normalized_point(value: PointV1) -> Result<NormalizedPoint, PortableError> {
@@ -1462,6 +1621,20 @@ fn validate_content(content: &CanvasContentV1) -> Result<(), PortableError> {
     Ok(())
 }
 
+fn scan_template(template: &TemplateBodyV1) -> Vec<SecretWarning> {
+    let mut warnings = Vec::new();
+    scan_body(
+        &mut warnings,
+        &template.roles,
+        &template.agents,
+        &template.tasks,
+        &template.handoffs,
+        &template.canvas,
+        "template",
+    );
+    warnings
+}
+
 fn scan_archive(archive: &WorkspaceArchiveV1) -> Vec<SecretWarning> {
     let mut warnings = Vec::new();
     scan_string(
@@ -1475,104 +1648,181 @@ fn scan_archive(archive: &WorkspaceArchiveV1) -> Vec<SecretWarning> {
     if let Some(instructions) = &archive.archive.settings.instructions {
         scan_string(&mut warnings, "archive.settings.instructions", instructions);
     }
-    for role in &archive.archive.roles {
+    scan_body(
+        &mut warnings,
+        &archive.archive.roles,
+        &archive.archive.agents,
+        &archive.archive.tasks,
+        &archive.archive.handoffs,
+        &archive.archive.canvas,
+        "archive",
+    );
+    warnings
+}
+
+fn scan_body(
+    warnings: &mut Vec<SecretWarning>,
+    roles: &[RoleV1],
+    agents: &[AgentV1],
+    tasks: &[TaskV1],
+    handoffs: &[HandoffV1],
+    canvas: &CanvasV1,
+    prefix: &str,
+) {
+    for role in roles {
         scan_string(
-            &mut warnings,
-            &format!("roles[{}].name", role.id),
+            warnings,
+            &format!("{prefix}.roles[{}].name", role.id),
             &role.name,
         );
         scan_string(
-            &mut warnings,
-            &format!("roles[{}].instructions", role.id),
+            warnings,
+            &format!("{prefix}.roles[{}].instructions", role.id),
             &role.instructions,
         );
     }
-    for agent in &archive.archive.agents {
+    for agent in agents {
         scan_string(
-            &mut warnings,
-            &format!("agents[{}].name", agent.id),
+            warnings,
+            &format!("{prefix}.agents[{}].name", agent.id),
             &agent.name,
         );
     }
-    for task in &archive.archive.tasks {
+    for task in tasks {
         scan_string(
-            &mut warnings,
-            &format!("tasks[{}].title", task.id),
+            warnings,
+            &format!("{prefix}.tasks[{}].title", task.id),
             &task.title,
         );
         scan_string(
-            &mut warnings,
-            &format!("tasks[{}].prompt", task.id),
+            warnings,
+            &format!("{prefix}.tasks[{}].prompt", task.id),
             &task.prompt,
         );
     }
-    for handoff in &archive.archive.handoffs {
+    for handoff in handoffs {
         if let HandoffPayloadV1::Question { content } = &handoff.payload {
             scan_string(
-                &mut warnings,
-                &format!("handoffs[{}].payload.content", handoff.id),
+                warnings,
+                &format!("{prefix}.handoffs[{}].payload.content", handoff.id),
                 content,
             );
         }
     }
-    for node in &archive.archive.canvas.nodes {
+    for node in &canvas.nodes {
         if let Some(content) = &node.content {
-            let prefix = format!("canvas.nodes[{}].content", node.id);
+            let field = format!("{prefix}.canvas.nodes[{}].content", node.id);
             match content {
                 CanvasContentV1::Note { path, title } => {
-                    scan_string(&mut warnings, &format!("{prefix}.path"), path);
-                    scan_string(&mut warnings, &format!("{prefix}.title"), title);
+                    scan_string(warnings, &format!("{field}.path"), path);
+                    scan_string(warnings, &format!("{field}.title"), title);
                 }
                 CanvasContentV1::FileTree { root } => {
-                    scan_string(&mut warnings, &format!("{prefix}.root"), root);
+                    scan_string(warnings, &format!("{field}.root"), root);
                 }
                 CanvasContentV1::Artifact { path } | CanvasContentV1::Diff { path, .. } => {
-                    scan_string(&mut warnings, &format!("{prefix}.path"), path);
+                    scan_string(warnings, &format!("{field}.path"), path);
                 }
                 CanvasContentV1::Text { markdown } => {
-                    scan_string(&mut warnings, &format!("{prefix}.markdown"), markdown);
+                    scan_string(warnings, &format!("{field}.markdown"), markdown);
                 }
                 CanvasContentV1::Arrow { arrow } => {
                     if let Some(label) = &arrow.label {
-                        scan_string(&mut warnings, &format!("{prefix}.label"), label);
+                        scan_string(warnings, &format!("{field}.label"), label);
                     }
                 }
                 CanvasContentV1::Shape { .. } | CanvasContentV1::Freehand { .. } => {}
             }
         }
     }
-    warnings
 }
 
 fn scan_string(warnings: &mut Vec<SecretWarning>, field: &str, value: &str) {
     let lower = value.to_ascii_lowercase();
-    let patterns = [
-        ("private-key", "-----begin "),
-        ("bearer-token", "bearer "),
+    if lower.contains("-----begin ") {
+        warnings.push(SecretWarning {
+            field: field.to_owned(),
+            pattern: "private-key",
+        });
+    }
+    if has_credential_token(&lower, "bearer ", 16) {
+        warnings.push(SecretWarning {
+            field: field.to_owned(),
+            pattern: "bearer-token",
+        });
+    }
+    for (label, prefix) in [
         ("api-key-assignment", "api_key="),
         ("secret-assignment", "secret="),
         ("password-assignment", "password="),
         ("token-assignment", "token="),
-        ("github-token", "ghp_"),
-        ("github-token", "github_pat_"),
-        ("slack-token", "xoxb-"),
-        ("aws-access-key", "akia"),
-        ("openai-key", "sk-"),
-    ];
-    for (label, pattern) in patterns {
-        let suspicious = if pattern == "akia" {
-            lower.contains(pattern)
-                && lower[lower.find(pattern).unwrap_or(0)..].chars().count() >= 20
-        } else {
-            lower.contains(pattern)
-        };
-        if suspicious {
+    ] {
+        if has_assignment(&lower, prefix, 8) {
             warnings.push(SecretWarning {
                 field: field.to_owned(),
                 pattern: label,
             });
         }
     }
+    for (label, prefix, minimum) in [
+        ("github-token", "ghp_", 20),
+        ("github-token", "github_pat_", 20),
+        ("slack-token", "xoxb-", 16),
+        ("aws-access-key", "akia", 16),
+        ("openai-key", "sk-", 16),
+    ] {
+        if has_credential_token(&lower, prefix, minimum) {
+            warnings.push(SecretWarning {
+                field: field.to_owned(),
+                pattern: label,
+            });
+        }
+    }
+}
+
+fn has_assignment(value: &str, prefix: &str, minimum: usize) -> bool {
+    let mut offset = 0;
+    while let Some(relative) = value[offset..].find(prefix) {
+        let start = offset + relative;
+        if token_boundary(value, start) {
+            let candidate = value[start + prefix.len()..].trim_start();
+            let length = candidate
+                .chars()
+                .take_while(|character| !character.is_whitespace())
+                .count();
+            if length >= minimum {
+                return true;
+            }
+        }
+        offset = start + prefix.len();
+    }
+    false
+}
+
+fn has_credential_token(value: &str, prefix: &str, minimum: usize) -> bool {
+    let mut offset = 0;
+    while let Some(relative) = value[offset..].find(prefix) {
+        let start = offset + relative;
+        if token_boundary(value, start) {
+            let length = value[start + prefix.len()..]
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+                .count();
+            if length >= minimum {
+                return true;
+            }
+        }
+        offset = start + prefix.len();
+    }
+    false
+}
+
+fn token_boundary(value: &str, start: usize) -> bool {
+    start == 0
+        || !value.as_bytes()[start - 1].is_ascii_alphanumeric()
+            && value.as_bytes()[start - 1] != b'_'
 }
 
 fn symbolic(kind: &str, id: u64) -> String {
@@ -1802,7 +2052,10 @@ impl Error for PortableError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CanvasPoint, CanvasSize, DomainCommand, WorkspaceId};
+    use crate::domain::{
+        CanvasPoint, CanvasSize, DomainCommand, Floor, FloorLifecycle, Floors, TaskState,
+        WorkspaceDirectory, WorkspaceId,
+    };
 
     fn workspace() -> Workspace {
         Workspace::new(WorkspaceId::new(1), Name::new("Source").unwrap())
@@ -1858,6 +2111,203 @@ mod tests {
             .unwrap();
         let error = export_workspace_archive(&workspace).unwrap_err();
         assert!(matches!(error, PortableError::SecretDetected(_)));
+    }
+
+    #[test]
+    fn template_rejects_secret_like_canvas_content() {
+        let mut workspace = workspace();
+        workspace
+            .execute(DomainCommand::AddNode(Node::with_content(
+                NodeId::new(1),
+                CanvasNodeContent::Text {
+                    markdown: CanvasText::new("password=synthetic-review-canary").unwrap(),
+                },
+                CanvasPoint::new(0.0, 0.0).unwrap(),
+                CanvasSize::new(240.0, 160.0).unwrap(),
+            )))
+            .unwrap();
+
+        let error = export_template(&workspace, &[NodeId::new(1)]).unwrap_err();
+        assert!(matches!(error, PortableError::SecretDetected(_)));
+    }
+
+    #[test]
+    fn secret_scanner_respects_token_boundaries_and_key_shapes() {
+        let mut workspace = workspace();
+        workspace
+            .execute(DomainCommand::AddNode(Node::with_content(
+                NodeId::new(1),
+                CanvasNodeContent::Text {
+                    markdown: CanvasText::new("Use task-based planning").unwrap(),
+                },
+                CanvasPoint::new(0.0, 0.0).unwrap(),
+                CanvasSize::new(240.0, 160.0).unwrap(),
+            )))
+            .unwrap();
+
+        assert!(export_template(&workspace, &[NodeId::new(1)]).is_ok());
+        assert!(!has_credential_token("task-based planning", "sk-", 16));
+        assert!(has_credential_token(
+            "sk-synthetic-review-canary",
+            "sk-",
+            16
+        ));
+    }
+
+    #[test]
+    fn retry_relationships_round_trip_with_terminal_predecessor_state() {
+        let mut source = workspace();
+        source
+            .execute(DomainCommand::AddTask(Task::new(
+                TaskId::new(1),
+                Name::new("First attempt").unwrap(),
+                Content::new("Try the change").unwrap(),
+                None,
+                None,
+            )))
+            .unwrap();
+        source
+            .execute(DomainCommand::TransitionTask {
+                task_id: TaskId::new(1),
+                to: TaskState::Failed,
+            })
+            .unwrap();
+        source
+            .execute(DomainCommand::AddTask(Task::new(
+                TaskId::new(2),
+                Name::new("Second attempt").unwrap(),
+                Content::new("Try the change again").unwrap(),
+                None,
+                Some(TaskId::new(1)),
+            )))
+            .unwrap();
+        source
+            .execute(DomainCommand::AddTask(Task::new(
+                TaskId::new(3),
+                Name::new("Cancelled attempt").unwrap(),
+                Content::new("Cancel the change").unwrap(),
+                None,
+                None,
+            )))
+            .unwrap();
+        source
+            .execute(DomainCommand::TransitionTask {
+                task_id: TaskId::new(3),
+                to: TaskState::Cancelled,
+            })
+            .unwrap();
+        source
+            .execute(DomainCommand::AddTask(Task::new(
+                TaskId::new(4),
+                Name::new("Cancelled retry").unwrap(),
+                Content::new("Try a different path").unwrap(),
+                None,
+                Some(TaskId::new(3)),
+            )))
+            .unwrap();
+
+        let archive =
+            decode_workspace_archive(&export_workspace_archive(&source).unwrap()).unwrap();
+        assert_eq!(
+            archive.archive.tasks[1].retry_source_state,
+            Some(RetrySourceStateV1::Failed)
+        );
+        assert_eq!(
+            archive.archive.tasks[3].retry_source_state,
+            Some(RetrySourceStateV1::Cancelled)
+        );
+
+        let mut destination = workspace();
+        let plan = import_workspace_archive(&archive, &destination, &BTreeMap::new()).unwrap();
+        for command in plan.commands {
+            destination.execute(command).unwrap();
+        }
+        assert_eq!(
+            destination.task(TaskId::new(1)).unwrap().state(),
+            TaskState::Failed
+        );
+        assert_eq!(
+            destination.task(TaskId::new(2)).unwrap().retry_of(),
+            Some(TaskId::new(1))
+        );
+        assert_eq!(
+            destination.task(TaskId::new(3)).unwrap().state(),
+            TaskState::Cancelled
+        );
+        assert_eq!(
+            destination.task(TaskId::new(4)).unwrap().retry_of(),
+            Some(TaskId::new(3))
+        );
+    }
+
+    #[test]
+    fn import_merges_active_floor_without_duplicating_hidden_nodes() {
+        let mut source = workspace();
+        source
+            .execute(DomainCommand::AddNode(Node::with_content(
+                NodeId::new(1),
+                CanvasNodeContent::Text {
+                    markdown: CanvasText::new("imported").unwrap(),
+                },
+                CanvasPoint::new(100.0, 100.0).unwrap(),
+                CanvasSize::new(240.0, 160.0).unwrap(),
+            )))
+            .unwrap();
+        let document =
+            decode_template(&export_template(&source, &[NodeId::new(1)]).unwrap()).unwrap();
+
+        let mut destination = workspace();
+        destination
+            .execute(DomainCommand::AddNode(Node::with_content(
+                NodeId::new(10),
+                CanvasNodeContent::Text {
+                    markdown: CanvasText::new("hidden").unwrap(),
+                },
+                CanvasPoint::new(0.0, 0.0).unwrap(),
+                CanvasSize::new(240.0, 160.0).unwrap(),
+            )))
+            .unwrap();
+        let before = destination.floors().clone();
+        let mut floors = Floors::default();
+        for id in [1, 2] {
+            floors.entries.insert(
+                id,
+                Floor {
+                    name: Name::new(format!("floor-{id}")).unwrap(),
+                    directory: WorkspaceDirectory::new(format!("/floor-{id}")).unwrap(),
+                    repository: WorkspaceDirectory::new(format!("/floor-{id}")).unwrap(),
+                    branch: None,
+                    base_revision: "HEAD".to_owned(),
+                    base_branch: None,
+                    managed: false,
+                    ownership_token: None,
+                    owner: None,
+                    dirty: false,
+                    lifecycle: FloorLifecycle::Available,
+                },
+            );
+        }
+        floors.active = Some(1);
+        destination
+            .execute(DomainCommand::ReplaceFloors {
+                before,
+                after: floors,
+            })
+            .unwrap();
+
+        let plan = import_template(
+            &document,
+            &destination,
+            PointV1 { x: 0.0, y: 0.0 },
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        for command in plan.commands {
+            destination.execute(command).unwrap();
+        }
+        assert_eq!(destination.all_canvas_layout().nodes().len(), 2);
+        assert_eq!(destination.canvas_layout().nodes().len(), 1);
+        assert_eq!(destination.canvas_layout().nodes()[0].id(), NodeId::new(11));
     }
 
     #[test]
