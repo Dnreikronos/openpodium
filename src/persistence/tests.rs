@@ -140,6 +140,50 @@ fn batch_import_rolls_back_every_command_and_memory_on_any_snapshot_failure() {
 }
 
 #[test]
+fn batch_import_keeps_only_edge_snapshots_and_recovers_from_the_first() {
+    let temp = TempDir::new().unwrap();
+    let mut journal = Journal::open(database_path(&temp)).unwrap();
+    let mut workspace = test_workspace();
+
+    journal
+        .execute_batch(
+            &mut workspace,
+            [
+                DomainCommand::AddRole(test_role()),
+                DomainCommand::AddAgent(Agent::new(
+                    AgentId::new(1),
+                    name("Ada"),
+                    Some(RoleId::new(1)),
+                )),
+                DomainCommand::AddTask(Task::new(
+                    TaskId::new(1),
+                    name("Plan"),
+                    content("Keep the batch durable"),
+                    None,
+                    None,
+                )),
+            ],
+            timestamp(2),
+        )
+        .unwrap();
+
+    assert_eq!(table_count(&journal, "journal_events"), 3);
+    assert_eq!(table_count(&journal, "workspace_snapshots"), 2);
+
+    journal
+        .connection()
+        .execute(
+            "UPDATE workspace_snapshots SET checksum = zeroblob(32)
+             WHERE event_sequence = 3",
+            [],
+        )
+        .unwrap();
+    let recovered = journal.recover(WorkspaceId::new(7)).unwrap().unwrap();
+
+    assert_eq!(recovered, workspace);
+}
+
+#[test]
 fn timeline_returns_verified_events_in_journal_order() {
     let temp = TempDir::new().unwrap();
     let mut journal = Journal::open(database_path(&temp)).unwrap();

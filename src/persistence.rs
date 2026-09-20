@@ -10,7 +10,7 @@ mod storage;
 pub use canvas::{CanvasTransferError, export_canvas_fragment, import_canvas_fragment};
 pub use error::PersistenceError;
 pub use portable::{
-    AgentProgramV1, ArrowV1, CanvasContentV1, CanvasNodeV1, CanvasV1, ConnectionKindV1,
+    AgentProgramV1, AgentV1, ArrowV1, CanvasContentV1, CanvasNodeV1, CanvasV1, ConnectionKindV1,
     ConnectionV1, DiffComparisonV1, FreehandV1, HandoffPayloadV1, HandoffV1, ImportCounts,
     ImportPreview, NodeGroupV1, NodeTargetV1, PointV1, PortableError, PortableImport,
     PortableSettingsV1, RetrySourceStateV1, RoleV1, SecretWarning, ShapeKindV1, ShapeV1, TaskV1,

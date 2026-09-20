@@ -139,13 +139,20 @@ impl Journal {
     ) -> Result<Vec<TimelineEvent>, PersistenceError> {
         let mut candidate = workspace.clone();
         let mut records = Vec::new();
+        let mut first_snapshot_payload = None;
         for command in commands {
             let event = candidate.execute(command)?;
-            records.push((encode_event(&event)?, encode_workspace(&candidate)?, event));
+            if first_snapshot_payload.is_none() {
+                first_snapshot_payload = Some(encode_workspace(&candidate)?);
+            }
+            records.push((encode_event(&event)?, event));
         }
         if records.is_empty() {
             return Ok(Vec::new());
         }
+        let first_snapshot_payload =
+            first_snapshot_payload.expect("non-empty command batch has a first snapshot");
+        let final_snapshot_payload = encode_workspace(&candidate)?;
 
         let workspace_key = workspace.id().get().to_string();
         let occurred_at_value = occurred_at.as_unix_millis();
@@ -178,7 +185,8 @@ impl Journal {
         }
 
         let mut timelines = Vec::with_capacity(records.len());
-        for (event_payload, snapshot_payload, event) in records {
+        let record_count = records.len();
+        for (index, (event_payload, event)) in records.into_iter().enumerate() {
             let event_version = EVENT_FORMAT_VERSION.to_le_bytes();
             let timestamp_bytes = occurred_at_value.to_le_bytes();
             let event_checksum = checksum(&[
@@ -203,30 +211,37 @@ impl Journal {
                 .map_err(|source| PersistenceError::database("insert domain event", source))?;
 
             let sequence = positive_sequence(transaction.last_insert_rowid(), "domain event")?;
-            let snapshot_version = SNAPSHOT_FORMAT_VERSION.to_le_bytes();
-            let sequence_bytes = sequence.to_le_bytes();
-            let snapshot_checksum = checksum(&[
-                &snapshot_version,
-                workspace_key.as_bytes(),
-                &sequence_bytes,
-                &snapshot_payload,
-            ]);
-            transaction
-                .execute(
-                    "INSERT INTO workspace_snapshots (
-                        event_sequence, workspace_id, format_version, payload, checksum
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        i64::try_from(sequence).expect("SQLite row IDs fit in i64"),
-                        &workspace_key,
-                        i64::from(SNAPSHOT_FORMAT_VERSION),
-                        snapshot_payload,
-                        &snapshot_checksum[..],
-                    ],
-                )
-                .map_err(|source| {
-                    PersistenceError::database("insert workspace snapshot", source)
-                })?;
+            if index == 0 || index + 1 == record_count {
+                let snapshot_payload = if index + 1 == record_count {
+                    &final_snapshot_payload
+                } else {
+                    &first_snapshot_payload
+                };
+                let snapshot_version = SNAPSHOT_FORMAT_VERSION.to_le_bytes();
+                let sequence_bytes = sequence.to_le_bytes();
+                let snapshot_checksum = checksum(&[
+                    &snapshot_version,
+                    workspace_key.as_bytes(),
+                    &sequence_bytes,
+                    snapshot_payload,
+                ]);
+                transaction
+                    .execute(
+                        "INSERT INTO workspace_snapshots (
+                             event_sequence, workspace_id, format_version, payload, checksum
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            i64::try_from(sequence).expect("SQLite row IDs fit in i64"),
+                            &workspace_key,
+                            i64::from(SNAPSHOT_FORMAT_VERSION),
+                            snapshot_payload,
+                            &snapshot_checksum[..],
+                        ],
+                    )
+                    .map_err(|source| {
+                        PersistenceError::database("insert workspace snapshot", source)
+                    })?;
+            }
 
             timelines.push(TimelineEvent::new(
                 TimelineEventId::new(sequence),

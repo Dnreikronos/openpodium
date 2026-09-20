@@ -72,10 +72,13 @@ impl Display for WorkspaceError {
             Self::WorkspaceIdExhausted => {
                 formatter.write_str("cannot allocate another workspace identifier")
             }
-            Self::InvalidImportDestination { floor } => write!(
+            Self::InvalidImportDestination { floor: Some(floor) } => write!(
                 formatter,
-                "import destination floor {floor:?} is not the active destination"
+                "floor {floor} is not the active import destination"
             ),
+            Self::InvalidImportDestination { floor: None } => {
+                formatter.write_str("the main canvas is not the active import destination")
+            }
         }
     }
 }

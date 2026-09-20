@@ -2697,8 +2697,8 @@ fn confirm_portable_import(state: &mut OpenPodium) {
     }
     let camera = state.camera.position();
     let origin = PointV1 {
-        x: camera.x as f32,
-        y: camera.y as f32,
+        x: canvas_coordinate(camera.x),
+        y: canvas_coordinate(camera.y),
     };
     let workspaces = state
         .workspaces
