@@ -183,13 +183,11 @@ fn incompatible_and_invalid_updates_are_diagnostic_and_non_destructive() {
             .any(|diagnostic| diagnostic.kind() == DiagnosticKind::Manifest)
     );
 
-    write_manifest(
-        directory.path(),
-        &SAMPLE_MANIFEST.replace(
-            "\"minimum\": \"1.0\",\n    \"maximum\": \"1.0\"",
-            "\"minimum\": \"2.0\",\n    \"maximum\": \"2.0\"",
-        ),
-    );
+    let windows_manifest = SAMPLE_MANIFEST.lines().collect::<Vec<_>>().join("\r\n");
+    let mut incompatible: serde_json::Value = serde_json::from_str(&windows_manifest).unwrap();
+    incompatible["sdk"]["minimum"] = serde_json::json!("2.0");
+    incompatible["sdk"]["maximum"] = serde_json::json!("2.0");
+    write_manifest(directory.path(), &incompatible.to_string());
     catalog.refresh();
     assert_eq!(
         catalog.plugin("dev.openpodium.sample").unwrap().state(),
