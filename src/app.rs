@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iced::widget::{button, column, container, row, scrollable, text, text_editor, text_input};
-use iced::{Element, Fill, Subscription, Task, Theme, clipboard, event};
+use iced::{Color, Element, Fill, Subscription, Task, Theme, clipboard, event, theme};
 use openpodium::domain::{
     Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, ChatAttachmentId,
     ChatDraft, ChatMessageId, ChatThread, ChatThreadId, CommandPreset, CommandPresetId,
@@ -27,6 +27,7 @@ use openpodium::ipc::{
     AGENT_ID_ENV, AVAILABLE_ENV, AgentCapabilities, AgentRegistration, CLI_ENV, ENDPOINT_ENV,
     IpcService, SUPPORTED_VERSIONS, TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
 };
+use openpodium::localization::{LOCALE_KEY, Locale, Localizer};
 use openpodium::navigation::{CommandRegistry, Shortcut};
 use openpodium::orchestration::{DeliveryRequest, Orchestrator};
 use openpodium::persistence::{
@@ -34,6 +35,9 @@ use openpodium::persistence::{
     import_role,
 };
 use openpodium::portal::{PortalAction, PortalFrame};
+use openpodium::presentation::{
+    HIGH_CONTRAST_KEY, PresentationPreferences, REDUCED_MOTION_KEY, TEXT_SCALE_KEY,
+};
 use openpodium::routines::{
     MissedOccurrences, RoutineDispatch, RoutineScheduler, RunRequest, TriggerEvent, TriggerWatcher,
 };
@@ -97,6 +101,8 @@ struct PortableImportDraft {
 }
 
 struct OpenPodium {
+    localizer: Localizer,
+    presentation: PresentationPreferences,
     floor_ui: floors::UiState,
     context_ui: context_nodes::UiState,
     portal_ui: portals::UiState,
@@ -222,6 +228,8 @@ impl Default for OpenPodium {
             }
         }
         let mut state = Self {
+            localizer: Localizer::default(),
+            presentation: PresentationPreferences::default(),
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
             portal_ui: portals::UiState::default(),
@@ -280,6 +288,7 @@ impl Default for OpenPodium {
             portable_import: None,
             notice,
         };
+        load_application_preferences(&mut state);
         state.load_active_settings();
         state.sync_ipc_directory();
         refresh_supervisor_snapshot(&mut state);
@@ -294,6 +303,10 @@ enum Message {
     Portal(portals::Message),
     OrchestrationTick,
     Canvas(canvas::Message),
+    CycleTextScale,
+    CycleLocale,
+    ToggleHighContrast,
+    ToggleReducedMotion,
     Chat(chat::Message),
     Timeline(timeline_panel::Message),
     Supervisor(supervisor_panel::Message),
@@ -411,7 +424,8 @@ enum CanvasAction {
 pub(crate) fn run() -> iced::Result {
     iced::application(OpenPodium::default, update, view)
         .title(APP_NAME)
-        .theme(Theme::Dark)
+        .theme(|state: &OpenPodium| application_theme(state.presentation))
+        .scale_factor(|state: &OpenPodium| state.presentation.text_scale())
         .subscription(|_| {
             Subscription::batch([
                 iced::time::every(Duration::from_millis(100)).map(|_| Message::OrchestrationTick),
@@ -422,8 +436,70 @@ pub(crate) fn run() -> iced::Result {
         .run()
 }
 
+fn application_theme(preferences: PresentationPreferences) -> Theme {
+    if preferences.high_contrast() {
+        Theme::custom(
+            "OpenPodium high contrast",
+            theme::Palette {
+                background: Color::BLACK,
+                text: Color::WHITE,
+                primary: Color::from_rgb8(0, 255, 255),
+                success: Color::from_rgb8(0, 255, 0),
+                warning: Color::from_rgb8(255, 255, 0),
+                danger: Color::from_rgb8(255, 96, 96),
+            },
+        )
+    } else {
+        Theme::Dark
+    }
+}
+
+fn load_application_preferences(state: &mut OpenPodium) {
+    let Some(workspaces) = state.workspaces.as_ref() else {
+        return;
+    };
+    match workspaces.preferences() {
+        Ok(values) => {
+            if let Some((_, locale)) = values.iter().find(|(key, _)| key == LOCALE_KEY) {
+                state.localizer = Localizer::new(Locale::from_tag(locale));
+            }
+            state.presentation.apply_stored(values);
+        }
+        Err(error) => state.notice = Some(error.to_string()),
+    }
+}
+
+fn persist_application_preference(state: &mut OpenPodium, key: &str, value: &str) {
+    let Some(workspaces) = state.workspaces.as_mut() else {
+        return;
+    };
+    if let Err(error) = workspaces.store_preference(key, value) {
+        state.notice = Some(error.to_string());
+    }
+}
+
 fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
+        Message::CycleTextScale => {
+            state.presentation.cycle_text_scale();
+            let value = state.presentation.text_scale().to_string();
+            persist_application_preference(state, TEXT_SCALE_KEY, &value);
+        }
+        Message::CycleLocale => {
+            state.localizer.cycle_user_locale();
+            let value = state.localizer.locale().tag();
+            persist_application_preference(state, LOCALE_KEY, value);
+        }
+        Message::ToggleHighContrast => {
+            state.presentation.toggle_high_contrast();
+            let value = state.presentation.high_contrast().to_string();
+            persist_application_preference(state, HIGH_CONTRAST_KEY, &value);
+        }
+        Message::ToggleReducedMotion => {
+            state.presentation.toggle_reduced_motion();
+            let value = state.presentation.reduced_motion().to_string();
+            persist_application_preference(state, REDUCED_MOTION_KEY, &value);
+        }
         Message::Floor(message) => return floors::update(state, message),
         Message::Portal(message) => return portals::update(state, message),
         Message::OrchestrationTick => {
@@ -528,7 +604,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             match result {
                 Ok(workspace_id) => {
                     state.create_directory.clear();
-                    state.notice = Some("Workspace created".to_owned());
+                    state.notice = Some(state.localizer.text("workspace-created"));
                     state.navigation_ui.mark_stale(workspace_id);
                     floors::workspace_changed(state);
                     state.reset_canvas_session();
@@ -660,20 +736,22 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .as_ref()
         .and_then(WorkspaceManager::active_workspace)
         .is_some();
+    let palette_shortcut = state
+        .command_registry
+        .binding(openpodium::navigation::CommandId::OpenPalette)
+        .map_or_else(
+            || state.localizer.text("unbound"),
+            |shortcut| shortcut.display(openpodium::navigation::Platform::current()),
+        );
     let mut workspace_list = column![
-        text(APP_NAME).size(24),
-        button(text(format!(
-            "Search / commands ({})",
-            state
-                .command_registry
-                .binding(openpodium::navigation::CommandId::OpenPalette)
-                .map_or_else(
-                    || "unbound".to_owned(),
-                    |shortcut| shortcut.display(openpodium::navigation::Platform::current())
-                )
+        text(state.localizer.text("app-name")).size(24),
+        button(text(state.localizer.with_str(
+            "search-commands",
+            "shortcut",
+            palette_shortcut,
         )))
         .on_press(Message::Navigation(navigation_panel::Message::Open)),
-        text("Workspaces").size(14)
+        text(state.localizer.text("workspaces")).size(14)
     ]
     .spacing(12);
     if let Some(workspaces) = &state.workspaces {
@@ -686,11 +764,10 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             };
             let attention = timeline::attention_counts(workspace).total();
             if attention > 0 {
-                label = if attention == 1 {
-                    format!("{label} · 1 needs attention")
-                } else {
-                    format!("{label} · {attention} need attention")
-                };
+                label = format!(
+                    "{label} · {}",
+                    state.localizer.count("attention-count", attention)
+                );
             }
             workspace_list = workspace_list.push(
                 button(text(label))
@@ -700,18 +777,61 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         }
     }
 
+    let project_path_placeholder = state.localizer.text("project-path-placeholder");
+    let enabled = |enabled| {
+        state
+            .localizer
+            .text(if enabled { "state-on" } else { "state-off" })
+    };
+    let accessibility_controls = column![
+        text(state.localizer.text("accessibility-settings")).size(14),
+        button(text(state.localizer.with_str(
+            "locale",
+            "locale",
+            state.localizer.text(match state.localizer.locale() {
+                Locale::EnUs | Locale::PseudoRtl => "locale-en-us",
+                Locale::PtBr => "locale-pt-br",
+            }),
+        )))
+        .on_press(Message::CycleLocale),
+        button(text(state.localizer.with_str(
+            "text-scale",
+            "percent",
+            state.presentation.text_scale_percent().to_string(),
+        )))
+        .on_press(Message::CycleTextScale),
+        button(text(state.localizer.with_str(
+            "high-contrast",
+            "state",
+            enabled(state.presentation.high_contrast()),
+        )))
+        .on_press(Message::ToggleHighContrast),
+        button(text(state.localizer.with_str(
+            "reduced-motion",
+            "state",
+            enabled(state.presentation.reduced_motion()),
+        )))
+        .on_press(Message::ToggleReducedMotion),
+    ]
+    .spacing(8);
     let create_form = column![
-        text("Open a local directory").size(14),
-        text_input("/path/to/project", &state.create_directory)
+        text(state.localizer.text("open-local-directory")).size(14),
+        text_input(&project_path_placeholder, &state.create_directory)
             .on_input(Message::CreateDirectoryChanged),
-        button("Create workspace").on_press(Message::CreateWorkspace),
+        button(text(state.localizer.text("create-workspace"))).on_press(Message::CreateWorkspace),
     ]
     .spacing(8);
     let sidebar = container(
         column![
-            scrollable(workspace_list).height(Fill),
+            scrollable(workspace_list)
+                .direction(scrollable::Direction::Both {
+                    vertical: scrollable::Scrollbar::default(),
+                    horizontal: scrollable::Scrollbar::default(),
+                })
+                .height(Fill),
             supervisor_panel::panel(&state.supervisor_snapshot, &state.supervisor_ui)
                 .map(Message::Supervisor),
+            accessibility_controls,
             create_form
         ]
         .spacing(16)
@@ -1160,8 +1280,8 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     }
     if !has_active_workspace {
         settings = column![
-            text("Create your first workspace").size(28),
-            text("Enter a local project directory in the sidebar to get started."),
+            text(state.localizer.text("create-first-workspace")).size(28),
+            text(state.localizer.text("create-first-workspace-detail")),
         ]
         .spacing(12)
         .max_width(720);
@@ -1237,10 +1357,13 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                 state.canvas_revision,
             )
             .map(Message::Canvas),
-            container(scrollable(settings))
-                .width(420)
-                .height(Fill)
-                .padding(24),
+            container(scrollable(settings).direction(scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            }))
+            .width(420)
+            .height(Fill)
+            .padding(24),
         ]
         .into()
     } else {
@@ -4604,6 +4727,8 @@ mod tests {
             .create_workspace(&project, Timestamp::from_unix_millis(1))
             .unwrap();
         let mut state = OpenPodium {
+            localizer: Localizer::new(openpodium::localization::Locale::EnUs),
+            presentation: PresentationPreferences::default(),
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
             portal_ui: portals::UiState::default(),
@@ -5283,11 +5408,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn changing_one_application_preference_does_not_freeze_system_defaults() {
+        let temp = TempDir::new().unwrap();
+        let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        let _ = update(&mut state, Message::CycleLocale);
+        assert_eq!(state.localizer.locale(), Locale::PtBr);
+        assert_eq!(
+            state.workspaces.as_ref().unwrap().preferences().unwrap(),
+            vec![(LOCALE_KEY.to_owned(), "pt-BR".to_owned())]
+        );
+
+        let previous_contrast = state.presentation.high_contrast();
+        let _ = update(&mut state, Message::ToggleHighContrast);
+        assert_eq!(state.presentation.high_contrast(), !previous_contrast);
+        assert_eq!(
+            state.workspaces.as_ref().unwrap().preferences().unwrap(),
+            vec![
+                (
+                    HIGH_CONTRAST_KEY.to_owned(),
+                    (!previous_contrast).to_string()
+                ),
+                (LOCALE_KEY.to_owned(), "pt-BR".to_owned()),
+            ]
+        );
+    }
+
     fn test_state(
         workspaces: WorkspaceManager,
         terminals: BTreeMap<TerminalKey, Session>,
     ) -> OpenPodium {
         OpenPodium {
+            localizer: Localizer::new(openpodium::localization::Locale::EnUs),
+            presentation: PresentationPreferences::default(),
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
             portal_ui: portals::UiState::default(),

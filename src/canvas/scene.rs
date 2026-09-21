@@ -226,7 +226,7 @@ fn draw_nodes(
         let accent = node_color(label.kind, palette);
         let is_selected = selected.contains(&node.id());
 
-        frame.fill(&shape, Color::from_rgb(0.055, 0.065, 0.08));
+        frame.fill(&shape, palette.background.weak.color);
         frame.stroke(
             &shape,
             Stroke::default()
