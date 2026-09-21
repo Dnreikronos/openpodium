@@ -63,6 +63,15 @@ Validates and routes typed handoffs. A local OpenPodium command/IPC endpoint wil
 
 Stores current snapshots plus an append-only journal of meaningful changes. Transactions update the journal and materialized state together. Canvas movement may be coalesced before persistence; task and lifecycle events are never silently discarded.
 
+### Remote access
+
+Owns explicit device pairing, revocable workspace capability grants,
+end-to-end encrypted packets, incremental projections, acknowledgements, and
+idempotent steering command receipts. It is transport agnostic: a relay may
+forward opaque packets but never joins the trust boundary or receives project
+content. The protocol and recovery rules are defined in the
+[encrypted remote protocol](remote-protocol.md).
+
 ### Git isolation
 
 Creates and inventories worktrees, records branch ownership, calculates changed paths, and reports collisions. It proposes integration operations but never merges or discards user work without an explicit action.

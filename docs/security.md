@@ -38,6 +38,7 @@ same-user process sandbox.
 | Browser portals | Only HTTP(S) navigation; isolated temporary Chromium profile; Chromium chooses an ephemeral loopback CDP port; observation-revision element tokens; explicit policy approval and expiring grants for consequential actions. | `src/portal/browser.rs`, `src/portal/policy.rs`, `src/ipc/portal.rs` | browser, portal policy, and IPC portal tests |
 | Device portals | Appium endpoints must be loopback, responses are capped at 8 MiB, XML identities are observation-scoped, and consequential actions pass through the same approval policy. | `src/portal/appium.rs`, `src/portal/device.rs`, `src/portal/policy.rs` | `portal::appium::tests::arbitrary_appium_xml_and_http_responses_fail_safely`, Appium identity and policy tests |
 | Native plugins | Disabled by default; manifest paths cannot traverse or escape through symlinks; child environment is cleared; protocol frames are capped at 1 MiB; timeouts, ID matching, and quarantine contain protocol failures. Grants are intersected with declarations. | `src/plugins/catalog.rs`, `src/plugins/manifest.rs`, `src/plugins/protocol.rs` | `plugins::tests::arbitrary_manifest_input_is_rejected_or_fully_validated`, `tests/plugins.rs` |
+| Remote devices | Explicit single-use local pairing; X25519 identity agreement; XChaCha20-Poly1305 payload encryption; revocable workspace and operation grants; bounded packets; ordered acknowledgements and idempotent command IDs. Relays receive only authenticated ciphertext and routing metadata. | `src/remote` | `remote::tests` |
 | Diagnostics | Common assignments, authorization headers, credential prefixes, URL passwords, and private keys are redacted. Secret-bearing process and adapter plans have redacted `Debug` output. OpenPodium has no crash uploader or remote logging sink. | `src/security.rs`, process/plugin/Git/portal error boundaries | `security::tests`, `runtime::tests::process_debug_output_redacts_secret_arguments_and_environment`, plugin redaction tests |
 
 Terminal content and project files are intentionally user-visible and may
@@ -73,6 +74,7 @@ listed below.
 | Device discovery | Local `adb`, `xcrun`, and Appium tooling | Explicit discovery; tool-defined device/daemon traffic | Output is parsed as untrusted input; diagnostic stderr is redacted |
 | Agent and custom runtime processes | Process-defined destinations | Explicit agent launch | Outside OpenPodium's network mediation; isolate with OS facilities when required |
 | Native plugin processes | Process-defined destinations | Explicit enable/start after permission review | Outside OpenPodium's network mediation; child environment is cleared but OS network access remains |
+| Remote relay or direct peer | User-configured HTTPS/WebSocket relay or paired peer | Explicit remote-access enablement; encrypted remote packets plus routing metadata | Project content is encrypted end to end; device grants are checked locally; relay transport is not yet selected |
 
 Git operations in this repository are local status, diff, worktree, merge,
 rebase, and cherry-pick operations; OpenPodium does not invoke fetch, pull,
