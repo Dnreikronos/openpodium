@@ -283,13 +283,19 @@ fn subtract(rect: Rectangle, occluder: Rectangle) -> Vec<Rectangle> {
     parts
 }
 
-/// The parts of `rect` still visible once every occluder is removed.
+/// The parts of `rect` still visible: inside `within`, and not taken by an
+/// occluder.
 ///
 /// The renderer batches all canvas text and draws it above all canvas
-/// geometry, so a node covered by another cannot be hidden by draw order: its
-/// text would paint straight through. Clipping each node to what it actually
-/// shows is what keeps a stack of nodes readable.
-fn visible_regions(rect: Rectangle, occluders: &[Rectangle]) -> Vec<Rectangle> {
+/// geometry, so a node covered by another cannot be hidden by draw order, and
+/// a node hanging off the edge is not clipped to the widget either. Its text
+/// would paint straight through the node above it and across the workspace
+/// rail beside it. Clipping each node to what it actually shows is what keeps
+/// both honest.
+fn visible_regions(rect: Rectangle, within: Rectangle, occluders: &[Rectangle]) -> Vec<Rectangle> {
+    let Some(rect) = rect.intersection(&within) else {
+        return Vec::new();
+    };
     let mut regions = vec![rect];
     for occluder in occluders {
         if regions.is_empty() {
@@ -307,6 +313,9 @@ fn visible_regions(rect: Rectangle, occluders: &[Rectangle]) -> Vec<Rectangle> {
         regions = split;
     }
     regions
+        .into_iter()
+        .filter(|region| region.width > 0.0 && region.height > 0.0)
+        .collect()
 }
 
 fn draw_nodes(
@@ -327,6 +336,11 @@ fn draw_nodes(
         .filter(|node| visible.intersects(node_bounds(node)))
         .collect::<Vec<_>>();
     nodes.sort_by_key(|node| (node.z_index(), node.id()));
+
+    let canvas_bounds = Rectangle::new(
+        Point::ORIGIN,
+        Size::new(viewport.width as f32, viewport.height as f32),
+    );
 
     // Screen rectangles in the same back-to-front order, so each node can be
     // clipped to the part of it that the nodes above have not covered.
@@ -351,7 +365,7 @@ fn draw_nodes(
         .collect::<Vec<_>>();
 
     for (index, node) in nodes.iter().enumerate() {
-        let regions = visible_regions(rects[index], &rects[index + 1..]);
+        let regions = visible_regions(rects[index], canvas_bounds, &rects[index + 1..]);
         if regions.is_empty() {
             continue;
         }
@@ -956,6 +970,10 @@ mod tests {
         Rectangle::new(Point::new(x, y), Size::new(width, height))
     }
 
+    fn canvas() -> Rectangle {
+        rect(-1_000.0, -1_000.0, 4_000.0, 4_000.0)
+    }
+
     fn area(regions: &[Rectangle]) -> f32 {
         regions
             .iter()
@@ -975,9 +993,9 @@ mod tests {
     fn an_unobstructed_node_is_drawn_whole() {
         let node = rect(0.0, 0.0, 100.0, 100.0);
 
-        assert_eq!(visible_regions(node, &[]), vec![node]);
+        assert_eq!(visible_regions(node, canvas(), &[]), vec![node]);
         assert_eq!(
-            visible_regions(node, &[rect(200.0, 200.0, 50.0, 50.0)]),
+            visible_regions(node, canvas(), &[rect(200.0, 200.0, 50.0, 50.0)]),
             vec![node]
         );
     }
@@ -988,11 +1006,12 @@ mod tests {
     fn a_fully_covered_node_is_not_drawn() {
         let node = rect(10.0, 10.0, 80.0, 80.0);
 
-        assert!(visible_regions(node, &[rect(0.0, 0.0, 200.0, 200.0)]).is_empty());
-        assert!(visible_regions(node, &[node]).is_empty());
+        assert!(visible_regions(node, canvas(), &[rect(0.0, 0.0, 200.0, 200.0)]).is_empty());
+        assert!(visible_regions(node, canvas(), &[node]).is_empty());
         assert!(
             visible_regions(
                 node,
+                canvas(),
                 &[rect(0.0, 0.0, 200.0, 50.0), rect(0.0, 50.0, 200.0, 150.0)]
             )
             .is_empty(),
@@ -1005,13 +1024,27 @@ mod tests {
         let node = rect(0.0, 0.0, 100.0, 100.0);
 
         // Covered from the right half.
-        let regions = visible_regions(node, &[rect(50.0, -10.0, 100.0, 120.0)]);
+        let regions = visible_regions(node, canvas(), &[rect(50.0, -10.0, 100.0, 120.0)]);
         assert_eq!(regions, vec![rect(0.0, 0.0, 50.0, 100.0)]);
 
         // Covered through the middle, leaving a band above and below.
-        let regions = visible_regions(node, &[rect(-10.0, 40.0, 120.0, 20.0)]);
+        let regions = visible_regions(node, canvas(), &[rect(-10.0, 40.0, 120.0, 20.0)]);
         assert_eq!(area(&regions), 8_000.0);
         assert!(regions.iter().all(|region| region.height > 0.0));
+    }
+
+    /// The text batch is not clipped to the canvas widget, so a node hanging
+    /// off the edge would otherwise print across the workspace rail.
+    #[test]
+    fn a_node_past_the_canvas_edge_is_cut_at_it() {
+        let node = rect(-200.0, 50.0, 300.0, 100.0);
+        let canvas = rect(0.0, 0.0, 800.0, 600.0);
+
+        assert_eq!(
+            visible_regions(node, canvas, &[]),
+            vec![rect(0.0, 50.0, 100.0, 100.0)]
+        );
+        assert!(visible_regions(rect(-400.0, 0.0, 100.0, 100.0), canvas, &[]).is_empty());
     }
 
     /// Fragmenting without bound would cost more than the bleeding it avoids.
@@ -1025,7 +1058,7 @@ mod tests {
             rect(60.0, 60.0, 10.0, 10.0),
         ];
 
-        let regions = visible_regions(node, &occluders);
+        let regions = visible_regions(node, canvas(), &occluders);
         assert!(regions.len() <= MAX_VISIBLE_REGIONS.max(1));
         assert_eq!(regions, vec![node]);
     }
