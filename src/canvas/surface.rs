@@ -670,10 +670,7 @@ impl Surface {
         text: Option<&str>,
         modifiers: Modifiers,
     ) -> Option<Action<Message>> {
-        if crate::navigation_panel::shortcut_from_key(key, modifiers)
-            .as_ref()
-            .is_some_and(|shortcut| self.application_shortcuts.contains(shortcut))
-        {
+        if is_application_shortcut(&self.application_shortcuts, key, modifiers) {
             return Some(Action::capture());
         }
         if is_copy_shortcut(key, modifiers) {
@@ -695,10 +692,7 @@ impl Surface {
         text: Option<&str>,
         modifiers: Modifiers,
     ) -> Option<Action<Message>> {
-        if crate::navigation_panel::shortcut_from_key(key, modifiers)
-            .as_ref()
-            .is_some_and(|shortcut| self.application_shortcuts.contains(shortcut))
-        {
+        if is_application_shortcut(&self.application_shortcuts, key, modifiers) {
             return Some(Action::capture());
         }
         if modifiers.command() || modifiers.control() || modifiers.alt() {
@@ -905,6 +899,12 @@ fn viewport(bounds: Rectangle) -> ViewportSize {
     ViewportSize::new(f64::from(bounds.width), f64::from(bounds.height))
 }
 
+fn is_application_shortcut(shortcuts: &[Shortcut], key: &Key, modifiers: Modifiers) -> bool {
+    crate::navigation_panel::shortcut_from_key(key, modifiers)
+        .as_ref()
+        .is_some_and(|shortcut| shortcuts.contains(shortcut))
+}
+
 fn scroll_delta(delta: mouse::ScrollDelta) -> (f64, f64, f64) {
     match delta {
         mouse::ScrollDelta::Lines { x, y } => (
@@ -1067,6 +1067,36 @@ mod tests {
             ),
             Some(release)
         );
+    }
+
+    #[test]
+    fn focused_embedded_content_releases_zoom_shortcuts_to_the_application() {
+        let shortcuts = [
+            Shortcut::parse("plus").unwrap(),
+            Shortcut::parse("minus").unwrap(),
+            Shortcut::parse("0").unwrap(),
+        ];
+
+        assert!(is_application_shortcut(
+            &shortcuts,
+            &Key::Character("+".into()),
+            Modifiers::empty(),
+        ));
+        assert!(is_application_shortcut(
+            &shortcuts,
+            &Key::Character("-".into()),
+            Modifiers::empty(),
+        ));
+        assert!(is_application_shortcut(
+            &shortcuts,
+            &Key::Character("0".into()),
+            Modifiers::empty(),
+        ));
+        assert!(!is_application_shortcut(
+            &shortcuts,
+            &Key::Character("z".into()),
+            Modifiers::empty(),
+        ));
     }
 
     #[test]

@@ -245,7 +245,14 @@ pub(super) fn handle_key(
         return Task::none();
     };
     if status == Status::Captured
-        && !matches!(command, CommandId::OpenPalette | CommandId::FocusCanvas)
+        && !matches!(
+            command,
+            CommandId::OpenPalette
+                | CommandId::FocusCanvas
+                | CommandId::ZoomIn
+                | CommandId::ZoomOut
+                | CommandId::ResetZoom
+        )
     {
         return Task::none();
     }
@@ -310,7 +317,7 @@ fn save_binding(state: &mut OpenPodium, unbind: bool) -> Task<Message> {
     Task::none()
 }
 
-fn execute_command(state: &mut OpenPodium, command: CommandId) -> Task<Message> {
+pub(super) fn execute_command(state: &mut OpenPodium, command: CommandId) -> Task<Message> {
     match command {
         CommandId::OpenPalette => return update(state, navigation_panel::Message::Open),
         CommandId::NextWorkspace => return cycle_workspace(state, true),

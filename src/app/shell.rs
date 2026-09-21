@@ -59,6 +59,20 @@ pub fn toolbar(theme: &Theme) -> container::Style {
     }
 }
 
+pub fn control_group(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(palette.background.weakest.color.into()),
+        text_color: Some(palette.background.base.text),
+        border: Border {
+            width: 1.0,
+            radius: 10.0.into(),
+            color: palette.background.weak.color,
+        },
+        ..container::Style::default()
+    }
+}
+
 pub fn inspector(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {

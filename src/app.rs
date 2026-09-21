@@ -35,7 +35,7 @@ use openpodium::ipc::{
     IpcService, SUPPORTED_VERSIONS, TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
 };
 use openpodium::localization::{LOCALE_KEY, Locale, Localizer};
-use openpodium::navigation::{CommandRegistry, Shortcut};
+use openpodium::navigation::{CommandId, CommandRegistry, Shortcut};
 use openpodium::orchestration::{DeliveryRequest, Orchestrator};
 use openpodium::persistence::{
     ImportPreview, PointV1, export_canvas_fragment, export_role, import_canvas_fragment,
@@ -333,6 +333,7 @@ enum Message {
     ToggleHighContrast,
     ToggleReducedMotion,
     ToggleInspector,
+    ExecuteCommand(CommandId),
     Chat(chat::Message),
     Timeline(timeline_panel::Message),
     Supervisor(supervisor_panel::Message),
@@ -532,6 +533,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             persist_application_preference(state, REDUCED_MOTION_KEY, &value);
         }
         Message::ToggleInspector => state.inspector_open = !state.inspector_open,
+        Message::ExecuteCommand(command) => return navigation::execute_command(state, command),
         Message::Floor(message) => return floors::update(state, message),
         Message::Portal(message) => return portals::update(state, message),
         Message::OrchestrationTick => {
@@ -1444,8 +1446,11 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             state.focused_terminal,
             state.focused_portal,
             [
-                openpodium::navigation::CommandId::OpenPalette,
-                openpodium::navigation::CommandId::FocusCanvas,
+                CommandId::OpenPalette,
+                CommandId::FocusCanvas,
+                CommandId::ZoomIn,
+                CommandId::ZoomOut,
+                CommandId::ResetZoom,
             ]
             .into_iter()
             .filter_map(|command| state.command_registry.binding(command).cloned())
@@ -1454,6 +1459,26 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         )
         .map(Message::Canvas);
         let workspace_title = workspace.name().to_owned();
+        let zoom_controls = container(
+            row![
+                button(text("−").size(18))
+                    .style(shell::utility_button)
+                    .padding([5, 10])
+                    .on_press(Message::ExecuteCommand(CommandId::ZoomOut)),
+                button(text(format!("{}%", state.camera.zoom_percent())).size(12))
+                    .style(shell::utility_button)
+                    .padding([7, 9])
+                    .on_press(Message::ExecuteCommand(CommandId::ResetZoom)),
+                button(text("+").size(17))
+                    .style(shell::utility_button)
+                    .padding([5, 10])
+                    .on_press(Message::ExecuteCommand(CommandId::ZoomIn)),
+            ]
+            .spacing(1)
+            .align_y(IcedAlignment::Center),
+        )
+        .style(shell::control_group)
+        .padding(2);
         let toolbar = container(
             row![
                 column![
@@ -1464,6 +1489,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                 ]
                 .spacing(1)
                 .width(Fill),
+                zoom_controls,
                 button("+ Codex").on_press(Message::AddAgent(AgentProgram::Codex)),
                 button("+ Claude").on_press(Message::AddAgent(AgentProgram::Claude)),
                 button(if state.inspector_open {
@@ -5089,6 +5115,36 @@ mod tests {
         state.reset_canvas_session();
 
         assert!(state.terminals.contains_key(&key));
+    }
+
+    #[test]
+    fn toolbar_zoom_commands_update_and_reset_the_canvas_camera() {
+        let temp = TempDir::new().unwrap();
+        let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        let _ = update(&mut state, Message::ExecuteCommand(CommandId::ZoomOut));
+        assert_eq!(state.camera.zoom_percent(), 83);
+
+        let _ = update(&mut state, Message::ExecuteCommand(CommandId::ZoomIn));
+        assert_eq!(state.camera.zoom_percent(), 100);
+
+        let _ = update(&mut state, Message::ExecuteCommand(CommandId::ZoomOut));
+        let _ = update(&mut state, Message::ExecuteCommand(CommandId::ResetZoom));
+        assert_eq!(state.camera, Camera::default());
+
+        let zoom_out = state
+            .command_registry
+            .binding(CommandId::ZoomOut)
+            .cloned()
+            .unwrap();
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Other,
+            Some(zoom_out),
+            event::Status::Captured,
+        );
+        assert_eq!(state.camera.zoom_percent(), 83);
     }
 
     #[test]
