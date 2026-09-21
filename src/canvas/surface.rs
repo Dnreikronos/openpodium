@@ -369,7 +369,7 @@ impl canvas::Program<Message> for Surface {
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let anchor = cursor.position_in(bounds)?;
                 let (x, y, zoom_sensitivity) = scroll_delta(*delta);
-                if !(state.modifiers.command() || state.modifiers.control())
+                if state.modifiers.alt()
                     && let Some((node_id, observation_revision, point)) =
                         self.portal_point_at(anchor, bounds)
                 {
@@ -385,7 +385,7 @@ impl canvas::Program<Message> for Surface {
                         .and_capture(),
                     );
                 }
-                if !(state.modifiers.command() || state.modifiers.control())
+                if state.modifiers.alt()
                     && let Some((node_id, row, column, _)) = self.terminal_cell_at(anchor, bounds)
                 {
                     let lines = (y / f64::from(CELL_HEIGHT)).round() as i32;
@@ -405,14 +405,10 @@ impl canvas::Program<Message> for Surface {
                         );
                     }
                 }
-                let camera = if state.modifiers.command() || state.modifiers.control() {
-                    self.camera.zoom_at(
-                        (y * zoom_sensitivity).exp(),
-                        ScreenPoint::new(f64::from(anchor.x), f64::from(anchor.y)),
-                        viewport(bounds),
-                    )
-                } else {
+                let camera = if state.modifiers.alt() {
                     self.camera.pan_by_screen(x, y)
+                } else {
+                    zoom_camera(self.camera, y, zoom_sensitivity, anchor, bounds)
                 };
                 self.publish_camera(state, camera)
             }
@@ -916,6 +912,20 @@ fn scroll_delta(delta: mouse::ScrollDelta) -> (f64, f64, f64) {
     }
 }
 
+fn zoom_camera(
+    camera: Camera,
+    vertical_delta: f64,
+    sensitivity: f64,
+    anchor: Point,
+    bounds: Rectangle,
+) -> Camera {
+    camera.zoom_at(
+        (vertical_delta * sensitivity).exp(),
+        ScreenPoint::new(f64::from(anchor.x), f64::from(anchor.y)),
+        viewport(bounds),
+    )
+}
+
 fn saturating_i32(value: f64) -> i32 {
     value
         .round()
@@ -1097,6 +1107,30 @@ mod tests {
             &Key::Character("z".into()),
             Modifiers::empty(),
         ));
+    }
+
+    #[test]
+    fn wheel_and_trackpad_scroll_zoom_around_the_pointer_without_modifiers() {
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1_000.0, 800.0));
+        let anchor = Point::new(760.0, 240.0);
+        let camera = Camera::default();
+        let world_before = camera.screen_to_world(
+            ScreenPoint::new(f64::from(anchor.x), f64::from(anchor.y)),
+            viewport(bounds),
+        );
+
+        for delta in [
+            mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            mouse::ScrollDelta::Pixels { x: 0.0, y: 24.0 },
+        ] {
+            let (_, y, sensitivity) = scroll_delta(delta);
+            let zoomed = zoom_camera(camera, y, sensitivity, anchor, bounds);
+            let screen_after = zoomed.world_to_screen(world_before, viewport(bounds));
+
+            assert!(zoomed.zoom() > camera.zoom());
+            assert!((screen_after.x - f64::from(anchor.x)).abs() < 0.001);
+            assert!((screen_after.y - f64::from(anchor.y)).abs() < 0.001);
+        }
     }
 
     #[test]
