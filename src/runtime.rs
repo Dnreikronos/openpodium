@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter};
 use std::path::{Path, PathBuf};
 
 mod adapters;
@@ -21,7 +21,7 @@ pub trait ProcessRuntime: Send + Sync {
     fn spawn(&self, spec: ProcessSpec) -> Result<RunningProcess, RuntimeError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProcessSpec {
     program: OsString,
     arguments: Vec<OsString>,
@@ -29,6 +29,40 @@ pub struct ProcessSpec {
     environment: Vec<(OsString, OsString)>,
     terminal_size: TerminalSize,
     output_capacity: usize,
+}
+
+impl Debug for ProcessSpec {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let arguments = self
+            .arguments
+            .iter()
+            .map(|argument| {
+                crate::security::redact_secrets(&argument.to_string_lossy()).into_owned()
+            })
+            .collect::<Vec<_>>();
+        let environment = self
+            .environment
+            .iter()
+            .map(|(name, value)| {
+                let name = name.to_string_lossy();
+                let value = if crate::security::is_sensitive_name(&name) {
+                    "[redacted]".to_owned()
+                } else {
+                    crate::security::redact_secrets(&value.to_string_lossy()).into_owned()
+                };
+                (name.into_owned(), value)
+            })
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("ProcessSpec")
+            .field("program", &self.program)
+            .field("arguments", &arguments)
+            .field("working_directory", &self.working_directory)
+            .field("environment", &environment)
+            .field("terminal_size", &self.terminal_size)
+            .field("output_capacity", &self.output_capacity)
+            .finish()
+    }
 }
 
 impl ProcessSpec {

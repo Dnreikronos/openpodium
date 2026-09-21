@@ -3,8 +3,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use openpodium::plugins::{
-    AdapterRequest, Capability, DiagnosticKind, PermissionGrant, PluginCatalog, PluginError,
-    PluginSession, PluginState,
+    AdapterRequest, Capability, DiagnosticKind, PermissionGrant, PermissionImpact, PluginCatalog,
+    PluginError, PluginSession, PluginState,
 };
 use tempfile::TempDir;
 
@@ -55,6 +55,58 @@ fn external_plugin_adds_a_permission_gated_provider_and_command() {
         catalog.plugin("dev.openpodium.sample").unwrap().state(),
         PluginState::Disabled
     );
+}
+
+#[test]
+fn permission_review_exposes_requested_granted_and_native_process_risk() {
+    let (_directory, mut catalog) = installed_sample();
+    catalog
+        .enable(
+            "dev.openpodium.sample",
+            PermissionGrant::new([Capability::Commands]),
+        )
+        .unwrap();
+
+    let review = catalog.permission_review("dev.openpodium.sample").unwrap();
+    assert_eq!(review.plugin_name(), "OpenPodium sample plugin");
+    assert!(
+        review
+            .native_access_notice()
+            .contains("filesystem and network")
+    );
+    let commands = review
+        .permissions()
+        .iter()
+        .find(|item| item.capability() == Capability::Commands)
+        .unwrap();
+    assert_eq!(commands.impact(), PermissionImpact::Execute);
+    assert!(commands.granted());
+    let adapters = review
+        .permissions()
+        .iter()
+        .find(|item| item.capability() == Capability::Adapters)
+        .unwrap();
+    assert!(!adapters.granted());
+}
+
+#[cfg(unix)]
+#[test]
+fn discovery_rejects_an_executable_symlink_that_escapes_the_plugin_directory() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let plugin_directory = directory.path().join("sample");
+    fs::create_dir(&plugin_directory).unwrap();
+    let binary_name = Path::new(SAMPLE_BINARY).file_name().unwrap();
+    symlink(SAMPLE_BINARY, plugin_directory.join(binary_name)).unwrap();
+    write_manifest(directory.path(), SAMPLE_MANIFEST);
+
+    let catalog = PluginCatalog::discover([directory.path().to_path_buf()]);
+    assert!(catalog.plugin("dev.openpodium.sample").is_none());
+    assert!(catalog.diagnostics().iter().any(|diagnostic| {
+        diagnostic.kind() == DiagnosticKind::Discovery
+            && diagnostic.message().contains("inside its plugin directory")
+    }));
 }
 
 #[test]

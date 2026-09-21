@@ -166,7 +166,9 @@ impl Repository {
                     .to_owned(),
             })?;
         if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let detail =
+                crate::security::redact_secrets(String::from_utf8_lossy(&output.stderr).trim())
+                    .into_owned();
             return Err(IntegrationError {
                 message: if detail.is_empty() {
                     format!("Git {:?} failed", action)
@@ -263,7 +265,10 @@ fn byte_output(directory: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         .output()
         .map_err(|error| format!("Cannot run Git: {error}"))?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        return Err(crate::security::redact_secrets(
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )
+        .into_owned());
     }
     Ok(output.stdout)
 }

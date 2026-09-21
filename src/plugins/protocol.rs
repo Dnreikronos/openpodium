@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -77,13 +77,41 @@ pub struct AdapterRequest {
     pub prompt: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterPlan {
     pub program: String,
     #[serde(default)]
     pub arguments: Vec<String>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+}
+
+impl Debug for AdapterPlan {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let arguments = self
+            .arguments
+            .iter()
+            .map(|argument| crate::security::redact_secrets(argument).into_owned())
+            .collect::<Vec<_>>();
+        let environment = self
+            .environment
+            .iter()
+            .map(|(name, value)| {
+                let value = if crate::security::is_sensitive_name(name) {
+                    "[redacted]".to_owned()
+                } else {
+                    crate::security::redact_secrets(value).into_owned()
+                };
+                (name, value)
+            })
+            .collect::<BTreeMap<_, _>>();
+        formatter
+            .debug_struct("AdapterPlan")
+            .field("program", &self.program)
+            .field("arguments", &arguments)
+            .field("environment", &environment)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -266,7 +294,7 @@ impl PluginSession {
                 self.validate_actions(&outcome.actions)?;
                 Ok(outcome)
             }
-            PluginMessage::Error { message, .. } => Err(PluginError::Plugin(message)),
+            PluginMessage::Error { message, .. } => Err(plugin_error(message)),
             _ => self.protocol_failure("plugin returned the wrong command response"),
         }
     }
@@ -300,7 +328,7 @@ impl PluginSession {
             PluginMessage::AdapterPlan { .. } => {
                 self.protocol_failure("plugin returned an empty adapter program")
             }
-            PluginMessage::Error { message, .. } => Err(PluginError::Plugin(message)),
+            PluginMessage::Error { message, .. } => Err(plugin_error(message)),
             _ => self.protocol_failure("plugin returned the wrong adapter response"),
         }
     }
@@ -326,7 +354,7 @@ impl PluginSession {
             },
         )? {
             PluginMessage::Acknowledged { .. } => Ok(()),
-            PluginMessage::Error { message, .. } => Err(PluginError::Plugin(message)),
+            PluginMessage::Error { message, .. } => Err(plugin_error(message)),
             _ => self.protocol_failure("plugin did not acknowledge the event"),
         }
     }
@@ -346,7 +374,7 @@ impl PluginSession {
         let id = self.take_request_id()?;
         match self.exchange(id, HostMessage::ProvideSettings { id, values })? {
             PluginMessage::Acknowledged { .. } => Ok(()),
-            PluginMessage::Error { message, .. } => Err(PluginError::Plugin(message)),
+            PluginMessage::Error { message, .. } => Err(plugin_error(message)),
             _ => self.protocol_failure("plugin did not acknowledge settings"),
         }
     }
@@ -505,6 +533,10 @@ fn io_error(error: io::Error) -> PluginError {
     PluginError::Io(error.to_string())
 }
 
+fn plugin_error(message: String) -> PluginError {
+    PluginError::Plugin(crate::security::redact_secrets(&message).into_owned())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginError {
     NotEnabled(String),
@@ -553,3 +585,26 @@ impl Display for PluginError {
 }
 
 impl Error for PluginError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_supplied_diagnostics_and_adapter_debug_output_are_redacted() {
+        let error = plugin_error("request failed with token=plugin-secret-value".to_owned());
+        assert!(!error.to_string().contains("plugin-secret-value"));
+
+        let plan = AdapterPlan {
+            program: "agent".to_owned(),
+            arguments: vec!["--header=Authorization: Bearer abcdefghijklmnop".to_owned()],
+            environment: BTreeMap::from([(
+                "SERVICE_PASSWORD".to_owned(),
+                "do-not-print-this".to_owned(),
+            )]),
+        };
+        let debug = format!("{plan:?}");
+        assert!(!debug.contains("abcdefghijklmnop"));
+        assert!(!debug.contains("do-not-print-this"));
+    }
+}

@@ -32,6 +32,7 @@ impl CapabilityIssuer {
                 });
             }
         };
+        verify_regular_file(path)?;
         verify_permissions(path)?;
 
         let mut session = [0_u8; SESSION_BYTES];
@@ -94,6 +95,22 @@ fn read_secret(path: &Path) -> Result<[u8; SECRET_BYTES], AuthenticationError> {
     decode_secret(encoded.trim()).ok_or_else(|| AuthenticationError::InvalidSecret {
         path: path.to_owned(),
     })
+}
+
+fn verify_regular_file(path: &Path) -> Result<(), AuthenticationError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| AuthenticationError::FileAccess {
+            operation: "inspect",
+            path: path.to_owned(),
+            source,
+        })?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(AuthenticationError::UnsafeFileType {
+            path: path.to_owned(),
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -172,6 +189,9 @@ pub enum AuthenticationError {
     InsecurePermissions {
         path: PathBuf,
     },
+    UnsafeFileType {
+        path: PathBuf,
+    },
     Random(getrandom::Error),
 }
 
@@ -197,6 +217,11 @@ impl Display for AuthenticationError {
                 "IPC secret {} is accessible by another local user; set its permissions to 0600",
                 path.display()
             ),
+            Self::UnsafeFileType { path } => write!(
+                formatter,
+                "IPC secret {} must be a regular file and cannot be a symbolic link",
+                path.display()
+            ),
             Self::Random(source) => {
                 write!(formatter, "failed to obtain secure randomness: {source}")
             }
@@ -208,7 +233,10 @@ impl Error for AuthenticationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::FileAccess { source, .. } => Some(source),
-            Self::InvalidSecret { .. } | Self::InsecurePermissions { .. } | Self::Random(_) => None,
+            Self::InvalidSecret { .. }
+            | Self::InsecurePermissions { .. }
+            | Self::UnsafeFileType { .. }
+            | Self::Random(_) => None,
         }
     }
 }
@@ -268,5 +296,22 @@ mod tests {
 
         let mode = fs::metadata(path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_cannot_be_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        fs::write(&target, "0".repeat(SECRET_BYTES * 2)).unwrap();
+        let path = temp.path().join("ipc-secret");
+        symlink(target, &path).unwrap();
+
+        assert!(matches!(
+            CapabilityIssuer::load_or_create(path),
+            Err(AuthenticationError::UnsafeFileType { .. })
+        ));
     }
 }

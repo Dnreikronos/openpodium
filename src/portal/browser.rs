@@ -1,7 +1,8 @@
 use std::fmt::{self, Display, Formatter};
+use std::fs;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -113,7 +114,7 @@ impl BrowserBackend {
             if let Some(error) = response.get("error") {
                 return Err(BrowserError::Command {
                     method: method.to_owned(),
-                    detail: error.to_string(),
+                    detail: crate::security::redact_secrets(&error.to_string()).into_owned(),
                 });
             }
             return Ok(response.get("result").cloned().unwrap_or(Value::Null));
@@ -162,14 +163,6 @@ impl BrowserBackend {
     }
 
     fn launch(&mut self) -> Result<String, BrowserError> {
-        let listener =
-            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(BrowserError::DebugEndpointBind)?;
-        let port = listener
-            .local_addr()
-            .map_err(BrowserError::DebugEndpointBind)?
-            .port();
-        drop(listener);
-
         let user_data_dir = tempfile::tempdir().map_err(BrowserError::UserDataDirectory)?;
         let mut child = Command::new(&self.executable)
             .args([
@@ -178,7 +171,8 @@ impl BrowserBackend {
                 "--no-default-browser-check",
                 "--disable-gpu",
             ])
-            .arg(format!("--remote-debugging-port={port}"))
+            .arg("--remote-debugging-address=127.0.0.1")
+            .arg("--remote-debugging-port=0")
             .arg(format!(
                 "--user-data-dir={}",
                 user_data_dir.path().display()
@@ -195,6 +189,15 @@ impl BrowserBackend {
         // browser running that nothing can reap.
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         let endpoint = loop {
+            let port = match debug_port(user_data_dir.path()) {
+                Ok(Some(port)) => port,
+                Ok(None) if Instant::now() >= deadline => break Err(BrowserError::StartupTimeout),
+                Ok(None) => {
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                Err(error) => break Err(error),
+            };
             match debug_websocket_url(port) {
                 Ok(Some(endpoint)) => break Ok(endpoint),
                 Ok(None) if Instant::now() >= deadline => break Err(BrowserError::StartupTimeout),
@@ -269,6 +272,22 @@ impl BrowserBackend {
         }
         Ok(())
     }
+}
+
+fn debug_port(user_data_dir: &Path) -> Result<Option<u16>, BrowserError> {
+    let path = user_data_dir.join("DevToolsActivePort");
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(BrowserError::DebugEndpoint(error)),
+    };
+    let port = contents
+        .lines()
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .ok_or(BrowserError::InvalidDebugPort)?;
+    Ok(Some(port))
 }
 
 impl PortalBackend for BrowserBackend {
@@ -547,6 +566,9 @@ fn debug_websocket_url(port: u16) -> Result<Option<String>, BrowserError> {
 /// Keeps a portal on the web. Without this an approved navigation could read
 /// `file://` or `chrome://` content and hand it back as an observation.
 fn validate_navigable_url(url: &str) -> Result<(), BrowserError> {
+    if crate::security::url_has_userinfo(url) {
+        return Err(BrowserError::EmbeddedCredentials);
+    }
     let scheme = url
         .split_once("://")
         .map_or("", |(scheme, _)| scheme)
@@ -594,8 +616,8 @@ pub enum BrowserError {
     NotConnected,
     ExecutableUnavailable,
     Launch(std::io::Error),
-    DebugEndpointBind(std::io::Error),
     DebugEndpoint(std::io::Error),
+    InvalidDebugPort,
     ConfigureSocket(std::io::Error),
     UserDataDirectory(std::io::Error),
     WebSocket(Box<tungstenite::Error>),
@@ -609,6 +631,7 @@ pub enum BrowserError {
     Session(PortalSessionError),
     Validation(super::PortalValidationError),
     UnsupportedUrlScheme(String),
+    EmbeddedCredentials,
     StartupTimeout,
 }
 
@@ -618,12 +641,10 @@ impl Display for BrowserError {
             Self::NotConnected => formatter.write_str("browser backend is not connected"),
             Self::ExecutableUnavailable => formatter.write_str("Chromium executable was not found"),
             Self::Launch(error) => write!(formatter, "failed to launch Chromium: {error}"),
-            Self::DebugEndpointBind(error) => {
-                write!(formatter, "failed to reserve a CDP port: {error}")
-            }
             Self::DebugEndpoint(error) => {
                 write!(formatter, "failed to query CDP endpoint: {error}")
             }
+            Self::InvalidDebugPort => formatter.write_str("Chromium wrote an invalid CDP port"),
             Self::ConfigureSocket(error) => {
                 write!(formatter, "failed to configure CDP socket timeout: {error}")
             }
@@ -658,6 +679,9 @@ impl Display for BrowserError {
                     "a browser portal only navigates http and https URLs, not {url:?}"
                 )
             }
+            Self::EmbeddedCredentials => {
+                formatter.write_str("browser portal URLs cannot contain user information")
+            }
             Self::StartupTimeout => formatter.write_str("Chromium did not expose CDP in time"),
         }
     }
@@ -667,6 +691,7 @@ impl std::error::Error for BrowserError {}
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
     use std::time::Instant;
 
     use super::*;
@@ -699,6 +724,28 @@ mod tests {
                 "{url} should not be navigable"
             );
         }
+        assert!(matches!(
+            validate_navigable_url("https://alice:secret@example.test"),
+            Err(BrowserError::EmbeddedCredentials)
+        ));
+    }
+
+    #[test]
+    fn browser_selects_its_own_debug_port_without_a_reservation_race() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(debug_port(directory.path()).unwrap(), None);
+        fs::write(
+            directory.path().join("DevToolsActivePort"),
+            "43123\n/devtools/browser/random\n",
+        )
+        .unwrap();
+        assert_eq!(debug_port(directory.path()).unwrap(), Some(43123));
+
+        fs::write(directory.path().join("DevToolsActivePort"), "invalid\n").unwrap();
+        assert!(matches!(
+            debug_port(directory.path()),
+            Err(BrowserError::InvalidDebugPort)
+        ));
     }
 
     #[test]

@@ -16,6 +16,69 @@ pub struct PermissionGrant {
     capabilities: BTreeSet<Capability>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionImpact {
+    Observe,
+    Change,
+    Execute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionReviewItem {
+    capability: Capability,
+    impact: PermissionImpact,
+    summary: &'static str,
+    granted: bool,
+}
+
+impl PermissionReviewItem {
+    pub const fn capability(&self) -> Capability {
+        self.capability
+    }
+
+    pub const fn impact(&self) -> PermissionImpact {
+        self.impact
+    }
+
+    pub const fn summary(&self) -> &'static str {
+        self.summary
+    }
+
+    pub const fn granted(&self) -> bool {
+        self.granted
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionReview {
+    plugin_id: String,
+    plugin_name: String,
+    plugin_version: String,
+    permissions: Vec<PermissionReviewItem>,
+}
+
+impl PermissionReview {
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+
+    pub fn plugin_version(&self) -> &str {
+        &self.plugin_version
+    }
+
+    pub fn permissions(&self) -> &[PermissionReviewItem] {
+        &self.permissions
+    }
+
+    pub const fn native_access_notice(&self) -> &'static str {
+        "Native plugins run as local child processes with the user's filesystem and network access; capability grants only restrict OpenPodium APIs."
+    }
+}
+
 impl PermissionGrant {
     pub fn new(capabilities: impl IntoIterator<Item = Capability>) -> Self {
         Self {
@@ -76,6 +139,27 @@ impl PluginRecord {
 
     pub fn qualified_id(&self, local_id: &str) -> String {
         format!("{}/{local_id}", self.manifest.id)
+    }
+
+    pub fn permission_review(&self) -> PermissionReview {
+        let permissions = self
+            .manifest
+            .capabilities
+            .iter()
+            .copied()
+            .map(|capability| PermissionReviewItem {
+                capability,
+                impact: permission_impact(capability),
+                summary: permission_summary(capability),
+                granted: self.granted.contains(capability),
+            })
+            .collect();
+        PermissionReview {
+            plugin_id: self.manifest.id.clone(),
+            plugin_name: self.manifest.name.clone(),
+            plugin_version: self.manifest.version.clone(),
+            permissions,
+        }
     }
 }
 
@@ -191,9 +275,11 @@ impl PluginCatalog {
                     records.insert(record.manifest.id.clone(), record);
                 }
                 Err((kind, message)) => {
+                    let resolved_manifest =
+                        fs::canonicalize(&manifest_path).unwrap_or_else(|_| manifest_path.clone());
                     let retained = previous
                         .values()
-                        .find(|record| record.directory.join(MANIFEST_FILE) == manifest_path);
+                        .find(|record| record.directory.join(MANIFEST_FILE) == resolved_manifest);
                     if let Some(record) = retained {
                         records.insert(record.manifest.id.clone(), record.clone());
                     }
@@ -216,6 +302,12 @@ impl PluginCatalog {
 
     pub fn diagnostics(&self) -> &[PluginDiagnostic] {
         &self.diagnostics
+    }
+
+    pub fn permission_review(&self, plugin_id: &str) -> Result<PermissionReview, CatalogError> {
+        self.plugin(plugin_id)
+            .map(PluginRecord::permission_review)
+            .ok_or_else(|| CatalogError::NotFound(plugin_id.to_owned()))
     }
 
     pub fn enable(&mut self, plugin_id: &str, grant: PermissionGrant) -> Result<(), CatalogError> {
@@ -291,9 +383,7 @@ fn discover_candidates(roots: &[PathBuf], diagnostics: &mut Vec<PluginDiagnostic
     let mut candidates = Vec::new();
     for root in roots {
         let direct = root.join(MANIFEST_FILE);
-        if direct.is_file() {
-            candidates.push(direct);
-        }
+        add_manifest_candidate(&direct, &mut candidates, diagnostics);
         let entries = match fs::read_dir(root) {
             Ok(entries) => entries,
             Err(error) => {
@@ -307,15 +397,39 @@ fn discover_candidates(roots: &[PathBuf], diagnostics: &mut Vec<PluginDiagnostic
             }
         };
         for entry in entries.flatten() {
-            let manifest = entry.path().join(MANIFEST_FILE);
-            if manifest.is_file() {
-                candidates.push(manifest);
+            if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                diagnostics.push(diagnostic(
+                    DiagnosticKind::Discovery,
+                    entry.path(),
+                    None,
+                    "plugin directories cannot be symbolic links",
+                ));
+                continue;
             }
+            let manifest = entry.path().join(MANIFEST_FILE);
+            add_manifest_candidate(&manifest, &mut candidates, diagnostics);
         }
     }
     candidates.sort();
     candidates.dedup();
     candidates
+}
+
+fn add_manifest_candidate(
+    path: &Path,
+    candidates: &mut Vec<PathBuf>,
+    diagnostics: &mut Vec<PluginDiagnostic>,
+) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => diagnostics.push(diagnostic(
+            DiagnosticKind::Discovery,
+            path.to_owned(),
+            None,
+            "plugin manifests cannot be symbolic links",
+        )),
+        Ok(metadata) if metadata.is_file() => candidates.push(path.to_owned()),
+        Ok(_) | Err(_) => {}
+    }
 }
 
 fn load_record(path: &Path) -> Result<PluginRecord, (DiagnosticKind, String)> {
@@ -331,11 +445,26 @@ fn load_record(path: &Path) -> Result<PluginRecord, (DiagnosticKind, String)> {
         .parent()
         .expect("a manifest candidate always has a parent")
         .to_path_buf();
-    let executable = directory.join(&manifest.executable);
-    if !executable.is_file() {
+    let directory = fs::canonicalize(&directory).map_err(|error| {
+        (
+            DiagnosticKind::Discovery,
+            format!("could not resolve plugin directory: {error}"),
+        )
+    })?;
+    let unresolved_executable = directory.join(&manifest.executable);
+    let executable = fs::canonicalize(&unresolved_executable).map_err(|_| {
+        (
+            DiagnosticKind::Discovery,
+            format!(
+                "plugin executable does not exist: {}",
+                unresolved_executable.display()
+            ),
+        )
+    })?;
+    if !executable.starts_with(&directory) || !executable.is_file() {
         return Err((
             DiagnosticKind::Discovery,
-            format!("plugin executable does not exist: {}", executable.display()),
+            "plugin executable must resolve inside its plugin directory".to_owned(),
         ));
     }
     let negotiated_sdk = manifest.negotiate(HOST_SDK_VERSION).ok();
@@ -352,6 +481,25 @@ fn load_record(path: &Path) -> Result<PluginRecord, (DiagnosticKind, String)> {
         state,
         granted: PermissionGrant::default(),
     })
+}
+
+fn permission_impact(capability: Capability) -> PermissionImpact {
+    match capability {
+        Capability::Events | Capability::SettingsRead => PermissionImpact::Observe,
+        Capability::SettingsWrite | Capability::Ui => PermissionImpact::Change,
+        Capability::Adapters | Capability::Commands => PermissionImpact::Execute,
+    }
+}
+
+fn permission_summary(capability: Capability) -> &'static str {
+    match capability {
+        Capability::Adapters => "Prepare executable agent launch plans",
+        Capability::Commands => "Receive user-invoked plugin commands",
+        Capability::Events => "Receive explicitly forwarded host events",
+        Capability::SettingsRead => "Read the plugin's namespaced settings",
+        Capability::SettingsWrite => "Propose changes to the plugin's namespaced settings",
+        Capability::Ui => "Show host-rendered panels and settings fields",
+    }
 }
 
 fn diagnostic(

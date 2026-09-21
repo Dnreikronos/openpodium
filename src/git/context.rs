@@ -133,7 +133,7 @@ pub fn path_diff(checkout: &Path, path: &str) -> Result<PathDiff, String> {
 }
 
 fn stderr(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).trim().to_owned()
+    crate::security::redact_secrets(String::from_utf8_lossy(bytes).trim()).into_owned()
 }
 
 #[cfg(test)]

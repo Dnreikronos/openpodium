@@ -265,7 +265,10 @@ fn is_ancestor(root: &Path, head: &str, target: &str) -> Result<bool, String> {
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
-        _ => Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+        _ => Err(
+            crate::security::redact_secrets(String::from_utf8_lossy(&output.stderr).trim())
+                .into_owned(),
+        ),
     }
 }
 
@@ -274,7 +277,10 @@ fn run(directory: &Path, args: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|e| format!("Cannot run Git: {e}"))?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        return Err(crate::security::redact_secrets(
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )
+        .into_owned());
     }
     String::from_utf8(output.stdout).map_err(|_| "Git returned a non-Unicode path".to_owned())
 }

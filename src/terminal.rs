@@ -686,6 +686,8 @@ fn function_sequence(final_char: char, modifiers: Modifiers) -> String {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn model() -> Model {
@@ -768,5 +770,17 @@ mod tests {
                 rows: 12
             }
         );
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_terminal_output_preserves_render_invariants(bytes in prop::collection::vec(any::<u8>(), 0..16_384)) {
+            let mut model = model();
+            let _updates = model.feed(&bytes);
+            let view = model.view(Status::Running);
+
+            prop_assert_eq!(view.size, GridSize { columns: 20, rows: 4 });
+            prop_assert!(view.cells.iter().all(|cell| cell.row < 4 && cell.column < 20));
+        }
     }
 }

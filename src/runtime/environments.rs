@@ -211,10 +211,7 @@ fn prepare_container(
         environment.working_directory(),
     ]);
     for (name, value) in variables {
-        let mut assignment = name;
-        assignment.push("=");
-        assignment.push(value);
-        prepared = prepared.args([OsString::from("--env"), assignment]);
+        prepared = prepared.arg("--env").arg(name.clone()).env(name, value);
     }
     prepared
         .arg(environment.container())
@@ -380,12 +377,16 @@ mod tests {
                 "--workdir",
                 "/workspace",
                 "--env",
-                "TERM=xterm-256color",
+                "TERM",
                 "dev",
                 "codex",
                 "--quiet",
             ]
             .map(OsString::from)
+        );
+        assert_eq!(
+            prepared.environment(),
+            [(OsString::from("TERM"), OsString::from("xterm-256color"))]
         );
     }
 
