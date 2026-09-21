@@ -50,6 +50,23 @@ pub(crate) fn icon_button<'a, Message: Clone + 'a>(
     .style(shell::utility_button)
 }
 
+/// Names an icon-only control on hover, so a bare glyph still says what it
+/// does without spending a row on a written label.
+pub(crate) fn labelled<'a, Message: 'a>(
+    control: impl Into<Element<'a, Message>>,
+    label: impl text::IntoFragment<'a>,
+) -> Element<'a, Message> {
+    iced::widget::tooltip(
+        control,
+        container(text(label).size(12))
+            .style(shell::tooltip)
+            .padding([5, 9]),
+        iced::widget::tooltip::Position::Bottom,
+    )
+    .gap(6)
+    .into()
+}
+
 /// One segment of a segmented picker.
 pub(crate) fn segment<'a, Message: Clone + 'a>(
     label: &'a str,

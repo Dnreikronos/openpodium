@@ -71,7 +71,7 @@ use crate::terminal::session::{self, Action as TerminalAction, ProcessStream, Se
 use crate::timeline_panel;
 
 use ui::{
-    action_grid, button, count_badge, float_row, icon_button, panel_card, pill_divider,
+    action_grid, button, count_badge, float_row, icon_button, labelled, panel_card, pill_divider,
     primary_button, rule, section, section_label, segment, segmented, swatch, text_input,
 };
 
@@ -807,23 +807,41 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         ]
         .spacing(0)
         .width(Fill),
-        icon_button("+", 17.0).on_press(Message::OpenProject),
+        labelled(
+            icon_button("+", 17.0)
+                .style(shell::secondary_button)
+                .on_press(Message::OpenProject),
+            state.localizer.text(if has_active_workspace {
+                "open-another-project"
+            } else {
+                "open-project"
+            }),
+        ),
     ]
     .spacing(10)
     .align_y(IcedAlignment::Center);
+    // Styled as a recessed field rather than a button: it is where you go to
+    // type, even though typing happens in the palette it opens.
     let search = button(
-        row![
-            text(state.localizer.text("search-short"))
-                .size(13)
-                .style(shell::muted_text)
-                .width(Fill),
-            text(palette_shortcut).size(11).style(shell::subtle_text),
-        ]
-        .spacing(8)
-        .align_y(IcedAlignment::Center),
+        container(
+            row![
+                text(state.localizer.text("search-short"))
+                    .size(13)
+                    .style(shell::muted_text)
+                    .width(Fill)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                text(palette_shortcut).size(11).style(shell::subtle_text),
+            ]
+            .spacing(8)
+            .align_y(IcedAlignment::Center),
+        )
+        .style(shell::field)
+        .padding([8, 12])
+        .width(Fill)
+        .clip(true),
     )
-    .style(shell::navigation_button(false))
-    .padding([9, 11])
+    .style(shell::utility_button)
+    .padding(0)
     .on_press(Message::Navigation(navigation_panel::Message::Open))
     .width(Fill);
     let mut workspace_list = column![section_label(state.localizer.text("workspaces"))]
@@ -834,15 +852,24 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             let icon = workspace.settings().icon().map_or("", |icon| icon.as_str());
             let glyph = if icon.is_empty() { "▢" } else { icon };
             let attention = timeline::attention_counts(workspace).total();
+            let agents = workspace.agents().count();
             let selected = active_workspace_id == Some(workspace.id());
+            // Agent count on the right tells you how loaded a workspace is;
+            // the red badge only shows up when something wants you.
             let mut entry = row![
                 text(glyph.to_owned()).size(13),
-                text(workspace.name().to_owned()).size(13).width(Fill),
+                text(workspace.name().to_owned())
+                    .size(13)
+                    .width(Fill)
+                    .wrapping(iced::widget::text::Wrapping::None),
             ]
             .spacing(8)
             .align_y(IcedAlignment::Center);
             if attention > 0 {
                 entry = entry.push(count_badge(attention, true));
+            }
+            if agents > 0 {
+                entry = entry.push(count_badge(agents, false));
             }
             workspace_list = workspace_list.push(
                 button(entry)
@@ -915,31 +942,11 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .spacing(4),
     ]
     .spacing(6);
-    let add_workspace = if has_active_workspace {
-        column![
-            button(
-                row![
-                    text("+").size(13).style(shell::muted_text),
-                    text(state.localizer.text("open-another-project"))
-                        .size(13)
-                        .style(shell::muted_text),
-                ]
-                .spacing(8)
-                .align_y(IcedAlignment::Center)
-            )
-            .style(shell::navigation_button(false))
-            .padding([7, 9])
-            .on_press(Message::OpenProject)
-            .width(Fill),
-        ]
-    } else {
-        column![]
-    };
     let sidebar = container(
         column![
             brand,
             search,
-            scrollable(column![workspace_list, add_workspace].spacing(2)).height(Fill),
+            scrollable(workspace_list).height(Fill),
             accessibility_controls,
         ]
         .spacing(12)

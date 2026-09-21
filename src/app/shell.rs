@@ -70,6 +70,18 @@ pub(crate) fn sunken_color(palette: &palette::Extended) -> Color {
     }
 }
 
+/// The fill that marks a selected row. A shade stronger than [`sunken`] so it
+/// still reads as chosen when it sits on the workspace rail rather than on a
+/// white card.
+fn selected_fill(theme: &Theme) -> Color {
+    let palette = theme.extended_palette();
+    if palette.is_dark {
+        palette.background.strong.color
+    } else {
+        Color::from_rgb8(226, 226, 221)
+    }
+}
+
 /// The quiet grey the window chrome is built from: the workspace rail and the
 /// backdrop the canvas sheet floats on. Iced's derived `weak` neutral is too
 /// saturated to sit behind a whole window, so the light value is explicit.
@@ -390,12 +402,7 @@ pub fn navigation_button(selected: bool) -> impl Fn(&Theme, button::Status) -> b
         style.border.radius = 9.0.into();
         style.text_color = palette.background.base.text;
         if selected {
-            style.background = Some(surface(theme).into());
-            style.border = Border {
-                width: 1.0,
-                radius: 9.0.into(),
-                color: hairline(theme),
-            };
+            style.background = Some(selected_fill(theme).into());
         }
         style
     }
@@ -438,6 +445,38 @@ pub fn search_input(theme: &Theme, _status: text_input::Status) -> text_input::S
 /// Dims whatever sits behind a modal surface.
 pub fn scrim(_theme: &Theme) -> container::Style {
     container::Style::default().background(Color::BLACK.scale_alpha(0.28))
+}
+
+/// The label that names an icon-only control on hover.
+pub fn tooltip(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(surface(theme).into()),
+        text_color: Some(palette.background.base.text),
+        border: Border {
+            width: 1.0,
+            radius: 7.0.into(),
+            color: hairline(theme),
+        },
+        shadow: soft_shadow(theme, 16.0),
+        ..container::Style::default()
+    }
+}
+
+/// A recessed field. Used where a control should read as something you type
+/// into, even when it opens a palette instead.
+pub fn field(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(sunken(theme).into()),
+        text_color: Some(palette.background.base.text),
+        border: Border {
+            width: if palette.is_dark { 1.0 } else { 0.0 },
+            radius: CAPSULE.into(),
+            color: hairline(theme),
+        },
+        ..container::Style::default()
+    }
 }
 
 /// A keyboard shortcut rendered as a key cap.
