@@ -358,6 +358,38 @@ impl WorkspaceManager {
             .map_err(WorkspaceError::from)
     }
 
+    /// Terminal transcripts recorded for a workspace, keyed by node identifier.
+    pub fn terminal_transcripts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<(u64, Vec<u8>)>, WorkspaceError> {
+        self.journal
+            .terminal_transcripts(workspace_id)
+            .map_err(WorkspaceError::from)
+    }
+
+    pub fn store_terminal_transcript(
+        &mut self,
+        workspace_id: WorkspaceId,
+        node_id: u64,
+        captured_at: Timestamp,
+        payload: &[u8],
+    ) -> Result<(), WorkspaceError> {
+        self.journal
+            .store_terminal_transcript(workspace_id, node_id, captured_at, payload)
+            .map_err(WorkspaceError::from)
+    }
+
+    pub fn clear_terminal_transcript(
+        &mut self,
+        workspace_id: WorkspaceId,
+        node_id: u64,
+    ) -> Result<(), WorkspaceError> {
+        self.journal
+            .clear_terminal_transcript(workspace_id, node_id)
+            .map_err(WorkspaceError::from)
+    }
+
     pub fn preferences(&self) -> Result<Vec<(String, String)>, WorkspaceError> {
         self.journal.preferences().map_err(WorkspaceError::from)
     }
