@@ -5,6 +5,7 @@ pub mod ipc;
 pub mod navigation;
 pub mod orchestration;
 pub mod persistence;
+pub mod plugins;
 pub mod portal;
 pub mod routines;
 pub mod runtime;
