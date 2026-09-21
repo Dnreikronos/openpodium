@@ -263,7 +263,7 @@ fn triggers_section(routine: &Routine) -> Element<'_, Message> {
             let zone = schedule
                 .timezone_label()
                 .map(|label| label.as_str().to_owned())
-                .unwrap_or_else(|| format!("UTC{:+}", schedule.offset_minutes() / 60));
+                .unwrap_or_else(|| format_timezone_offset(schedule.offset_minutes()));
             detail.push_str(&format!(
                 " · {zone} · next {}",
                 schedule
@@ -303,6 +303,12 @@ fn triggers_section(routine: &Routine) -> Element<'_, Message> {
         .spacing(6),
     );
     section.into()
+}
+
+fn format_timezone_offset(offset_minutes: i32) -> String {
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let absolute = offset_minutes.unsigned_abs();
+    format!("UTC{sign}{:02}:{:02}", absolute / 60, absolute % 60)
 }
 
 fn runs_section<'a>(workspace: &'a Workspace, state: &'a UiState) -> Element<'a, Message> {
@@ -487,5 +493,12 @@ mod tests {
             format_instant(Timestamp::from_unix_millis(1_709_164_800_000)),
             "2024-02-29 00:00 UTC"
         );
+    }
+
+    #[test]
+    fn timezone_offsets_keep_hour_and_minute_components() {
+        assert_eq!(format_timezone_offset(330), "UTC+05:30");
+        assert_eq!(format_timezone_offset(-30), "UTC-00:30");
+        assert_eq!(format_timezone_offset(0), "UTC+00:00");
     }
 }

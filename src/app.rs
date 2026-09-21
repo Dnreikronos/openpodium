@@ -1711,9 +1711,6 @@ enum ScheduleOrWatch {
 fn save_routine(state: &mut OpenPodium, workspace_id: WorkspaceId) -> Result<String, String> {
     let name =
         Name::new(state.routines_ui.name.trim().to_owned()).map_err(|error| error.to_string())?;
-    if state.routines_ui.pending_steps.is_empty() {
-        return Err("Add at least one step before saving".to_owned());
-    }
     if state.routines_ui.capture_canvas && state.canvas_selection.is_empty() {
         return Err("Select the canvas nodes each run should rebuild".to_owned());
     }
@@ -1728,15 +1725,26 @@ fn save_routine(state: &mut OpenPodium, workspace_id: WorkspaceId) -> Result<Str
     let existing = state
         .routines_ui
         .selected_routine
-        .and_then(|id| workspace.routine(id));
+        .and_then(|id| workspace.routine(id))
+        .cloned();
+    if existing.is_none() && state.routines_ui.pending_steps.is_empty() {
+        return Err("Add at least one step before saving".to_owned());
+    }
     let (next_routine_id, next_version_id, _) = openpodium::routines::next_routine_ids(workspace);
 
-    // Steps run in the order the user listed them, each depending on the one
-    // before it. That keeps the first editor honest about what it produces.
-    let mut steps = Vec::new();
-    let mut previous: Option<RoutineStepId> = None;
-    for (index, pending) in state.routines_ui.pending_steps.iter().enumerate() {
-        let step_id = RoutineStepId::new(u64::try_from(index + 1).unwrap_or(u64::MAX));
+    // An edit appends to the latest immutable version. Preserve every saved
+    // step verbatim so the basic panel cannot erase bindings, outputs,
+    // approvals, retry policies, resource claims, or an existing DAG.
+    let mut steps = existing.as_ref().map_or_else(Vec::new, |routine| {
+        routine.latest_version().steps().to_vec()
+    });
+    let mut previous = steps.last().map(RoutineStep::id);
+    let mut next_step_id = steps.iter().map(|step| step.id().get()).max().unwrap_or(0);
+    for pending in &state.routines_ui.pending_steps {
+        next_step_id = next_step_id
+            .checked_add(1)
+            .ok_or_else(|| "Routine step IDs are exhausted".to_owned())?;
+        let step_id = RoutineStepId::new(next_step_id);
         steps.push(
             RoutineStep::new(
                 step_id,
@@ -1755,8 +1763,10 @@ fn save_routine(state: &mut OpenPodium, workspace_id: WorkspaceId) -> Result<Str
         previous = Some(step_id);
     }
 
-    let routine_id = existing.map_or(next_routine_id, Routine::id);
-    let number = existing.map_or(1, |routine| routine.latest_version().number() + 1);
+    let routine_id = existing.as_ref().map_or(next_routine_id, Routine::id);
+    let number = existing
+        .as_ref()
+        .map_or(1, |routine| routine.latest_version().number() + 1);
     // Capturing the selection now freezes the arrangement into the version, so
     // later canvas edits cannot change what an already-saved version rebuilds.
     let template = if state.routines_ui.capture_canvas {
@@ -1765,31 +1775,45 @@ fn save_routine(state: &mut OpenPodium, workspace_id: WorkspaceId) -> Result<Str
             .map_err(|error| error.to_string())?;
         Some(Content::new(document).map_err(|error| error.to_string())?)
     } else {
-        existing.and_then(|routine| routine.latest_version().template().cloned())
+        existing
+            .as_ref()
+            .and_then(|routine| routine.latest_version().template().cloned())
     };
+    let inputs = existing.as_ref().map_or_else(Vec::new, |routine| {
+        routine.latest_version().inputs().to_vec()
+    });
     let version = RoutineVersion::new(
         next_version_id,
         routine_id,
         number,
-        Vec::new(),
+        inputs,
         steps,
         template,
         now(),
     )
     .map_err(|error| error.to_string())?;
 
-    let command = if existing.is_some() {
-        DomainCommand::AddRoutineVersion {
+    let commands = if let Some(routine) = existing {
+        let mut commands = Vec::with_capacity(2);
+        if routine.name() != &name {
+            commands.push(DomainCommand::UpdateRoutine {
+                routine_id,
+                name,
+                description: routine.description().cloned(),
+            });
+        }
+        commands.push(DomainCommand::AddRoutineVersion {
             routine_id,
             version,
-        }
+        });
+        commands
     } else {
-        DomainCommand::AddRoutine(
+        vec![DomainCommand::AddRoutine(
             Routine::new(routine_id, name, None, version).map_err(|error| error.to_string())?,
-        )
+        )]
     };
     workspaces
-        .execute(workspace_id, command, now())
+        .execute_batch(workspace_id, commands, now())
         .map_err(|error| error.to_string())?;
     state.routines_ui.pending_steps.clear();
     if let Some(workspace) = state
@@ -1911,6 +1935,12 @@ fn run_routine_tick(state: &mut OpenPodium) {
         return;
     };
     let poll = state.trigger_watcher.poll(workspaces, current_time);
+    for warning in poll.warnings {
+        state.notice = Some(format!(
+            "Routine {} trigger {} was not scanned: {}",
+            warning.routine_id, warning.trigger_id, warning.detail
+        ));
+    }
     for missed in poll.missed {
         record_missed_occurrences(workspaces, &missed, current_time, &mut state.notice);
     }
@@ -5065,6 +5095,116 @@ mod tests {
         assert_eq!(
             state.notice.as_deref(),
             Some("Opened matching message near character 4")
+        );
+    }
+
+    #[test]
+    fn saving_an_existing_routine_preserves_its_contract_and_rename() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("openpodium.sqlite")).unwrap();
+        let workspace_id = workspaces
+            .create_workspace(&project, Timestamp::from_unix_millis(1))
+            .unwrap();
+        workspaces
+            .execute(
+                workspace_id,
+                DomainCommand::AddAgent(Agent::with_program(
+                    AgentId::new(1),
+                    Name::new("Builder").unwrap(),
+                    None,
+                    AgentProgram::Codex,
+                )),
+                Timestamp::from_unix_millis(2),
+            )
+            .unwrap();
+
+        let routine_id = openpodium::domain::RoutineId::new(1);
+        let input = openpodium::domain::RoutineInputDeclaration::new(
+            openpodium::domain::RoutineInputKey::new("scope").unwrap(),
+            Name::new("Scope").unwrap(),
+            true,
+            None,
+        );
+        let original_step = RoutineStep::new(
+            RoutineStepId::new(7),
+            Name::new("Plan").unwrap(),
+            AgentId::new(1),
+            Content::new("Plan {{scope}}").unwrap(),
+            [],
+            [(
+                openpodium::domain::RoutineInputKey::new("scope").unwrap(),
+                openpodium::domain::RoutineBindingSource::Input(
+                    openpodium::domain::RoutineInputKey::new("scope").unwrap(),
+                ),
+            )],
+            [openpodium::domain::RoutineOutputKey::new("plan").unwrap()],
+            RoutineApproval::Required,
+            RoutineRetryPolicy::new(3).unwrap(),
+            RoutineStepClaims::default(),
+        )
+        .unwrap();
+        let version = RoutineVersion::new(
+            openpodium::domain::RoutineVersionId::new(1),
+            routine_id,
+            1,
+            vec![input.clone()],
+            vec![original_step.clone()],
+            None,
+            Timestamp::from_unix_millis(3),
+        )
+        .unwrap();
+        workspaces
+            .execute(
+                workspace_id,
+                DomainCommand::AddRoutine(
+                    Routine::new(routine_id, Name::new("Draft").unwrap(), None, version).unwrap(),
+                ),
+                Timestamp::from_unix_millis(4),
+            )
+            .unwrap();
+
+        let mut state = test_state(workspaces, BTreeMap::new());
+        state.routines_ui.select(
+            state
+                .workspaces
+                .as_ref()
+                .unwrap()
+                .workspace(workspace_id)
+                .unwrap(),
+            Some(routine_id),
+        );
+        state.routines_ui.name = "Renamed".to_owned();
+        state
+            .routines_ui
+            .pending_steps
+            .push(routines_panel::PendingStep {
+                name: "Build".to_owned(),
+                prompt: "Build the plan".to_owned(),
+                agent_id: AgentId::new(1),
+            });
+
+        save_routine(&mut state, workspace_id).unwrap();
+
+        let routine = state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .workspace(workspace_id)
+            .unwrap()
+            .routine(routine_id)
+            .unwrap();
+        assert_eq!(routine.name().as_str(), "Renamed");
+        assert_eq!(routine.latest_version().number(), 2);
+        assert_eq!(routine.latest_version().inputs(), &[input]);
+        assert_eq!(routine.latest_version().steps().len(), 2);
+        assert_eq!(routine.latest_version().steps()[0], original_step);
+        assert_eq!(
+            routine.latest_version().steps()[1]
+                .depends_on()
+                .collect::<Vec<_>>(),
+            vec![RoutineStepId::new(7)]
         );
     }
 

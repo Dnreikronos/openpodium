@@ -366,17 +366,6 @@ pub fn export_template(
         return Err(PortableError::EmptySelection);
     }
 
-    let origin = layout
-        .nodes()
-        .iter()
-        .filter(|node| selected.contains(&node.id()))
-        .map(Node::position)
-        .map(PointV1::from)
-        .reduce(|left, right| PointV1 {
-            x: left.x.min(right.x),
-            y: left.y.min(right.y),
-        })
-        .ok_or(PortableError::EmptySelection)?;
     let layout = CanvasLayout::new(
         layout
             .nodes()
@@ -399,6 +388,22 @@ pub fn export_template(
             .cloned()
             .collect(),
     );
+    let portable_handoffs = workspace
+        .handoffs()
+        .filter(|handoff| handoff.source().is_some())
+        .map(|handoff| handoff.id())
+        .collect();
+    let layout = without_handoff_nodes(&layout, &portable_handoffs);
+    let origin = layout
+        .nodes()
+        .iter()
+        .map(Node::position)
+        .map(PointV1::from)
+        .reduce(|left, right| PointV1 {
+            x: left.x.min(right.x),
+            y: left.y.min(right.y),
+        })
+        .ok_or(PortableError::EmptySelection)?;
 
     let references = referenced_entities(workspace, &layout)?;
     let body = build_body(workspace, &layout, references, Some(origin))?;

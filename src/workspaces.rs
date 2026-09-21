@@ -114,6 +114,21 @@ impl WorkspaceManager {
             .map_err(WorkspaceError::from)
     }
 
+    pub fn execute_batch(
+        &mut self,
+        workspace_id: WorkspaceId,
+        commands: impl IntoIterator<Item = DomainCommand>,
+        occurred_at: Timestamp,
+    ) -> Result<Vec<TimelineEvent>, WorkspaceError> {
+        let workspace = self
+            .workspaces
+            .get_mut(&workspace_id)
+            .ok_or(WorkspaceError::UnknownWorkspace { workspace_id })?;
+        self.journal
+            .execute_batch(workspace, commands, occurred_at)
+            .map_err(WorkspaceError::from)
+    }
+
     pub fn export_template(
         &self,
         workspace_id: WorkspaceId,

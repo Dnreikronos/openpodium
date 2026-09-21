@@ -20,6 +20,8 @@ use super::TriggerFiring;
 
 /// Guards against a filesystem trigger walking an unbounded tree.
 const MAX_SCANNED_ENTRIES: usize = 20_000;
+/// Keeps blocking filesystem and Git work off the 100 ms UI tick cadence.
+const MIN_SCAN_INTERVAL_MS: u64 = 1_000;
 /// Guards against an ancient `next_occurrence` producing an unbounded loop.
 const MAX_CATCHUP_OCCURRENCES: u32 = 10_000;
 
@@ -44,10 +46,19 @@ pub struct MissedOccurrences {
     pub next_occurrence: Option<Timestamp>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerWarning {
+    pub workspace_id: WorkspaceId,
+    pub routine_id: RoutineId,
+    pub trigger_id: RoutineTriggerId,
+    pub detail: String,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TriggerPoll {
     pub events: Vec<TriggerEvent>,
     pub missed: Vec<MissedOccurrences>,
+    pub warnings: Vec<TriggerWarning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +87,7 @@ pub struct TriggerWatcher {
     session_start: Option<Timestamp>,
     filesystem: BTreeMap<(u64, u64), FilesystemObservation>,
     git: BTreeMap<(u64, u64), GitObservation>,
+    last_scanned: BTreeMap<(u64, u64), Timestamp>,
 }
 
 impl TriggerWatcher {
@@ -84,6 +96,7 @@ impl TriggerWatcher {
             session_start: Some(session_start),
             filesystem: BTreeMap::new(),
             git: BTreeMap::new(),
+            last_scanned: BTreeMap::new(),
         }
     }
 
@@ -116,7 +129,11 @@ impl TriggerWatcher {
                     patterns,
                     debounce_ms,
                 } => {
-                    if let Some(event) = self.poll_filesystem(
+                    let key = (workspace_id.get(), trigger.id().get());
+                    if !self.scan_due(key, now, MIN_SCAN_INTERVAL_MS) {
+                        continue;
+                    }
+                    match self.poll_filesystem(
                         workspace,
                         workspace_id,
                         routine_id,
@@ -125,10 +142,21 @@ impl TriggerWatcher {
                         *debounce_ms,
                         now,
                     ) {
-                        poll.events.push(event);
+                        Ok(Some(event)) => poll.events.push(event),
+                        Ok(None) => {}
+                        Err(error) => poll.warnings.push(TriggerWarning {
+                            workspace_id,
+                            routine_id,
+                            trigger_id: trigger.id(),
+                            detail: error.to_string(),
+                        }),
                     }
                 }
                 RoutineTriggerKind::Git { refs } => {
+                    let key = (workspace_id.get(), trigger.id().get());
+                    if !self.scan_due(key, now, MIN_SCAN_INTERVAL_MS) {
+                        continue;
+                    }
                     if let Some(event) =
                         self.poll_git(workspace, workspace_id, routine_id, &trigger, refs)
                     {
@@ -164,6 +192,16 @@ impl TriggerWatcher {
         poll
     }
 
+    fn scan_due(&mut self, key: (u64, u64), now: Timestamp, interval_ms: u64) -> bool {
+        if self.last_scanned.get(&key).is_some_and(|last| {
+            now.as_unix_millis().saturating_sub(last.as_unix_millis()) < interval_ms
+        }) {
+            return false;
+        }
+        self.last_scanned.insert(key, now);
+        true
+    }
+
     /// Reports that an event was consumed, so the same observation does not
     /// produce a second run.
     pub fn mark_consumed(&mut self, event: &TriggerEvent) {
@@ -188,8 +226,10 @@ impl TriggerWatcher {
         patterns: &[String],
         debounce_ms: u64,
         now: Timestamp,
-    ) -> Option<TriggerEvent> {
-        let root = workspace.active_directory()?;
+    ) -> Result<Option<TriggerEvent>, ScanDigestError> {
+        let Some(root) = workspace.active_directory() else {
+            return Ok(None);
+        };
         let digest = scan_digest(Path::new(root.as_str()), patterns)?;
         let key = (workspace_id.get(), trigger.id().get());
         let observation = self
@@ -210,20 +250,23 @@ impl TriggerWatcher {
             };
         }
         if observation.fired {
-            return None;
+            return Ok(None);
         }
         if now
             .as_unix_millis()
             .saturating_sub(observation.first_seen.as_unix_millis())
             < debounce_ms
         {
-            return None;
+            return Ok(None);
         }
         // The occurrence identity is the observed state, so a duplicate
         // observation of the same tree can never start a second run.
-        let occurrence =
-            RoutineOccurrenceKey::new(format!("fs-{}-{digest}", trigger.id().get())).ok()?;
-        Some(TriggerEvent {
+        let Ok(occurrence) =
+            RoutineOccurrenceKey::new(format!("fs-{}-{digest}", trigger.id().get()))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(TriggerEvent {
             workspace_id,
             routine_id,
             firing: TriggerFiring {
@@ -232,7 +275,7 @@ impl TriggerWatcher {
                 next_occurrence: None,
             },
             observed: BTreeMap::new(),
-        })
+        }))
     }
 
     fn poll_git(
@@ -372,7 +415,33 @@ fn advance_occurrence(cadence: RoutineCadence, from: Timestamp, offset: i32) -> 
 
 /// Hashes the paths a filesystem trigger watches together with their size and
 /// modification time. Two observations of the same tree produce the same value.
-fn scan_digest(root: &Path, patterns: &[String]) -> Option<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanDigestError {
+    EntryLimitExceeded { limit: usize },
+}
+
+impl std::fmt::Display for ScanDigestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EntryLimitExceeded { limit } => {
+                write!(
+                    formatter,
+                    "filesystem scan exceeded the {limit}-entry limit"
+                )
+            }
+        }
+    }
+}
+
+fn scan_digest(root: &Path, patterns: &[String]) -> Result<String, ScanDigestError> {
+    scan_digest_with_limit(root, patterns, MAX_SCANNED_ENTRIES)
+}
+
+fn scan_digest_with_limit(
+    root: &Path,
+    patterns: &[String],
+    limit: usize,
+) -> Result<String, ScanDigestError> {
     let mut hasher = blake3::Hasher::new();
     let mut stack = vec![root.to_path_buf()];
     let mut scanned = 0_usize;
@@ -382,10 +451,10 @@ fn scan_digest(root: &Path, patterns: &[String]) -> Option<String> {
             continue;
         };
         for entry in entries.flatten() {
-            scanned += 1;
-            if scanned > MAX_SCANNED_ENTRIES {
-                break;
+            if scanned == limit {
+                return Err(ScanDigestError::EntryLimitExceeded { limit });
             }
+            scanned += 1;
             let path = entry.path();
             let Ok(relative) = path.strip_prefix(root) else {
                 continue;
@@ -419,7 +488,7 @@ fn scan_digest(root: &Path, patterns: &[String]) -> Option<String> {
         hasher.update(entry.as_bytes());
         hasher.update(b"\n");
     }
-    Some(hasher.finalize().to_hex()[..32].to_owned())
+    Ok(hasher.finalize().to_hex()[..32].to_owned())
 }
 
 /// A small glob matcher: `*` matches within one path segment and `**` matches
@@ -516,4 +585,35 @@ pub fn routine_of_trigger(workspace: &Workspace, trigger_id: RoutineTriggerId) -
     workspace
         .routines()
         .find(|routine| routine.trigger(trigger_id).is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn scan_interval_runs_immediately_then_throttles_each_trigger() {
+        let mut watcher = TriggerWatcher::default();
+        let first = (1, 1);
+        let second = (1, 2);
+
+        assert!(watcher.scan_due(first, Timestamp::from_unix_millis(1_000), 1_000));
+        assert!(!watcher.scan_due(first, Timestamp::from_unix_millis(1_999), 1_000));
+        assert!(watcher.scan_due(first, Timestamp::from_unix_millis(2_000), 1_000));
+        assert!(watcher.scan_due(second, Timestamp::from_unix_millis(1_001), 1_000));
+    }
+
+    #[test]
+    fn oversized_scan_reports_truncation_instead_of_hashing_partial_state() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("one.rs"), "one").unwrap();
+        fs::write(temp.path().join("two.rs"), "two").unwrap();
+
+        assert_eq!(
+            scan_digest_with_limit(temp.path(), &["**/*".to_owned()], 1),
+            Err(ScanDigestError::EntryLimitExceeded { limit: 1 })
+        );
+    }
 }

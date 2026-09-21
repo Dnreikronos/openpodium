@@ -869,25 +869,29 @@ fn a_filesystem_trigger_debounces_and_deduplicates_what_it_observed() {
     fs::write(project.join("main.rs"), "fn main() {}").unwrap();
     assert!(
         watcher.poll(&manager, timestamp(1_010)).events.is_empty(),
-        "a change inside the debounce window does not fire yet"
+        "a change inside the scan interval is not observed yet"
     );
-    let poll = watcher.poll(&manager, timestamp(1_200));
+    assert!(
+        watcher.poll(&manager, timestamp(2_000)).events.is_empty(),
+        "the first scan that observes a change starts its debounce window"
+    );
+    let poll = watcher.poll(&manager, timestamp(3_000));
     assert_eq!(poll.events.len(), 1);
     let occurrence = poll.events[0].firing.occurrence.clone();
 
     // Re-observing the same tree must not produce a second occurrence.
     watcher.mark_consumed(&poll.events[0]);
-    assert!(watcher.poll(&manager, timestamp(1_300)).events.is_empty());
+    assert!(watcher.poll(&manager, timestamp(4_000)).events.is_empty());
 
     fs::write(project.join("notes.txt"), "ignored").unwrap();
     assert!(
-        watcher.poll(&manager, timestamp(1_500)).events.is_empty(),
+        watcher.poll(&manager, timestamp(5_000)).events.is_empty(),
         "paths outside the trigger's patterns are filtered out"
     );
 
     fs::write(project.join("main.rs"), "fn main() { todo!() }").unwrap();
-    assert!(watcher.poll(&manager, timestamp(2_000)).events.is_empty());
-    let poll = watcher.poll(&manager, timestamp(2_200));
+    assert!(watcher.poll(&manager, timestamp(6_000)).events.is_empty());
+    let poll = watcher.poll(&manager, timestamp(7_000));
     assert_eq!(poll.events.len(), 1);
     assert_ne!(
         poll.events[0].firing.occurrence, occurrence,
@@ -1720,7 +1724,11 @@ fn a_git_trigger_records_the_revisions_it_observed_and_holds_its_baseline() {
     git(&["add", "."]);
     assert!(git(&["commit", "-m", "second"]));
 
-    let poll = watcher.poll(&manager, timestamp(1_100));
+    assert!(
+        watcher.poll(&manager, timestamp(1_100)).events.is_empty(),
+        "Git polling is throttled independently of the UI tick"
+    );
+    let poll = watcher.poll(&manager, timestamp(2_000));
     assert_eq!(poll.events.len(), 1);
     let event = poll.events[0].clone();
     assert!(event.observed.contains_key(&input_key("git.after")));
@@ -1731,10 +1739,10 @@ fn a_git_trigger_records_the_revisions_it_observed_and_holds_its_baseline() {
 
     // Without consuming the event the baseline holds, so a transient failure
     // to start the run re-reports the same change rather than dropping it.
-    assert_eq!(watcher.poll(&manager, timestamp(1_200)).events.len(), 1);
+    assert_eq!(watcher.poll(&manager, timestamp(3_000)).events.len(), 1);
 
     watcher.mark_consumed(&event);
-    assert!(watcher.poll(&manager, timestamp(1_300)).events.is_empty());
+    assert!(watcher.poll(&manager, timestamp(4_000)).events.is_empty());
 
     let mut scheduler = RoutineScheduler::default();
     let run_id = scheduler
@@ -2192,12 +2200,19 @@ fn a_workspace_with_a_routine_run_still_exports() {
     scheduler
         .tick(&mut manager, &mut orchestrator, timestamp(21))
         .unwrap();
+    let routine_handoff = manager
+        .workspace(workspace_id)
+        .unwrap()
+        .handoffs()
+        .find(|handoff| handoff.source().is_none())
+        .map(|handoff| handoff.id())
+        .expect("the run dispatched a routine-submitted handoff");
     assert!(
         manager
             .workspace(workspace_id)
             .unwrap()
-            .handoffs()
-            .any(|handoff| handoff.source().is_none()),
+            .handoff(routine_handoff)
+            .is_some(),
         "the run dispatched a routine-submitted handoff"
     );
 
@@ -2208,4 +2223,37 @@ fn a_workspace_with_a_routine_run_still_exports() {
         !archive.contains("routine-1-1-1"),
         "the execution record of a run is not reusable workspace structure"
     );
+
+    for (node_id, target, x) in [
+        (
+            crate::domain::NodeId::new(1),
+            crate::domain::NodeTarget::Agent(AgentId::new(1)),
+            0.0,
+        ),
+        (
+            crate::domain::NodeId::new(2),
+            crate::domain::NodeTarget::Handoff(routine_handoff),
+            400.0,
+        ),
+    ] {
+        manager
+            .execute(
+                workspace_id,
+                DomainCommand::AddNode(crate::domain::Node::new(
+                    node_id,
+                    target,
+                    crate::domain::CanvasPoint::new(x, 0.0).unwrap(),
+                    crate::domain::CanvasSize::new(320.0, 200.0).unwrap(),
+                )),
+                timestamp(22),
+            )
+            .unwrap();
+    }
+    let template = manager
+        .export_template(
+            workspace_id,
+            &[crate::domain::NodeId::new(1), crate::domain::NodeId::new(2)],
+        )
+        .expect("a reusable selection should ignore its routine execution record");
+    assert!(!template.contains("routine-1-1-1"));
 }
