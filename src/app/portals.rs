@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use iced::widget::{button, column, row, text, text_input};
+use iced::widget::{column, row, text};
+
+use super::ui::section_label;
+use super::ui::{button, text_input};
 use iced::{Element, Task};
 use openpodium::domain::{
     CanvasNodeContent, CanvasPoint, CanvasSize, DomainCommand, Node, NodeId, NodeTarget, Workspace,
@@ -370,7 +373,7 @@ pub(super) fn shutdown(state: &mut OpenPodium) {
 
 pub(super) fn creation_view(state: &OpenPodium) -> Element<'_, AppMessage> {
     let mut content = column![
-        text("Browser portals").size(18),
+        section_label("Browser portals"),
         row![
             text_input("https://example.com", &state.portal_ui.url)
                 .on_input(|url| AppMessage::Portal(Message::UrlChanged(url))),
@@ -381,7 +384,7 @@ pub(super) fn creation_view(state: &OpenPodium) -> Element<'_, AppMessage> {
     .spacing(8);
     content =
         content
-            .push(text("Device portals").size(18))
+            .push(section_label("Device portals"))
             .push(if state.portal_ui.discovery_busy {
                 button("Discovering devices…")
             } else {
@@ -423,7 +426,7 @@ pub(super) fn creation_view(state: &OpenPodium) -> Element<'_, AppMessage> {
 pub(super) fn selected_view(state: &OpenPodium) -> Option<Element<'_, AppMessage>> {
     let (key, config) = selected_portal(state)?;
     let content = column![
-        text("Portal").size(18),
+        section_label("Portal"),
         text(config.target().selector()).size(12),
     ]
     .spacing(8);
@@ -461,7 +464,7 @@ fn approval_view(state: &OpenPodium, portal_id: Option<u64>) -> Option<Element<'
     if approvals.is_empty() {
         return None;
     }
-    let mut content = column![text("Pending portal actions").size(18)].spacing(8);
+    let mut content = column![section_label("Pending portal actions")].spacing(8);
     for approval in approvals {
         let approve_once = Message::Approve {
             workspace_id: approval.workspace_id,

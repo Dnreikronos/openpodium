@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use iced::widget::{button, column, row, text, text_editor};
+use iced::widget::{column, row, text, text_editor};
+
+use super::ui::button;
+use super::ui::section_label;
 use iced::{Element, Fill, Task};
 use openpodium::context::{
     FilePreview, NoteBuffer, list_directory, preview_file, render_diff, resolve_project_path,
@@ -332,7 +335,7 @@ pub(super) fn note_panel(state: &UiState) -> Option<Element<'_, Message>> {
     let Some(note) = state.note.as_ref() else {
         return state.text_key.map(|_| {
             column![
-                text("Editing text node").size(18),
+                section_label("Editing text node"),
                 state
                     .search_match
                     .map(|offset| text(format!("Search match near character {offset}")).size(12)),

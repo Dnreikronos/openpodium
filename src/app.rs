@@ -1546,12 +1546,14 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         settings = settings.push(panel_card(portal));
     }
     if has_active_workspace {
-        settings = settings
-            .push(text(state.localizer.text("workspace-health")).size(18))
-            .push(
-                supervisor_panel::panel(&state.supervisor_snapshot, &state.supervisor_ui)
-                    .map(Message::Supervisor),
-            );
+        settings = settings.push(
+            supervisor_panel::panel(
+                state.localizer.text("workspace-health"),
+                &state.supervisor_snapshot,
+                &state.supervisor_ui,
+            )
+            .map(Message::Supervisor),
+        );
     }
 
     let stage: Element<'_, Message> = if has_active_workspace {
