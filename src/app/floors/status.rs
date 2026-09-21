@@ -6,8 +6,11 @@ use iced::widget::{column, text};
 use iced::{Element, Task};
 use openpodium::domain::NodeId;
 use openpodium::git::{ChangeKind, ChangedPath, CollisionReport, CollisionSeverity, Repository};
+use openpodium::supervisor::{CollisionObservation, SignalClass};
 
-use super::super::{Message as AppMessage, OpenPodium, WorkspaceManager};
+use crate::notifications::NotificationRequest;
+
+use super::super::{Message as AppMessage, OpenPodium, WorkspaceManager, now};
 
 #[derive(Default)]
 pub(super) struct UiState {
@@ -89,8 +92,49 @@ pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessag
             state.floor_ui.status.signature = Some(result.signature);
             state.floor_ui.status.main = Some(result.main);
             if let Some(report) = result.report {
+                let observations = report
+                    .collisions
+                    .iter()
+                    .map(|collision| CollisionObservation {
+                        workspace_id: id,
+                        path: collision.path.to_string(),
+                        left_checkout: collision.left.display().to_string(),
+                        right_checkout: collision.right.display().to_string(),
+                    })
+                    .collect::<Vec<_>>();
+                let new_collision = observations.iter().find(|observation| {
+                    !state
+                        .supervisor_collisions
+                        .get(&id)
+                        .is_some_and(|previous| previous.contains(observation))
+                });
+                let notification = new_collision.and_then(|collision| {
+                    state
+                        .notification_limiter
+                        .should_send(
+                            id,
+                            SignalClass::Collision,
+                            now(),
+                            state.supervisor_ui.notification_settings(),
+                        )
+                        .then(|| NotificationRequest {
+                            target: None,
+                            title: "File collision detected".to_owned(),
+                            body: format!(
+                                "{} overlaps between {} and {}",
+                                collision.path, collision.left_checkout, collision.right_checkout
+                            ),
+                        })
+                });
+                state.supervisor_collisions.insert(id, observations);
                 state.floor_ui.status.report = report;
                 state.canvas_revision = state.canvas_revision.wrapping_add(1);
+                if let Some(notification) = notification {
+                    return Task::perform(
+                        crate::notifications::show(notification),
+                        AppMessage::NotificationActivated,
+                    );
+                }
             }
         }
         Err(error) => state.notice = Some(format!("Git collision refresh failed: {error}")),

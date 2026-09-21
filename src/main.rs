@@ -4,6 +4,7 @@ mod chat;
 mod navigation_panel;
 mod notifications;
 mod routines_panel;
+mod supervisor_panel;
 mod terminal;
 mod timeline_panel;
 

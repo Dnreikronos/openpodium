@@ -41,7 +41,10 @@ use openpodium::runtime::{
     EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, ProcessSpec,
     RuntimeError, check_agent_capability, check_environment, prepare_environment_process,
 };
-use openpodium::timeline::{self, AttentionLevel, NavigationTarget, RecoveryAction, TimelineItem};
+use openpodium::supervisor::{
+    self, CollisionObservation, NotificationRateLimiter, WorkspaceActivity,
+};
+use openpodium::timeline::{self, NavigationTarget, RecoveryAction, TimelineItem};
 use openpodium::workspaces::{WorkspaceManager, WorkspaceSettingsInput};
 use tokio::sync::Mutex;
 
@@ -50,6 +53,7 @@ use crate::chat::{self, AttachmentStore, LinkTarget};
 use crate::navigation_panel;
 use crate::notifications::NotificationRequest;
 use crate::routines_panel;
+use crate::supervisor_panel;
 use crate::terminal;
 use crate::terminal::session::{self, Action as TerminalAction, ProcessStream, Session};
 use crate::timeline_panel;
@@ -110,6 +114,9 @@ struct OpenPodium {
     timeline_ui: timeline_panel::UiState,
     timeline_items: BTreeMap<WorkspaceId, Vec<TimelineItem>>,
     timeline_high_watermarks: BTreeMap<WorkspaceId, TimelineEventId>,
+    supervisor_ui: supervisor_panel::UiState,
+    notification_limiter: NotificationRateLimiter,
+    supervisor_collisions: BTreeMap<WorkspaceId, Vec<CollisionObservation>>,
     navigation_ui: navigation_panel::UiState,
     command_registry: CommandRegistry,
     attachment_store: Option<AttachmentStore>,
@@ -231,6 +238,9 @@ impl Default for OpenPodium {
             timeline_ui: timeline_panel::UiState::default(),
             timeline_items,
             timeline_high_watermarks,
+            supervisor_ui: supervisor_panel::UiState::default(),
+            notification_limiter: NotificationRateLimiter::default(),
+            supervisor_collisions: BTreeMap::new(),
             navigation_ui: navigation_panel::UiState::default(),
             command_registry,
             attachment_store,
@@ -283,6 +293,7 @@ enum Message {
     Canvas(canvas::Message),
     Chat(chat::Message),
     Timeline(timeline_panel::Message),
+    Supervisor(supervisor_panel::Message),
     Routines(routines_panel::Message),
     Navigation(navigation_panel::Message),
     NavigationKey {
@@ -459,6 +470,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::CancelPortableImport => state.portable_import = None,
         Message::Chat(message) => return handle_chat_message(state, message),
         Message::Timeline(message) => return handle_timeline_message(state, message),
+        Message::Supervisor(message) => state.supervisor_ui.update(message),
         Message::Routines(message) => return handle_routines_message(state, message),
         Message::Navigation(message) => return navigation::update(state, message),
         Message::NavigationKey {
@@ -640,6 +652,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
 }
 
 fn view(state: &OpenPodium) -> Element<'_, Message> {
+    let supervisor = supervisor_snapshot(state);
     let has_active_workspace = state
         .workspaces
         .as_ref()
@@ -693,9 +706,13 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     ]
     .spacing(8);
     let sidebar = container(
-        column![scrollable(workspace_list).height(Fill), create_form]
-            .spacing(16)
-            .height(Fill),
+        column![
+            scrollable(workspace_list).height(Fill),
+            supervisor_panel::panel(&supervisor, &state.supervisor_ui).map(Message::Supervisor),
+            create_form
+        ]
+        .spacing(16)
+        .height(Fill),
     )
     .width(280)
     .height(Fill)
@@ -1349,6 +1366,24 @@ fn load_timeline_state(workspaces: &WorkspaceManager) -> Result<TimelineState, S
     Ok((items, high_watermarks))
 }
 
+fn supervisor_snapshot(state: &OpenPodium) -> supervisor::Snapshot {
+    let Some(workspaces) = state.workspaces.as_ref() else {
+        return supervisor::Snapshot::default();
+    };
+    supervisor::aggregate(
+        workspaces
+            .recent_workspaces()
+            .map(|workspace| WorkspaceActivity {
+                workspace,
+                timeline: state
+                    .timeline_items
+                    .get(&workspace.id())
+                    .map_or(&[][..], Vec::as_slice),
+            }),
+        state.supervisor_collisions.values().flatten().cloned(),
+    )
+}
+
 fn refresh_timelines(state: &mut OpenPodium) -> Task<Message> {
     let workspace_ids = state
         .workspaces
@@ -1379,14 +1414,19 @@ fn refresh_timelines(state: &mut OpenPodium) -> Task<Message> {
             let items = timeline::project(workspace, &events);
             let requests = items
                 .iter()
-                .filter(|item| item.attention() != AttentionLevel::None)
                 .filter_map(|item| {
-                    let task_id = item.task_id()?;
-                    Some(NotificationRequest {
-                        target: timeline::navigation_target(workspace, task_id)?,
-                        title: item.title().to_owned(),
-                        body: item.detail().to_owned(),
-                    })
+                    let class = supervisor::notification_class(item)?;
+                    Some((
+                        NotificationRequest {
+                            target: item.task_id().and_then(|task_id| {
+                                timeline::navigation_target(workspace, task_id)
+                            }),
+                            title: item.title().to_owned(),
+                            body: item.detail().to_owned(),
+                        },
+                        class,
+                        item.occurred_at(),
+                    ))
                 })
                 .collect::<Vec<_>>();
             Ok((events.last().map(|event| event.id()), items, requests))
@@ -1408,7 +1448,21 @@ fn refresh_timelines(state: &mut OpenPodium) -> Task<Message> {
             .entry(workspace_id)
             .or_default()
             .extend(items);
-        notifications.extend(requests);
+        notifications.extend(
+            requests
+                .into_iter()
+                .filter_map(|(request, class, occurred_at)| {
+                    state
+                        .notification_limiter
+                        .should_send(
+                            workspace_id,
+                            class,
+                            occurred_at,
+                            state.supervisor_ui.notification_settings(),
+                        )
+                        .then_some(request)
+                }),
+        );
     }
     Task::batch(notifications.into_iter().map(|request| {
         Task::perform(
@@ -4550,6 +4604,9 @@ mod tests {
             timeline_ui: timeline_panel::UiState::default(),
             timeline_items: BTreeMap::new(),
             timeline_high_watermarks: BTreeMap::new(),
+            supervisor_ui: supervisor_panel::UiState::default(),
+            notification_limiter: NotificationRateLimiter::default(),
+            supervisor_collisions: BTreeMap::new(),
             navigation_ui: navigation_panel::UiState::default(),
             command_registry: CommandRegistry::new(),
             attachment_store: None,
@@ -5230,6 +5287,9 @@ mod tests {
             timeline_ui: timeline_panel::UiState::default(),
             timeline_items: BTreeMap::new(),
             timeline_high_watermarks: BTreeMap::new(),
+            supervisor_ui: supervisor_panel::UiState::default(),
+            notification_limiter: NotificationRateLimiter::default(),
+            supervisor_collisions: BTreeMap::new(),
             navigation_ui: navigation_panel::UiState::default(),
             command_registry: CommandRegistry::new(),
             attachment_store: None,

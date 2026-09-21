@@ -5,7 +5,7 @@ use openpodium::timeline::NavigationTarget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotificationRequest {
-    pub target: NavigationTarget,
+    pub target: Option<NavigationTarget>,
     pub title: String,
     pub body: String,
 }
@@ -21,7 +21,7 @@ pub async fn show(request: NotificationRequest) -> Option<NavigationTarget> {
             .ok()?;
         let activated = Cell::new(false);
         handle.wait_for_action(|action| activated.set(is_activation(action)));
-        activated.get().then_some(request.target)
+        activated.get().then_some(request.target).flatten()
     })
     .await
     .ok()
