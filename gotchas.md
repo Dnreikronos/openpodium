@@ -10,3 +10,4 @@
 - Never use unverified global screen coordinates for native-app validation when other windows are underneath. Target and focus the OpenPodium process explicitly, capture its window directly, and avoid interacting with unrelated applications.
 - Desktop project onboarding should use the operating system's native folder picker. Do not make users type or paste absolute filesystem paths when the platform already provides a safer, familiar selection flow.
 - Core canvas navigation must stay visible and work while embedded content is focused. Route zoom shortcuts around terminal and portal input capture, and provide persistent zoom controls instead of relying on undiscoverable gestures or keys.
+- Canvas zoom must work directly with an unmodified mouse wheel and two-finger trackpad scroll at the pointer location. Do not require buttons or keyboard modifiers for this primary interaction; reserve Option/Alt + scroll for embedded-content scrolling and canvas panning.
