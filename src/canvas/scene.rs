@@ -10,6 +10,7 @@ use openpodium::domain::{
 };
 use openpodium::portal::{PortalFrame, PortalFrameTransform, PortalRect};
 
+use crate::app::shell;
 use crate::terminal::{self, BODY_PADDING, CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT};
 
 use super::{Camera, CanvasDocument, NodeKind, ViewportSize, WorldPoint, WorldRect};
@@ -34,7 +35,7 @@ pub(super) fn draw(
     theme: &Theme,
 ) {
     let palette = theme.extended_palette();
-    frame.fill_rectangle(Point::ORIGIN, frame.size(), palette.background.base.color);
+    frame.fill_rectangle(Point::ORIGIN, frame.size(), shell::surface_color(palette));
 
     draw_grid(frame, camera, viewport, palette);
     draw_groups(frame, camera, viewport, document, palette);
@@ -83,10 +84,12 @@ fn draw_grid(
             path.line_to(Point::new(viewport.width as f32, screen_y));
         }
     });
+    // The grid is orientation, not decoration: it must be visible up close and
+    // never compete with the nodes drawn on top of it.
     frame.stroke(
         &grid,
         Stroke::default()
-            .with_color(palette.background.weak.color)
+            .with_color(shell::sunken_color(palette))
             .with_width(1.0),
     );
 
@@ -111,7 +114,7 @@ fn draw_grid(
     frame.stroke(
         &axes,
         Stroke::default()
-            .with_color(palette.background.strong.color)
+            .with_color(shell::hairline_color(palette))
             .with_width(1.5),
     );
 }
@@ -175,15 +178,31 @@ fn draw_connections(
         };
         let from = camera.world_to_screen(node_center(source), viewport);
         let to = camera.world_to_screen(node_center(target), viewport);
-        let path = Path::line(
-            Point::new(from.x as f32, from.y as f32),
-            Point::new(to.x as f32, to.y as f32),
-        );
+        let from = Point::new(from.x as f32, from.y as f32);
+        let to = Point::new(to.x as f32, to.y as f32);
+        // A dashed curve reads as a link rather than a hard edge, and the
+        // horizontal control points keep it clear of the node bodies the way a
+        // straight center-to-center line does not.
+        let reach = ((to.x - from.x).abs() * 0.5).clamp(40.0, 220.0);
+        let path = Path::new(|builder| {
+            builder.move_to(from);
+            builder.bezier_curve_to(
+                Point::new(from.x + reach, from.y),
+                Point::new(to.x - reach, to.y),
+                to,
+            );
+        });
         frame.stroke(
             &path,
-            Stroke::default()
-                .with_color(connection_color(connection.kind(), palette))
-                .with_width((2.0 * camera.zoom() as f32).clamp(1.0, 3.0)),
+            Stroke {
+                line_dash: canvas::LineDash {
+                    segments: &[6.0, 5.0],
+                    offset: 0,
+                },
+                ..Stroke::default()
+                    .with_color(connection_color(connection.kind(), palette).scale_alpha(0.7))
+                    .with_width((1.5 * camera.zoom() as f32).clamp(1.0, 2.5))
+            },
         );
     }
 }
@@ -226,28 +245,44 @@ fn draw_nodes(
         let accent = node_color(label.kind, palette);
         let is_selected = selected.contains(&node.id());
 
-        frame.fill(&shape, palette.background.weakest.color);
-        frame.stroke(
-            &shape,
-            Stroke::default()
-                .with_color(if is_selected {
-                    palette.primary.strong.color
-                } else {
-                    accent
-                })
-                .with_width(if is_selected { 3.0 } else { 1.5 }),
-        );
+        // Unselected nodes wear a neutral hairline and carry their kind in the
+        // accent bar alone. Selection is a dashed accent outline, which reads
+        // as a marquee rather than as a heavier permanent border.
+        frame.fill(&shape, shell::surface_color(palette));
         let zoom = camera.zoom() as f32;
         let header_height = (HEADER_HEIGHT * zoom).clamp(28.0, 60.0);
         frame.fill_rectangle(
             top_left,
             Size::new(size.width, header_height),
-            palette.background.weak.color,
+            shell::chrome_color(palette),
+        );
+        frame.fill_rectangle(
+            Point::new(top_left.x, top_left.y + header_height - 1.0),
+            Size::new(size.width, 1.0),
+            shell::hairline_color(palette),
         );
         frame.fill_rectangle(
             top_left,
-            Size::new((5.0 * camera.zoom() as f32).clamp(2.0, 6.0), header_height),
+            Size::new((4.0 * camera.zoom() as f32).clamp(2.0, 5.0), header_height),
             accent,
+        );
+        frame.stroke(
+            &shape,
+            if is_selected {
+                Stroke {
+                    line_dash: canvas::LineDash {
+                        segments: &[5.0, 4.0],
+                        offset: 0,
+                    },
+                    ..Stroke::default()
+                        .with_color(palette.primary.base.color)
+                        .with_width(1.5)
+                }
+            } else {
+                Stroke::default()
+                    .with_color(shell::hairline_color(palette))
+                    .with_width(1.0)
+            },
         );
 
         if camera.zoom() >= BODY_MIN_ZOOM {
@@ -255,14 +290,14 @@ fn draw_nodes(
             frame.fill_text(canvas::Text {
                 content: label.title.clone(),
                 position: Point::new(top_left.x + padding, top_left.y + padding * 0.45),
-                color: palette.background.weak.text,
+                color: palette.background.base.text,
                 size: Pixels((14.0 * zoom).clamp(9.0, 17.0)),
                 ..canvas::Text::default()
             });
             frame.fill_text(canvas::Text {
                 content: label.subtitle.clone(),
                 position: Point::new(top_left.x + padding, top_left.y + header_height * 0.56),
-                color: palette.secondary.base.color,
+                color: shell::muted_color(palette),
                 size: Pixels((10.0 * zoom).clamp(7.0, 12.0)),
                 ..canvas::Text::default()
             });
@@ -313,14 +348,23 @@ fn draw_nodes(
         }
 
         if is_selected {
-            let handle = (12.0 * camera.zoom() as f32).clamp(8.0, 16.0);
-            frame.fill_rectangle(
+            // A small filled grip in the corner, sized to stay grabbable at
+            // low zoom without turning into a block over the node body.
+            let handle = (10.0 * camera.zoom() as f32).clamp(7.0, 13.0);
+            let grip = Path::rounded_rectangle(
                 Point::new(
-                    top_left.x + size.width - handle,
-                    top_left.y + size.height - handle,
+                    top_left.x + size.width - handle - 2.0,
+                    top_left.y + size.height - handle - 2.0,
                 ),
                 Size::new(handle, handle),
-                palette.primary.strong.color,
+                3.0.into(),
+            );
+            frame.fill(&grip, palette.primary.base.color);
+            frame.stroke(
+                &grip,
+                Stroke::default()
+                    .with_color(shell::surface_color(palette))
+                    .with_width(1.5),
             );
         }
     }
