@@ -285,22 +285,43 @@ fn draw_nodes(
             },
         );
 
-        if camera.zoom() >= BODY_MIN_ZOOM {
-            let padding = (12.0 * zoom).clamp(7.0, 16.0);
-            frame.fill_text(canvas::Text {
-                content: label.title.clone(),
-                position: Point::new(top_left.x + padding, top_left.y + padding * 0.45),
-                color: palette.background.base.text,
-                size: Pixels((14.0 * zoom).clamp(9.0, 17.0)),
-                ..canvas::Text::default()
-            });
-            frame.fill_text(canvas::Text {
-                content: label.subtitle.clone(),
-                position: Point::new(top_left.x + padding, top_left.y + header_height * 0.56),
-                color: shell::muted_color(palette),
-                size: Pixels((10.0 * zoom).clamp(7.0, 12.0)),
-                ..canvas::Text::default()
-            });
+        // The title is what a node is. It stays legible at every zoom, clipped
+        // to its header so a small node truncates the name instead of spilling
+        // it across the board. Only the detail below it drops away.
+        let padding = (12.0 * zoom).clamp(7.0, 16.0);
+        let shows_detail = camera.zoom() >= BODY_MIN_ZOOM;
+        let title_size = (14.0 * zoom).clamp(9.0, 17.0);
+        let title_y = if shows_detail {
+            top_left.y + padding * 0.45
+        } else {
+            top_left.y + (header_height - title_size) * 0.5
+        };
+        frame.with_clip(
+            Rectangle::new(top_left, Size::new(size.width, header_height)),
+            |frame| {
+                frame.fill_text(canvas::Text {
+                    content: label.title.clone(),
+                    position: Point::new(top_left.x + padding, title_y),
+                    color: palette.background.base.text,
+                    size: Pixels(title_size),
+                    ..canvas::Text::default()
+                });
+                if shows_detail {
+                    frame.fill_text(canvas::Text {
+                        content: label.subtitle.clone(),
+                        position: Point::new(
+                            top_left.x + padding,
+                            top_left.y + header_height * 0.56,
+                        ),
+                        color: shell::muted_color(palette),
+                        size: Pixels((10.0 * zoom).clamp(7.0, 12.0)),
+                        ..canvas::Text::default()
+                    });
+                }
+            },
+        );
+
+        if shows_detail {
             if let Some(terminal) = document.terminal(node.id()) {
                 draw_terminal(
                     frame,
