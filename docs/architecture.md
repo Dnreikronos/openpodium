@@ -125,6 +125,9 @@ Runtime, persistence, orchestration, and Git modules will be added as their vert
 
 ## Security and privacy
 
+The detailed threat model, code/test mapping, residual risks, and outbound
+connection inventory live in [Security and privacy](security.md).
+
 - Bind IPC to the local user session and authenticate it with a per-install secret.
 - Treat terminal output, repository content, and agent messages as untrusted input.
 - Never interpolate user text into a shell command; use argument arrays.

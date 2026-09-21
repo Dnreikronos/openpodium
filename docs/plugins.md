@@ -125,6 +125,12 @@ the capabilities the user approved, enable the catalog record, and start its
 `PluginSession`; the catalog exposes only contributions backed by granted
 capabilities.
 
+Before activation, render `PluginCatalog::permission_review` so the user sees
+every requested capability, its observe/change/execute impact, current grant
+state, and the native-process filesystem/network warning. Discovery rejects
+manifest symlinks, symlinked plugin directories, and executables that resolve
+outside their plugin directory.
+
 ## Verification
 
 Targeted tests cover manifest validation, SDK range negotiation, contribution

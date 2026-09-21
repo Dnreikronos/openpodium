@@ -85,6 +85,12 @@ errors may name the profile and failed operation, but do not echo process
 arguments, environment variables, credential-helper output, or raw
 authentication prompts.
 
+Container launches pass `--env NAME` and place the corresponding value only in
+the engine process environment. This keeps values out of the Docker or Podman
+argument vector and therefore out of ordinary process listings. Remote SSH
+commands cannot inherit a local environment directly, so only the explicitly
+prepared non-secret agent environment is shell-quoted into that protocol.
+
 ## Verification
 
 Targeted domain and persistence tests cover profile validation, references,

@@ -58,6 +58,9 @@ cargo test --all-targets --all-features
 
 CI runs all three commands on macOS, Linux, and Windows. The current source boundaries are documented in [the architecture](docs/architecture.md#initial-code-organization).
 
+The enforceable trust model, secret-handling rules, and complete outbound
+connection inventory are documented in [Security and privacy](docs/security.md).
+
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
