@@ -17,8 +17,15 @@ use super::{Camera, CanvasDocument, NodeKind, ViewportSize, WorldPoint, WorldRec
 
 const BASE_GRID_STEP: f64 = 40.0;
 const MIN_GRID_PIXELS: f64 = 24.0;
-/// Node bodies, including portal frames, are only drawn at or above this zoom.
+/// Below this zoom a node is too small to aim at, so portals stop taking
+/// pointer input and the header drops its subtitle. Bodies still draw: a node
+/// you cannot read is still a node you need to see.
 pub(super) const BODY_MIN_ZOOM: f64 = 0.4;
+
+/// Below this zoom terminal glyphs are too small to read, so cells render as
+/// ink bars instead. Shaping thousands of illegible glyphs costs a great deal
+/// and shows less than the bars do.
+const GLYPH_MIN_ZOOM: f32 = 0.55;
 
 pub(super) struct TerminalOverlay<'a> {
     pub(super) focused: Option<NodeId>,
@@ -321,50 +328,46 @@ fn draw_nodes(
             },
         );
 
-        if shows_detail {
-            if let Some(terminal) = document.terminal(node.id()) {
-                draw_terminal(
-                    frame,
-                    top_left,
-                    header_height,
-                    zoom,
-                    terminal,
-                    (terminal_overlay.focused == Some(node.id()))
-                        .then_some(terminal_overlay.preedit),
-                );
-            } else {
-                let body_padding = (12.0 * zoom).clamp(7.0, 16.0);
-                let body_top_left = Point::new(
-                    top_left.x + body_padding,
-                    top_left.y + header_height + body_padding,
-                );
-                let body_size = Size::new(
-                    (size.width - body_padding * 2.0).max(1.0),
-                    (size.height - header_height - body_padding * 2.0).max(1.0),
-                );
-                let rendered_portal =
-                    document
-                        .portal_frame(node.id())
-                        .is_some_and(|portal_frame| {
-                            draw_portal_frame(
-                                frame,
-                                node.content(),
-                                portal_frame,
-                                body_top_left,
-                                body_size,
-                            )
-                        });
-                if !rendered_portal {
-                    draw_content(
+        if let Some(terminal) = document.terminal(node.id()) {
+            draw_terminal(
+                frame,
+                top_left,
+                header_height,
+                zoom,
+                terminal,
+                (terminal_overlay.focused == Some(node.id())).then_some(terminal_overlay.preedit),
+            );
+        } else {
+            let body_padding = (12.0 * zoom).clamp(7.0, 16.0);
+            let body_top_left = Point::new(
+                top_left.x + body_padding,
+                top_left.y + header_height + body_padding,
+            );
+            let body_size = Size::new(
+                (size.width - body_padding * 2.0).max(1.0),
+                (size.height - header_height - body_padding * 2.0).max(1.0),
+            );
+            let rendered_portal = document
+                .portal_frame(node.id())
+                .is_some_and(|portal_frame| {
+                    draw_portal_frame(
                         frame,
+                        node.content(),
+                        portal_frame,
                         body_top_left,
                         body_size,
-                        zoom,
-                        node.content(),
-                        document.body(node.id()),
-                        palette.background.base.text,
-                    );
-                }
+                    )
+                });
+            if !rendered_portal {
+                draw_content(
+                    frame,
+                    body_top_left,
+                    body_size,
+                    zoom,
+                    node.content(),
+                    document.body(node.id()),
+                    palette.background.base.text,
+                );
             }
         }
 
@@ -612,7 +615,15 @@ fn draw_terminal(
             background.a = 1.0;
         }
         frame.fill_rectangle(position, cell_size, background);
-        if cell.text != " " {
+        if cell.text != " " && zoom < GLYPH_MIN_ZOOM {
+            // Too small to read. An ink bar keeps the shape of the output,
+            // which is the only thing a glyph could convey at this size.
+            frame.fill_rectangle(
+                Point::new(position.x, position.y + cell_size.height * 0.25),
+                Size::new(cell_size.width, (cell_size.height * 0.5).max(1.0)),
+                terminal_color(cell.foreground).scale_alpha(0.85),
+            );
+        } else if cell.text != " " {
             frame.fill_text(canvas::Text {
                 content: cell.text.clone(),
                 position: Point::new(position.x, position.y - cell_size.height * 0.04),
