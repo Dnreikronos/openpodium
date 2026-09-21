@@ -1595,18 +1595,25 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
 
         // The canvas owns the window. Every control rides above it as a
         // floating pill so nothing steals height from the work surface.
+        // Neither line may wrap. A wrapped path grows the chip tall, and a
+        // capsule radius turns a tall box into a blob. A narrow window clips
+        // the path instead, and the workspace name always survives.
         let workspace_chip = container(
             row![
-                text(workspace_title).size(13),
+                text(workspace_title)
+                    .size(13)
+                    .wrapping(iced::widget::text::Wrapping::None),
                 text(&state.working_directory)
                     .size(11)
-                    .style(shell::subtle_text),
+                    .style(shell::subtle_text)
+                    .wrapping(iced::widget::text::Wrapping::None),
             ]
             .spacing(8)
             .align_y(IcedAlignment::Center),
         )
         .style(shell::floating_chip)
-        .padding([7, 13]);
+        .padding([7, 13])
+        .clip(true);
 
         let add_agent = |label: &'static str, program: AgentProgram| {
             iced_button(text(label).size(13))
