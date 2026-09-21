@@ -178,10 +178,11 @@ pub enum CommandId {
     Delete,
     Copy,
     Paste,
+    ToggleSidebar,
 }
 
 impl CommandId {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::OpenPalette,
         Self::NextWorkspace,
         Self::PreviousWorkspace,
@@ -206,6 +207,7 @@ impl CommandId {
         Self::Delete,
         Self::Copy,
         Self::Paste,
+        Self::ToggleSidebar,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -234,6 +236,7 @@ impl CommandId {
             Self::Delete => "delete",
             Self::Copy => "copy",
             Self::Paste => "paste",
+            Self::ToggleSidebar => "toggle_sidebar",
         }
     }
 
@@ -269,6 +272,7 @@ impl CommandId {
             Self::Delete => "Delete selection",
             Self::Copy => "Copy selection",
             Self::Paste => "Paste selection",
+            Self::ToggleSidebar => "Show or hide the workspace rail",
         }
     }
 
@@ -298,6 +302,7 @@ impl CommandId {
             Self::Delete => "Delete",
             Self::Copy => "Primary+c",
             Self::Paste => "Primary+v",
+            Self::ToggleSidebar => "Primary+b",
         };
         Shortcut::parse(value).ok()
     }
@@ -432,6 +437,34 @@ impl Error for BindingError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every command must be reachable and rebindable from the palette, and a
+    /// duplicate default binding would silently shadow one of them.
+    #[test]
+    fn every_command_has_a_distinct_default_binding() {
+        use std::collections::BTreeSet;
+
+        let mut seen = BTreeSet::new();
+        for command in CommandId::ALL {
+            let shortcut = command
+                .default_shortcut()
+                .unwrap_or_else(|| panic!("{} has no default binding", command.as_str()));
+            assert!(
+                seen.insert(shortcut.storage_value()),
+                "{} repeats a default binding",
+                command.as_str()
+            );
+            assert_eq!(CommandId::from_storage_id(command.as_str()), Some(command));
+        }
+
+        assert_eq!(
+            CommandId::ToggleSidebar
+                .default_shortcut()
+                .unwrap()
+                .storage_value(),
+            "Primary+b"
+        );
+    }
 
     #[test]
     fn shortcut_round_trip_and_platform_display_are_stable() {

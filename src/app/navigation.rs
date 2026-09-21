@@ -320,6 +320,7 @@ fn save_binding(state: &mut OpenPodium, unbind: bool) -> Task<Message> {
 pub(super) fn execute_command(state: &mut OpenPodium, command: CommandId) -> Task<Message> {
     match command {
         CommandId::OpenPalette => return update(state, navigation_panel::Message::Open),
+        CommandId::ToggleSidebar => return super::toggle_sidebar(state),
         CommandId::NextWorkspace => return cycle_workspace(state, true),
         CommandId::PreviousWorkspace => return cycle_workspace(state, false),
         CommandId::NextAttention => navigate_attention(state, true),

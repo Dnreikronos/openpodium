@@ -81,6 +81,8 @@ const DATABASE_FILE: &str = "openpodium.sqlite";
 /// 100ms, so transcripts are written about every three seconds while output is
 /// arriving, rather than on every chunk.
 const TRANSCRIPT_FLUSH_TICKS: u32 = 30;
+/// Preference key for whether the workspace rail is showing.
+const SIDEBAR_OPEN_KEY: &str = "sidebar_open";
 
 type TimelineState = (
     BTreeMap<WorkspaceId, Vec<TimelineItem>>,
@@ -122,6 +124,7 @@ struct OpenPodium {
     localizer: Localizer,
     presentation: PresentationPreferences,
     inspector_open: bool,
+    sidebar_open: bool,
     floor_ui: floors::UiState,
     context_ui: context_nodes::UiState,
     portal_ui: portals::UiState,
@@ -250,6 +253,7 @@ impl Default for OpenPodium {
             localizer: Localizer::default(),
             presentation: PresentationPreferences::default(),
             inspector_open: false,
+            sidebar_open: true,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
             portal_ui: portals::UiState::default(),
@@ -494,10 +498,21 @@ fn load_application_preferences(state: &mut OpenPodium) {
             if let Some((_, locale)) = values.iter().find(|(key, _)| key == LOCALE_KEY) {
                 state.localizer = Localizer::new(Locale::from_tag(locale));
             }
+            if let Some((_, open)) = values.iter().find(|(key, _)| key == SIDEBAR_OPEN_KEY) {
+                state.sidebar_open = open != "false";
+            }
             state.presentation.apply_stored(values);
         }
         Err(error) => state.notice = Some(error.to_string()),
     }
+}
+
+/// Shows or hides the workspace rail, remembering the choice for next launch.
+fn toggle_sidebar(state: &mut OpenPodium) -> Task<Message> {
+    state.sidebar_open = !state.sidebar_open;
+    let value = state.sidebar_open.to_string();
+    persist_application_preference(state, SIDEBAR_OPEN_KEY, &value);
+    Task::none()
 }
 
 fn persist_application_preference(state: &mut OpenPodium, key: &str, value: &str) {
@@ -794,6 +809,32 @@ fn create_workspace(state: &mut OpenPodium, directory: &Path) {
     }
 }
 
+/// The control that shows and hides the workspace rail.
+fn sidebar_toggle(state: &OpenPodium) -> Element<'_, Message> {
+    let shortcut = state
+        .command_registry
+        .binding(CommandId::ToggleSidebar)
+        .map_or_else(String::new, |shortcut| {
+            format!(
+                " ({})",
+                shortcut.display(openpodium::navigation::Platform::current())
+            )
+        });
+    labelled(
+        icon_button("◧", 15.0)
+            .style(shell::navigation_button(!state.sidebar_open))
+            .on_press(Message::ExecuteCommand(CommandId::ToggleSidebar)),
+        format!(
+            "{}{shortcut}",
+            state.localizer.text(if state.sidebar_open {
+                "hide-sidebar"
+            } else {
+                "show-sidebar"
+            })
+        ),
+    )
+}
+
 fn view(state: &OpenPodium) -> Element<'_, Message> {
     let active_workspace_id = state
         .workspaces
@@ -833,8 +874,9 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                 "open-project"
             }),
         ),
+        sidebar_toggle(state),
     ]
-    .spacing(10)
+    .spacing(8)
     .align_y(IcedAlignment::Center);
     // Styled as a recessed field rather than a button: it is where you go to
     // type, even though typing happens in the palette it opens.
@@ -1621,18 +1663,25 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         // Neither line may wrap. A wrapped path grows the chip tall, and a
         // capsule radius turns a tall box into a blob. A narrow window clips
         // the path instead, and the workspace name always survives.
+        // With the rail hidden the toggle moves onto the canvas, so the
+        // keyboard is never the only way to bring it back.
+        let mut chip_row = row![].spacing(8).align_y(IcedAlignment::Center);
+        if !state.sidebar_open {
+            chip_row = chip_row.push(sidebar_toggle(state));
+        }
         let workspace_chip = container(
-            row![
-                text(workspace_title)
-                    .size(13)
-                    .wrapping(iced::widget::text::Wrapping::None),
-                text(&state.working_directory)
-                    .size(11)
-                    .style(shell::subtle_text)
-                    .wrapping(iced::widget::text::Wrapping::None),
-            ]
-            .spacing(8)
-            .align_y(IcedAlignment::Center),
+            chip_row
+                .push(
+                    text(workspace_title)
+                        .size(13)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                )
+                .push(
+                    text(&state.working_directory)
+                        .size(11)
+                        .style(shell::subtle_text)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                ),
         )
         .style(shell::floating_chip)
         .padding([7, 13])
@@ -1766,26 +1815,46 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .width(Fill)
             .max_width(620)
             .padding(44);
-        container(empty_card)
+        let empty_stage = container(empty_card)
             .style(shell::canvas)
             .width(Fill)
             .height(Fill)
             .center(Fill)
-            .padding(40)
+            .padding(40);
+        if state.sidebar_open {
+            empty_stage.into()
+        } else {
+            // The first-run view has no canvas chip to carry the toggle, so it
+            // gets its own rather than stranding the rail behind a shortcut.
+            stack![
+                empty_stage,
+                container(sidebar_toggle(state))
+                    .width(Fill)
+                    .height(Fill)
+                    .align_x(IcedAlignment::Start)
+                    .align_y(IcedAlignment::Start)
+                    .padding(14),
+            ]
             .into()
+        }
     };
 
     // A hairline is the only thing separating the rail from the stage; both
     // share the same chrome grey so neither reads as a heavier slab.
-    let application = row![
-        sidebar,
-        container(iced::widget::Space::new().width(1).height(Fill))
-            .style(shell::rule)
-            .width(1)
-            .height(Fill),
+    let application: Element<'_, Message> = if state.sidebar_open {
+        row![
+            sidebar,
+            container(iced::widget::Space::new().width(1).height(Fill))
+                .style(shell::rule)
+                .width(1)
+                .height(Fill),
+            stage,
+        ]
+        .height(Fill)
+        .into()
+    } else {
         stage
-    ]
-    .height(Fill);
+    };
     if state.navigation_ui.open {
         stack![
             application,
@@ -1794,7 +1863,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         ]
         .into()
     } else {
-        application.into()
+        application
     }
 }
 
@@ -5228,6 +5297,7 @@ mod tests {
             .unwrap();
         let mut state = OpenPodium {
             transcript_ticks: 0,
+            sidebar_open: true,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
             inspector_open: false,
@@ -6001,6 +6071,7 @@ mod tests {
     ) -> OpenPodium {
         OpenPodium {
             transcript_ticks: 0,
+            sidebar_open: true,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
             inspector_open: false,
