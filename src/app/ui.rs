@@ -14,7 +14,7 @@ pub(crate) fn button<'a, Message: Clone + 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> iced::widget::Button<'a, Message> {
     iced_button(content)
-        .padding([8, 12])
+        .padding([7, 10])
         .style(shell::secondary_button)
 }
 
@@ -23,7 +23,7 @@ pub(crate) fn text_input<'a, Message: Clone + 'a>(
     value: &str,
 ) -> iced::widget::TextInput<'a, Message> {
     iced_text_input(placeholder, value)
-        .padding([10, 12])
+        .padding([8, 10])
         .style(shell::input)
 }
 
@@ -34,20 +34,6 @@ pub(crate) fn primary_button<'a, Message: Clone + 'a>(
     iced_button(content)
         .padding([9, 16])
         .style(shell::primary_button)
-}
-
-/// A borderless glyph button, sized for the floating canvas pills.
-pub(crate) fn icon_button<'a, Message: Clone + 'a>(
-    glyph: &'a str,
-    size: f32,
-) -> iced::widget::Button<'a, Message> {
-    iced_button(
-        container(text(glyph).size(size))
-            .width(26)
-            .align_x(Alignment::Center),
-    )
-    .padding([6, 4])
-    .style(shell::utility_button)
 }
 
 /// Names an icon-only control on hover, so a bare glyph still says what it
@@ -131,7 +117,7 @@ pub(crate) fn section<'a, Message: 'a>(
             .width(Fill),
     )
     .style(shell::section_card)
-    .padding(14)
+    .padding(12)
     .width(Fill)
     .into()
 }
@@ -143,7 +129,7 @@ pub(crate) fn panel_card<'a, Message: 'a>(
 ) -> Element<'a, Message> {
     container(body.into())
         .style(shell::section_card)
-        .padding(14)
+        .padding(12)
         .width(Fill)
         .into()
 }

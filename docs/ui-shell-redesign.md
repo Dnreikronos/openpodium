@@ -2,6 +2,41 @@
 
 Reference: https://www.themaestri.app/en
 
+## Inspector removal (2026-09-21)
+
+The workspace inspector and its toolbar toggle are removed. The canvas should
+not compete with an agent registry, event log, orchestration dashboard, or
+stack of unrelated configuration forms. Selecting a workspace or node must
+not reopen that dashboard. Workspace order, canvas navigation, and existing
+workspace data remain intact.
+
+Keep note editing and terminal actions contextual to the selected node. Open
+workspace settings from the workspace location menu, with less common tools
+behind a separate menu entry. These focused dialogs never reduce canvas width.
+
+## Demo alignment (2026-09-21)
+
+Visual reference: https://cdn.maestri.dev/assets/demo.mp4
+
+Match the demo's visual style and layout across the application while keeping
+the existing workflows. Use a 212-pixel workspace rail, compact neutral search
+and selection rows, and a canvas with a small outer inset. Keep workspace rows
+in creation order when selection changes. Replace the text-heavy canvas tool
+strip with consistent line icons and hover labels; every action must continue
+to dispatch its existing command. Move the workspace path into a compact
+bottom-left location label so it does not compete with the creation tools.
+
+Use cool near-white surfaces, restrained shadows, small corner radii, and
+lighter dialog sections. Reduce the visual weight of the canvas grid and
+node headers, with a compact colored kind marker and the existing dashed blue
+selection outline. Keep terminal sizing and pointer coordinates tied to the
+same header-height constant. Preserve high-contrast colors and display
+preferences, and verify the shell at narrow and standard window widths.
+
+Implementation passes: shell and controls first, then canvas and node styling.
+Run formatting, compilation, Clippy, and targeted canvas, terminal, navigation,
+and presentation checks. Inspect the rendered application before handing off.
+
 ## Direction
 
 OpenPodium is a canvas application. The canvas or empty-state invitation must
@@ -9,7 +44,7 @@ own the window, while navigation and configuration stay visually secondary.
 The reference is used for hierarchy and restraint, not copied branding or
 assets.
 
-The default shell uses a warm near-white canvas, dark text, hairline borders,
+The default shell uses a cool near-white canvas, dark text, hairline borders,
 soft neutral cards, one blue action color, and rounded surfaces. Dense dark
 panels and browser-like stacks of full-width default buttons are out of scope
 for the primary view.
@@ -22,12 +57,12 @@ for the primary view.
 - Move workspace creation into the main empty state. The first-run view has one
   headline, one sentence, and one clear action that opens the operating
   system's native folder picker.
-- With a workspace open, let the canvas take most of the window. Put detailed
-  workspace controls in a right inspector with section cards and scrolling.
+- With a workspace open, let the canvas take most of the window. Open detailed
+  workspace controls in focused dialogs from the workspace menu.
 - Float the canvas controls over the board rather than stacking them above it,
-  so no control steals height from the work surface. Four clusters: the
-  workspace name and path top left, node and agent creation top center, the
-  inspector toggle top right, and zoom bottom right. Each is a rounded pill on
+  so no control steals height from the work surface. Three persistent clusters: the
+  workspace location bottom left, node and agent creation top center, the
+  zoom bottom right. Selected-node actions appear above the footer. Each is a rounded pill on
   the canvas sheet. A pill only captures the pointer where a control sits, so
   panning and zooming still work across the rest of the board.
 - Keep zoom out, current zoom/reset, and zoom in controls visible in the canvas
@@ -43,7 +78,7 @@ for the primary view.
 
 Surfaces, controls, and layout helpers live in `src/app/shell.rs` and
 `src/app/ui.rs`. Panels build from those instead of restating styling, so the
-canvas renderer, the inspector, and the palette stay in step.
+canvas renderer, dialogs, and the palette stay in step.
 
 - Three greys carry the whole light theme: chrome behind the rail and the
   canvas backdrop, white for raised surfaces, and one recessed neutral for
@@ -56,7 +91,7 @@ canvas renderer, the inspector, and the palette stay in step.
   with more space above than below.
 - Related controls group into titled section cards. Clusters of equal-weight
   actions lay out in a grid that reflows to the panel width, so a narrow
-  inspector never clips a button.
+  dialog never clips a button.
 - Lists select by highlighting the row, not by prefixing a check mark, and a
   row's own actions unfold only while it is selected.
 - Mutually exclusive choices use a segmented picker rather than several
@@ -71,8 +106,8 @@ canvas renderer, the inspector, and the palette stay in step.
 
 ## Canvas nodes
 
-- A node is a white card with a hairline border, a light header band closed by
-  a hairline, and a narrow accent bar naming its kind. The accent is not the
+- A node is a white card with a hairline border, a compact header band closed by
+  a hairline, and a small colored marker naming its kind. The accent is not the
   border, so an unselected board reads as one material.
 - Selection is a dashed accent outline plus a small rounded grip in the corner,
   which reads as a marquee rather than a permanently heavier border.
@@ -80,6 +115,12 @@ canvas renderer, the inspector, and the palette stay in step.
   center-to-center line passes under the nodes it joins; a curve does not.
 - The grid is orientation, not decoration: visible up close, never competing
   with the nodes drawn over it.
+- Notes use a soft yellow surface in the default theme. Terminal defaults use
+  a white background and dark foreground, with ANSI colors chosen for that
+  background. Explicit application RGB colors remain intact, and background
+  queries report the light default so terminal programs can adapt their themes.
+- Changing contrast invalidates the cached canvas geometry immediately, so
+  node surfaces and labels update together with the surrounding controls.
 
 ## Acceptance
 
@@ -97,4 +138,6 @@ canvas renderer, the inspector, and the palette stay in step.
   modifier key.
 - Panning and zooming keep working over the canvas everywhere a floating pill
   is not directly under the pointer.
-- Every panel in the inspector fits its width without clipping a control.
+- There is no Inspector button, agent registry, or activity-log dashboard.
+- Note editing, terminal controls, and workspace settings remain reachable
+  without a permanent side panel or changes to the canvas viewport.

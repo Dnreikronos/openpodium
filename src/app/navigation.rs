@@ -110,6 +110,7 @@ pub(super) fn tick(state: &mut OpenPodium) -> Task<Message> {
 pub(super) fn update(state: &mut OpenPodium, message: navigation_panel::Message) -> Task<Message> {
     match message {
         navigation_panel::Message::Open => {
+            state.controls = None;
             state.navigation_ui.open = true;
             state.navigation_ui.selected = 0;
             return Task::batch([
@@ -209,6 +210,22 @@ pub(super) fn handle_key(
     shortcut: Option<Shortcut>,
     status: Status,
 ) -> Task<Message> {
+    if state.controls.is_some() {
+        return match navigation_key {
+            NavigationKey::Escape => {
+                state.controls = None;
+                Task::none()
+            }
+            NavigationKey::Tab { reverse } if status == Status::Ignored => {
+                if reverse {
+                    iced::widget::operation::focus_previous()
+                } else {
+                    iced::widget::operation::focus_next()
+                }
+            }
+            _ => Task::none(),
+        };
+    }
     if state.navigation_ui.open {
         return match navigation_key {
             NavigationKey::Up => update(state, navigation_panel::Message::MoveSelection(false)),

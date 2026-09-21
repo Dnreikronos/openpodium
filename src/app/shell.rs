@@ -6,8 +6,8 @@ use iced::theme::palette;
 use iced::widget::{button, container, text, text_input};
 use iced::{Background, Border, Color, Shadow, Theme, Vector, theme};
 
-pub const SIDEBAR_WIDTH: f32 = 248.0;
-pub const INSPECTOR_WIDTH: f32 = 360.0;
+pub const SIDEBAR_WIDTH: f32 = 212.0;
+pub const STAGE_PADDING: f32 = 4.0;
 
 /// Radius large enough to render any control height as a capsule.
 const CAPSULE: f32 = 999.0;
@@ -16,8 +16,8 @@ pub fn theme() -> Theme {
     Theme::custom(
         "OpenPodium",
         theme::Palette {
-            background: Color::from_rgb8(244, 244, 245),
-            text: Color::from_rgb8(24, 24, 27),
+            background: Color::from_rgb8(248, 249, 250),
+            text: Color::from_rgb8(39, 42, 47),
             primary: Color::from_rgb8(10, 132, 255),
             success: Color::from_rgb8(22, 163, 74),
             warning: Color::from_rgb8(217, 119, 6),
@@ -40,7 +40,7 @@ pub(crate) fn hairline_color(palette: &palette::Extended) -> Color {
     if palette.is_dark {
         palette.background.base.text.scale_alpha(0.7)
     } else {
-        palette.background.strong.color.scale_alpha(0.42)
+        Color::from_rgb8(222, 225, 229)
     }
 }
 
@@ -66,7 +66,7 @@ pub(crate) fn sunken_color(palette: &palette::Extended) -> Color {
     if palette.is_dark {
         palette.background.weak.color
     } else {
-        Color::from_rgb8(234, 234, 231)
+        Color::from_rgb8(237, 239, 241)
     }
 }
 
@@ -78,7 +78,7 @@ fn selected_fill(theme: &Theme) -> Color {
     if palette.is_dark {
         palette.background.strong.color
     } else {
-        Color::from_rgb8(226, 226, 221)
+        Color::from_rgb8(223, 226, 230)
     }
 }
 
@@ -93,7 +93,7 @@ pub(crate) fn chrome_color(palette: &palette::Extended) -> Color {
     if palette.is_dark {
         palette.background.base.color
     } else {
-        Color::from_rgb8(242, 242, 240)
+        Color::from_rgb8(248, 249, 250)
     }
 }
 
@@ -102,8 +102,8 @@ fn soft_shadow(theme: &Theme, blur: f32) -> Shadow {
         Shadow::default()
     } else {
         Shadow {
-            color: Color::BLACK.scale_alpha(0.10),
-            offset: Vector::new(0.0, blur * 0.25),
+            color: Color::BLACK.scale_alpha(0.06),
+            offset: Vector::new(0.0, blur * 0.15),
             blur_radius: blur,
         }
     }
@@ -137,8 +137,12 @@ pub fn canvas_surface(theme: &Theme) -> container::Style {
         background: Some(surface(theme).into()),
         text_color: Some(theme.extended_palette().background.base.text),
         border: Border {
-            width: 1.0,
-            radius: 14.0.into(),
+            width: if theme.extended_palette().is_dark {
+                1.0
+            } else {
+                0.0
+            },
+            radius: 8.0.into(),
             color: hairline(theme),
         },
         shadow: Shadow::default(),
@@ -154,9 +158,13 @@ pub fn floating_pill(theme: &Theme) -> container::Style {
         border: Border {
             width: 1.0,
             radius: CAPSULE.into(),
-            color: hairline(theme),
+            color: hairline(theme).scale_alpha(if theme.extended_palette().is_dark {
+                1.0
+            } else {
+                0.55
+            }),
         },
-        shadow: soft_shadow(theme, 20.0),
+        shadow: soft_shadow(theme, 12.0),
         ..container::Style::default()
     }
 }
@@ -168,7 +176,7 @@ pub fn floating_chip(theme: &Theme) -> container::Style {
             radius: CAPSULE.into(),
             ..floating_pill(theme).border
         },
-        shadow: soft_shadow(theme, 14.0),
+        shadow: Shadow::default(),
         ..floating_pill(theme)
     }
 }
@@ -188,13 +196,13 @@ pub fn segment_track(theme: &Theme) -> container::Style {
     }
 }
 
-pub fn inspector(theme: &Theme) -> container::Style {
+fn dialog_surface(theme: &Theme) -> container::Style {
     container::Style {
         background: Some(surface(theme).into()),
         text_color: Some(theme.extended_palette().background.base.text),
         border: Border {
             width: 1.0,
-            radius: 14.0.into(),
+            radius: 10.0.into(),
             color: hairline(theme),
         },
         shadow: Shadow::default(),
@@ -202,7 +210,7 @@ pub fn inspector(theme: &Theme) -> container::Style {
     }
 }
 
-/// A grouped block of related controls inside the inspector.
+/// A grouped block of related controls inside a dialog.
 pub fn section_card(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {
@@ -210,14 +218,14 @@ pub fn section_card(theme: &Theme) -> container::Style {
             if palette.is_dark {
                 palette.background.base.color
             } else {
-                Color::from_rgb8(252, 252, 251)
+                Color::from_rgb8(250, 251, 252)
             }
             .into(),
         ),
         text_color: Some(palette.background.base.text),
         border: Border {
             width: 1.0,
-            radius: 12.0.into(),
+            radius: 8.0.into(),
             color: hairline(theme),
         },
         shadow: Shadow::default(),
@@ -228,7 +236,7 @@ pub fn section_card(theme: &Theme) -> container::Style {
 pub fn card(theme: &Theme) -> container::Style {
     container::Style {
         shadow: soft_shadow(theme, 28.0),
-        ..inspector(theme)
+        ..dialog_surface(theme)
     }
 }
 
@@ -267,17 +275,13 @@ pub fn attention_badge(theme: &Theme) -> container::Style {
 pub fn app_mark(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {
-        background: Some(palette.primary.base.color.into()),
-        text_color: Some(palette.primary.base.text),
+        background: Some(sunken(theme).into()),
+        text_color: Some(palette.primary.base.color),
         border: Border {
-            radius: 12.0.into(),
+            radius: 8.0.into(),
             ..Border::default()
         },
-        shadow: Shadow {
-            color: palette.primary.base.color.scale_alpha(0.28),
-            offset: Vector::new(0.0, 5.0),
-            blur_radius: 14.0,
-        },
+        shadow: Shadow::default(),
         ..container::Style::default()
     }
 }
@@ -318,7 +322,7 @@ pub fn secondary_button(theme: &Theme, status: button::Status) -> button::Style 
         text_color: palette.background.base.text,
         border: Border {
             width: 1.0,
-            radius: CAPSULE.into(),
+            radius: 8.0.into(),
             color: hairline(theme),
         },
         shadow: Shadow::default(),
@@ -472,7 +476,7 @@ pub fn field(theme: &Theme) -> container::Style {
         text_color: Some(palette.background.base.text),
         border: Border {
             width: if palette.is_dark { 1.0 } else { 0.0 },
-            radius: CAPSULE.into(),
+            radius: 8.0.into(),
             color: hairline(theme),
         },
         ..container::Style::default()
