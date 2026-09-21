@@ -810,6 +810,8 @@ fn validate_text(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn credentials() -> Credentials {
@@ -972,5 +974,14 @@ mod tests {
         );
         assert!(failure.result.is_none());
         assert!(failure.error.is_some());
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_protocol_input_never_bypasses_typed_validation(bytes in prop::collection::vec(any::<u8>(), 0..16_384)) {
+            if let Ok(request) = serde_json::from_slice::<ProtocolRequest>(&bytes) {
+                let _ = request.command.validate();
+            }
+        }
     }
 }

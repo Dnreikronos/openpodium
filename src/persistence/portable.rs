@@ -2206,6 +2206,8 @@ impl Error for PortableError {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
     use crate::domain::{
         CanvasPoint, CanvasSize, DomainCommand, Floor, FloorLifecycle, Floors, TaskState,
@@ -2665,5 +2667,13 @@ mod tests {
         assert_eq!(imported.nodes()[1].id(), NodeId::new(2));
         assert_eq!(imported.connections()[0].source(), NodeId::new(1));
         assert_eq!(imported.connections()[0].target(), NodeId::new(2));
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_portable_documents_are_rejected_or_fully_validated(input in any::<String>()) {
+            let _ = decode_template(&input);
+            let _ = decode_workspace_archive(&input);
+        }
     }
 }
