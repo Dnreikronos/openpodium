@@ -20,7 +20,8 @@ for the primary view.
 - Keep the workspace rail narrow and calm: brand, command search, workspace
   list, then a small footer for display preferences.
 - Move workspace creation into the main empty state. The first-run view has one
-  headline, one sentence, one path field, and one clear primary action.
+  headline, one sentence, and one clear action that opens the operating
+  system's native folder picker.
 - With a workspace open, let the canvas take most of the window. Put detailed
   workspace controls in a right inspector with section cards and scrolling.
 - Show status as compact text or badges rather than a large block of controls.
@@ -31,7 +32,8 @@ for the primary view.
   neutral fills or hairline borders.
 - Section labels are small and muted. Headings use stronger size and weight,
   with more space above than below.
-- Inputs use light filled surfaces, subtle borders, and consistent height.
+- Project selection uses the native folder picker instead of exposing a raw
+  filesystem-path input.
 - Accessibility preferences remain reachable but become compact footer
   controls instead of dominating the sidebar.
 - High-contrast mode remains a separate black, white, cyan, yellow, green, and
@@ -39,7 +41,8 @@ for the primary view.
 
 ## Acceptance
 
-- At startup, workspace creation is the clear focal point.
+- At startup, opening a project is the clear focal point and never requires
+  manually entering a path.
 - The sidebar no longer competes with the canvas or empty state.
 - Primary and secondary actions are distinguishable without reading every
   label.
