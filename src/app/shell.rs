@@ -1,16 +1,24 @@
+//! The OpenPodium design system: the surfaces, controls, and layout helpers
+//! every panel is built from, so the whole application reads as one product
+//! rather than a pile of default widgets.
+
+use iced::theme::palette;
 use iced::widget::{button, container, text, text_input};
 use iced::{Background, Border, Color, Shadow, Theme, Vector, theme};
 
 pub const SIDEBAR_WIDTH: f32 = 248.0;
 pub const INSPECTOR_WIDTH: f32 = 360.0;
 
+/// Radius large enough to render any control height as a capsule.
+const CAPSULE: f32 = 999.0;
+
 pub fn theme() -> Theme {
     Theme::custom(
         "OpenPodium",
         theme::Palette {
-            background: Color::from_rgb8(246, 247, 249),
-            text: Color::from_rgb8(29, 29, 31),
-            primary: Color::from_rgb8(37, 99, 235),
+            background: Color::from_rgb8(244, 244, 245),
+            text: Color::from_rgb8(24, 24, 27),
+            primary: Color::from_rgb8(10, 132, 255),
             success: Color::from_rgb8(22, 163, 74),
             warning: Color::from_rgb8(217, 119, 6),
             danger: Color::from_rgb8(220, 38, 38),
@@ -18,82 +26,230 @@ pub fn theme() -> Theme {
     )
 }
 
+/// Border color for the hairline rules that separate calm surfaces.
+///
+/// High contrast themes replace the near-invisible neutral with the text color
+/// so that every surface edge stays perceivable.
+fn hairline(theme: &Theme) -> Color {
+    hairline_color(theme.extended_palette())
+}
+
+/// The palette-level form, for the canvas renderer which draws from a palette
+/// rather than a theme.
+pub(crate) fn hairline_color(palette: &palette::Extended) -> Color {
+    if palette.is_dark {
+        palette.background.base.text.scale_alpha(0.7)
+    } else {
+        palette.background.strong.color.scale_alpha(0.42)
+    }
+}
+
+/// The raised surface used by cards, pills, and panels.
+fn surface(theme: &Theme) -> Color {
+    surface_color(theme.extended_palette())
+}
+
+pub(crate) fn surface_color(palette: &palette::Extended) -> Color {
+    if palette.is_dark {
+        palette.background.base.color
+    } else {
+        Color::WHITE
+    }
+}
+
+/// The recessed neutral for tracks, badges, key caps, and hover fills.
+fn sunken(theme: &Theme) -> Color {
+    sunken_color(theme.extended_palette())
+}
+
+pub(crate) fn sunken_color(palette: &palette::Extended) -> Color {
+    if palette.is_dark {
+        palette.background.weak.color
+    } else {
+        Color::from_rgb8(234, 234, 231)
+    }
+}
+
+/// The quiet grey the window chrome is built from: the workspace rail and the
+/// backdrop the canvas sheet floats on. Iced's derived `weak` neutral is too
+/// saturated to sit behind a whole window, so the light value is explicit.
+fn chrome(theme: &Theme) -> Color {
+    chrome_color(theme.extended_palette())
+}
+
+pub(crate) fn chrome_color(palette: &palette::Extended) -> Color {
+    if palette.is_dark {
+        palette.background.base.color
+    } else {
+        Color::from_rgb8(242, 242, 240)
+    }
+}
+
+fn soft_shadow(theme: &Theme, blur: f32) -> Shadow {
+    if theme.extended_palette().is_dark {
+        Shadow::default()
+    } else {
+        Shadow {
+            color: Color::BLACK.scale_alpha(0.10),
+            offset: Vector::new(0.0, blur * 0.25),
+            blur_radius: blur,
+        }
+    }
+}
+
 pub fn sidebar(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {
-        background: Some(palette.background.weakest.color.into()),
+        background: Some(chrome(theme).into()),
         text_color: Some(palette.background.base.text),
         border: Border {
             width: 0.0,
             radius: 0.0.into(),
-            color: palette.background.weak.color,
+            color: hairline(theme),
         },
         shadow: Shadow::default(),
         ..container::Style::default()
     }
 }
 
+/// Backdrop behind the canvas and its floating controls.
 pub fn canvas(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
     container::Style::default()
-        .background(palette.background.base.color)
-        .color(palette.background.base.text)
+        .background(chrome(theme))
+        .color(theme.extended_palette().background.base.text)
 }
 
-pub fn toolbar(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
+/// The canvas sheet itself: a calm surface the floating pills sit on top of.
+pub fn canvas_surface(theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(palette.background.weakest.color.into()),
-        text_color: Some(palette.background.base.text),
+        background: Some(surface(theme).into()),
+        text_color: Some(theme.extended_palette().background.base.text),
         border: Border {
             width: 1.0,
             radius: 14.0.into(),
-            color: palette.background.weak.color,
+            color: hairline(theme),
         },
-        shadow: Shadow {
-            color: Color::BLACK.scale_alpha(0.06),
-            offset: Vector::new(0.0, 4.0),
-            blur_radius: 18.0,
-        },
+        shadow: Shadow::default(),
         ..container::Style::default()
     }
 }
 
-pub fn control_group(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
+/// A control cluster that floats over the canvas.
+pub fn floating_pill(theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(palette.background.weakest.color.into()),
-        text_color: Some(palette.background.base.text),
+        background: Some(surface(theme).into()),
+        text_color: Some(theme.extended_palette().background.base.text),
         border: Border {
             width: 1.0,
-            radius: 10.0.into(),
-            color: palette.background.weak.color,
+            radius: CAPSULE.into(),
+            color: hairline(theme),
+        },
+        shadow: soft_shadow(theme, 20.0),
+        ..container::Style::default()
+    }
+}
+
+/// A floating label, such as the workspace name over the canvas.
+pub fn floating_chip(theme: &Theme) -> container::Style {
+    container::Style {
+        border: Border {
+            radius: CAPSULE.into(),
+            ..floating_pill(theme).border
+        },
+        shadow: soft_shadow(theme, 14.0),
+        ..floating_pill(theme)
+    }
+}
+
+/// The recessed track behind a segmented control.
+pub fn segment_track(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(sunken(theme).into()),
+        text_color: Some(palette.background.base.text),
+        border: Border {
+            width: if palette.is_dark { 1.0 } else { 0.0 },
+            radius: 11.0.into(),
+            color: hairline(theme),
         },
         ..container::Style::default()
     }
 }
 
 pub fn inspector(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(surface(theme).into()),
+        text_color: Some(theme.extended_palette().background.base.text),
+        border: Border {
+            width: 1.0,
+            radius: 14.0.into(),
+            color: hairline(theme),
+        },
+        shadow: Shadow::default(),
+        ..container::Style::default()
+    }
+}
+
+/// A grouped block of related controls inside the inspector.
+pub fn section_card(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {
-        background: Some(palette.background.weakest.color.into()),
+        background: Some(
+            if palette.is_dark {
+                palette.background.base.color
+            } else {
+                Color::from_rgb8(252, 252, 251)
+            }
+            .into(),
+        ),
         text_color: Some(palette.background.base.text),
         border: Border {
             width: 1.0,
-            radius: 16.0.into(),
-            color: palette.background.weak.color,
+            radius: 12.0.into(),
+            color: hairline(theme),
         },
-        shadow: Shadow {
-            color: Color::BLACK.scale_alpha(0.08),
-            offset: Vector::new(0.0, 4.0),
-            blur_radius: 24.0,
-        },
+        shadow: Shadow::default(),
         ..container::Style::default()
     }
 }
 
 pub fn card(theme: &Theme) -> container::Style {
-    inspector(theme)
+    container::Style {
+        shadow: soft_shadow(theme, 28.0),
+        ..inspector(theme)
+    }
+}
+
+/// A one pixel rule. Render inside a container with a fixed height of 1.
+pub fn rule(theme: &Theme) -> container::Style {
+    container::Style::default().background(hairline(theme))
+}
+
+pub fn badge(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(sunken(theme).into()),
+        text_color: Some(palette.background.base.text.scale_alpha(0.62)),
+        border: Border {
+            radius: CAPSULE.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+/// A counter that must pull the eye, such as unread agent attention.
+pub fn attention_badge(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(palette.danger.base.color.into()),
+        text_color: Some(palette.danger.base.text),
+        border: Border {
+            radius: CAPSULE.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
 }
 
 pub fn app_mark(theme: &Theme) -> container::Style {
@@ -102,13 +258,13 @@ pub fn app_mark(theme: &Theme) -> container::Style {
         background: Some(palette.primary.base.color.into()),
         text_color: Some(palette.primary.base.text),
         border: Border {
-            radius: 14.0.into(),
+            radius: 12.0.into(),
             ..Border::default()
         },
         shadow: Shadow {
-            color: palette.primary.base.color.scale_alpha(0.22),
-            offset: Vector::new(0.0, 6.0),
-            blur_radius: 18.0,
+            color: palette.primary.base.color.scale_alpha(0.28),
+            offset: Vector::new(0.0, 5.0),
+            blur_radius: 14.0,
         },
         ..container::Style::default()
     }
@@ -117,15 +273,14 @@ pub fn app_mark(theme: &Theme) -> container::Style {
 pub fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
     let palette = theme.extended_palette();
     let background = match status {
-        button::Status::Hovered => palette.primary.strong.color,
-        button::Status::Pressed => palette.primary.strong.color,
+        button::Status::Hovered | button::Status::Pressed => palette.primary.strong.color,
         button::Status::Active | button::Status::Disabled => palette.primary.base.color,
     };
     let mut style = button::Style {
         background: Some(background.into()),
         text_color: palette.primary.base.text,
         border: Border {
-            radius: 10.0.into(),
+            radius: CAPSULE.into(),
             ..Border::default()
         },
         shadow: Shadow::default(),
@@ -143,16 +298,16 @@ pub fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
 pub fn secondary_button(theme: &Theme, status: button::Status) -> button::Style {
     let palette = theme.extended_palette();
     let background = match status {
-        button::Status::Hovered | button::Status::Pressed => palette.background.weak.color,
-        button::Status::Active | button::Status::Disabled => palette.background.weakest.color,
+        button::Status::Hovered | button::Status::Pressed => sunken(theme),
+        button::Status::Active | button::Status::Disabled => surface(theme),
     };
     let mut style = button::Style {
         background: Some(background.into()),
         text_color: palette.background.base.text,
         border: Border {
             width: 1.0,
-            radius: 9.0.into(),
-            color: palette.background.weak.color,
+            radius: CAPSULE.into(),
+            color: hairline(theme),
         },
         shadow: Shadow::default(),
         ..button::Style::default()
@@ -163,17 +318,30 @@ pub fn secondary_button(theme: &Theme, status: button::Status) -> button::Style 
     style
 }
 
+/// A destructive action. Quiet until hovered, then unmistakably red.
+pub fn danger_button(theme: &Theme, status: button::Status) -> button::Style {
+    let palette = theme.extended_palette();
+    let mut style = secondary_button(theme, status);
+    style.text_color = palette.danger.base.color;
+    if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        style.background = Some(palette.danger.base.color.into());
+        style.text_color = palette.danger.base.text;
+        style.border.color = palette.danger.base.color;
+    }
+    style
+}
+
 pub fn utility_button(theme: &Theme, status: button::Status) -> button::Style {
     let palette = theme.extended_palette();
     let background = match status {
-        button::Status::Hovered | button::Status::Pressed => palette.background.weak.color,
+        button::Status::Hovered | button::Status::Pressed => sunken(theme),
         button::Status::Active | button::Status::Disabled => Color::TRANSPARENT,
     };
     button::Style {
         background: Some(background.into()),
         text_color: palette.background.base.text.scale_alpha(0.72),
         border: Border {
-            radius: 8.0.into(),
+            radius: CAPSULE.into(),
             ..Border::default()
         },
         shadow: Shadow::default(),
@@ -181,13 +349,53 @@ pub fn utility_button(theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// One segment of a segmented control. The selected segment rides as a raised
+/// capsule on the recessed track, the way native tab pickers read.
+pub fn segment_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let palette = theme.extended_palette();
+        if selected {
+            return button::Style {
+                background: Some(palette.primary.base.color.into()),
+                text_color: palette.primary.base.text,
+                border: Border {
+                    radius: 9.0.into(),
+                    ..Border::default()
+                },
+                shadow: Shadow::default(),
+                ..button::Style::default()
+            };
+        }
+        let background = match status {
+            button::Status::Hovered | button::Status::Pressed => surface(theme).scale_alpha(0.75),
+            button::Status::Active | button::Status::Disabled => Color::TRANSPARENT,
+        };
+        button::Style {
+            background: Some(background.into()),
+            text_color: palette.background.base.text.scale_alpha(0.68),
+            border: Border {
+                radius: 9.0.into(),
+                ..Border::default()
+            },
+            shadow: Shadow::default(),
+            ..button::Style::default()
+        }
+    }
+}
+
 pub fn navigation_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let palette = theme.extended_palette();
         let mut style = utility_button(theme, status);
+        style.border.radius = 9.0.into();
+        style.text_color = palette.background.base.text;
         if selected {
-            style.background = Some(palette.primary.weak.color.into());
-            style.text_color = palette.primary.weak.text;
+            style.background = Some(surface(theme).into());
+            style.border = Border {
+                width: 1.0,
+                radius: 9.0.into(),
+                color: hairline(theme),
+            };
         }
         style
     }
@@ -197,14 +405,14 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let palette = theme.extended_palette();
     let focused = matches!(status, text_input::Status::Focused { .. });
     text_input::Style {
-        background: palette.background.weakest.color.into(),
+        background: surface(theme).into(),
         border: Border {
             width: if focused { 2.0 } else { 1.0 },
-            radius: 10.0.into(),
+            radius: 9.0.into(),
             color: if focused {
                 palette.primary.base.color
             } else {
-                palette.background.weak.color
+                hairline(theme)
             },
         },
         icon: palette.background.base.text.scale_alpha(0.55),
@@ -214,16 +422,66 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     }
 }
 
-pub fn muted_text(theme: &Theme) -> text::Style {
+/// A borderless field for a search surface that is already a card.
+pub fn search_input(theme: &Theme, _status: text_input::Status) -> text_input::Style {
     let palette = theme.extended_palette();
+    text_input::Style {
+        background: Color::TRANSPARENT.into(),
+        border: Border::default(),
+        icon: palette.background.base.text.scale_alpha(0.55),
+        placeholder: palette.background.base.text.scale_alpha(0.42),
+        value: palette.background.base.text,
+        selection: palette.primary.weak.color,
+    }
+}
+
+/// Dims whatever sits behind a modal surface.
+pub fn scrim(_theme: &Theme) -> container::Style {
+    container::Style::default().background(Color::BLACK.scale_alpha(0.28))
+}
+
+/// A keyboard shortcut rendered as a key cap.
+pub fn key_cap(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(sunken(theme).into()),
+        text_color: Some(palette.background.base.text.scale_alpha(0.7)),
+        border: Border {
+            width: 1.0,
+            radius: 5.0.into(),
+            color: hairline(theme),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Secondary text. High contrast themes barely fade it, because there the
+/// whole point of the palette is that nothing recedes out of legibility.
+pub(crate) fn muted_color(palette: &palette::Extended) -> Color {
+    palette
+        .background
+        .base
+        .text
+        .scale_alpha(if palette.is_dark { 0.9 } else { 0.72 })
+}
+
+/// Tertiary text: paths, hints, and other detail read after the label.
+pub(crate) fn subtle_color(palette: &palette::Extended) -> Color {
+    palette
+        .background
+        .base
+        .text
+        .scale_alpha(if palette.is_dark { 0.85 } else { 0.68 })
+}
+
+pub fn muted_text(theme: &Theme) -> text::Style {
     text::Style {
-        color: Some(palette.background.base.text.scale_alpha(0.72)),
+        color: Some(muted_color(theme.extended_palette())),
     }
 }
 
 pub fn subtle_text(theme: &Theme) -> text::Style {
-    let palette = theme.extended_palette();
     text::Style {
-        color: Some(palette.background.base.text.scale_alpha(0.68)),
+        color: Some(subtle_color(theme.extended_palette())),
     }
 }
