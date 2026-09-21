@@ -27,7 +27,9 @@ The first release will provide:
 - Git worktree isolation and collision warnings.
 - A durable orchestration timeline with recovery after restart.
 
-See the [product specification](docs/product-spec.md) and [architecture](docs/architecture.md) for the working contract.
+See the [product specification](docs/product-spec.md),
+[architecture](docs/architecture.md), and
+[third-party plugin SDK](docs/plugins.md) for the working contracts.
 
 ## Development
 
