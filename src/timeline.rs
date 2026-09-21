@@ -3,9 +3,9 @@
 use std::collections::BTreeSet;
 
 use crate::domain::{
-    AgentId, DeliveryOutcome, DomainEvent, Handoff, HandoffPayload, HandoffResponseStatus,
-    HandoffTermination, NodeId, NodeTarget, Task, TaskId, TaskState, TimelineEvent,
-    TimelineEventId, Timestamp, Workspace, WorkspaceId,
+    AgentId, AgentState, DeliveryOutcome, DomainEvent, Handoff, HandoffPayload,
+    HandoffResponseStatus, HandoffTermination, NodeId, NodeTarget, Task, TaskId, TaskState,
+    TimelineEvent, TimelineEventId, Timestamp, Workspace, WorkspaceId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +79,7 @@ impl TaskSummary {
 pub struct TimelineItem {
     event_id: TimelineEventId,
     occurred_at: Timestamp,
+    agent_id: Option<AgentId>,
     task_id: Option<TaskId>,
     title: String,
     detail: String,
@@ -92,6 +93,10 @@ impl TimelineItem {
 
     pub const fn occurred_at(&self) -> Timestamp {
         self.occurred_at
+    }
+
+    pub const fn agent_id(&self) -> Option<AgentId> {
+        self.agent_id
     }
 
     pub const fn task_id(&self) -> Option<TaskId> {
@@ -410,7 +415,19 @@ fn project_event(workspace: &Workspace, event: &TimelineEvent) -> TimelineItem {
             format!("Run {run_id} step {step_id}: {}", task.title()),
         ),
     };
+    let agent_id = match event.event() {
+        DomainEvent::AgentStateChanged { agent_id, .. } => Some(*agent_id),
+        _ => None,
+    };
     let attention = match event.event() {
+        DomainEvent::AgentStateChanged {
+            to: AgentState::Failed,
+            ..
+        } => AttentionLevel::Urgent,
+        DomainEvent::AgentStateChanged {
+            to: AgentState::Completed,
+            ..
+        } => AttentionLevel::Informational,
         DomainEvent::TaskStateChanged {
             to: TaskState::Blocked | TaskState::Failed,
             ..
@@ -435,6 +452,7 @@ fn project_event(workspace: &Workspace, event: &TimelineEvent) -> TimelineItem {
     TimelineItem {
         event_id: event.id(),
         occurred_at: event.occurred_at(),
+        agent_id,
         task_id,
         title,
         detail,
