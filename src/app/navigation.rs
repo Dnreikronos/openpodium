@@ -360,7 +360,7 @@ fn cycle_workspace(state: &OpenPodium, forward: bool) -> Task<Message> {
         return Task::none();
     };
     let ids = workspaces
-        .recent_workspaces()
+        .ordered_workspaces()
         .map(|workspace| workspace.id())
         .collect::<Vec<_>>();
     let Some(next) = cycle(&ids, workspaces.active_workspace_id(), forward) else {

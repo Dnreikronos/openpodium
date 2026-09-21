@@ -906,7 +906,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .spacing(2)
         .width(Fill);
     if let Some(workspaces) = &state.workspaces {
-        for workspace in workspaces.recent_workspaces() {
+        for workspace in workspaces.ordered_workspaces() {
             let icon = workspace.settings().icon().map_or("", |icon| icon.as_str());
             let glyph = if icon.is_empty() { "▢" } else { icon };
             let attention = timeline::attention_counts(workspace).total();

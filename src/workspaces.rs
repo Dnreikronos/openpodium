@@ -338,6 +338,11 @@ impl WorkspaceManager {
             .map_err(WorkspaceError::from)
     }
 
+    /// Workspaces in creation order, independent of selection and recency.
+    pub fn ordered_workspaces(&self) -> impl Iterator<Item = &Workspace> {
+        self.workspaces.values()
+    }
+
     pub fn recent_workspaces(&self) -> impl Iterator<Item = &Workspace> {
         self.recent
             .iter()
