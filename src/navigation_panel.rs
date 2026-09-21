@@ -8,6 +8,8 @@ use openpodium::navigation::{
     CommandId, CommandRegistry, Platform, SearchDocument, SearchIndex, SearchResult, Shortcut,
 };
 
+use crate::app::shell;
+
 const MAX_RESULTS: usize = 30;
 pub const INPUT_ID: &str = "navigation-palette-input";
 
@@ -124,49 +126,91 @@ pub fn shortcut_from_key(key: &Key, modifiers: Modifiers) -> Option<Shortcut> {
     .ok()
 }
 
+fn key_cap<'a>(label: impl text::IntoFragment<'a>) -> Element<'a, Message> {
+    container(text(label).size(11))
+        .style(shell::key_cap)
+        .padding([2, 6])
+        .into()
+}
+
 pub fn view<'a>(state: &'a UiState, commands: &'a CommandRegistry) -> Element<'a, Message> {
     let current_items = items(state, commands);
-    let mut results = column![].spacing(4);
+    let mut results = column![].spacing(2);
     if current_items.is_empty() {
-        results = results.push(text(if state.query.is_empty() {
-            "Type to search, or enter > to discover commands"
-        } else {
-            "No matching results"
-        }));
+        results = results.push(
+            container(
+                text(if state.query.is_empty() {
+                    "Type to search, or enter > to discover commands"
+                } else {
+                    "No matching results"
+                })
+                .size(13)
+                .style(shell::muted_text),
+            )
+            .padding([14, 10]),
+        );
     }
     for (index, item) in current_items.into_iter().enumerate() {
         let selected = index == state.selected;
-        let (label, detail) = match &item {
+        // The highlighted row carries the selection now, so the title no
+        // longer has to wear a "›" marker to say which one is active.
+        let (title, kind, detail) = match &item {
             Item::Search(result) => (
-                format!(
-                    "{}{} · {}",
-                    if selected { "› " } else { "" },
-                    result.document.title,
-                    result.document.kind.label()
-                ),
+                result.document.title.clone(),
+                Some(result.document.kind.label().to_owned()),
                 result.document.detail.clone(),
             ),
-            Item::Command(id) => {
-                let shortcut = commands.binding(*id).map_or_else(
+            Item::Command(id) => (
+                id.label().to_owned(),
+                None,
+                commands.binding(*id).map_or_else(
                     || "Unbound".to_owned(),
                     |value| value.display(Platform::current()),
-                );
-                (
-                    format!("{}{}", if selected { "› " } else { "" }, id.label()),
-                    shortcut,
-                )
-            }
+                ),
+            ),
         };
-        let mut item_row = row![
-            button(column![text(label), text(detail).size(12)])
-                .on_press(Message::Activate(item.clone()))
-                .width(Fill)
-        ]
-        .spacing(8);
-        if let Item::Command(id) = item {
-            item_row = item_row.push(button("Rebind").on_press(Message::BeginRebind(id)));
+        let mut heading = row![text(title).size(13)].spacing(6);
+        if let Some(kind) = kind {
+            heading = heading.push(text(kind).size(11).style(shell::subtle_text));
         }
-        results = results.push(item_row);
+        let entry: Element<'_, Message> = match item {
+            Item::Command(id) => row![
+                button(
+                    row![
+                        heading.width(Fill),
+                        container(key_cap(detail)).align_y(iced::Alignment::Center),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                )
+                .style(shell::navigation_button(selected))
+                .padding([8, 10])
+                .width(Fill)
+                .on_press(Message::Activate(Item::Command(id))),
+                button(text("Rebind").size(12))
+                    .style(shell::utility_button)
+                    .padding([6, 10])
+                    .on_press(Message::BeginRebind(id)),
+            ]
+            .spacing(6)
+            .into(),
+            search => button(
+                column![
+                    heading,
+                    text(detail)
+                        .size(11)
+                        .style(shell::muted_text)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                ]
+                .spacing(1),
+            )
+            .style(shell::navigation_button(selected))
+            .padding([8, 10])
+            .width(Fill)
+            .on_press(Message::Activate(search))
+            .into(),
+        };
+        results = results.push(entry);
     }
 
     let mut palette = column![
@@ -176,31 +220,72 @@ pub fn view<'a>(state: &'a UiState, commands: &'a CommandRegistry) -> Element<'a
                 &state.query
             )
             .id(INPUT_ID)
+            .size(15)
+            .style(shell::search_input)
             .on_input(Message::QueryChanged)
             .width(Fill),
-            button("Close").on_press(Message::Close),
+            button(key_cap("esc"))
+                .style(shell::utility_button)
+                .padding(2)
+                .on_press(Message::Close),
         ]
-        .spacing(8),
-        scrollable(results).height(320),
+        .spacing(10)
+        .align_y(iced::Alignment::Center),
+        container(iced::widget::Space::new().width(Fill).height(1))
+            .style(shell::rule)
+            .height(1),
+        scrollable(results).height(340),
     ]
     .spacing(10);
     if let Some(command) = state.rebinding {
         palette = palette.push(
-            row![
-                text(format!("Rebind {}", command.label())),
-                text_input("Primary+Shift+key", &state.binding_draft)
-                    .on_input(Message::BindingChanged),
-                button("Save").on_press(Message::SaveBinding),
-                button("Unbind").on_press(Message::Unbind),
+            column![
+                text(format!("Rebind {}", command.label()))
+                    .size(12)
+                    .style(shell::muted_text),
+                row![
+                    text_input("Primary+Shift+key", &state.binding_draft)
+                        .padding([8, 10])
+                        .style(shell::input)
+                        .on_input(Message::BindingChanged)
+                        .width(Fill),
+                    button(text("Save").size(13))
+                        .style(shell::primary_button)
+                        .padding([8, 14])
+                        .on_press(Message::SaveBinding),
+                    button(text("Unbind").size(13))
+                        .style(shell::secondary_button)
+                        .padding([8, 14])
+                        .on_press(Message::Unbind),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
             ]
-            .spacing(8),
+            .spacing(6),
         );
     }
-    container(palette)
-        .width(Fill)
-        .padding(16)
-        .style(container::rounded_box)
-        .into()
+
+    // A dimmed scrim plus a centered card, so the palette reads as a modal
+    // over the workspace instead of a bar that shoves the canvas downward.
+    let scrim = iced::widget::mouse_area(
+        container(iced::widget::Space::new().width(Fill).height(Fill))
+            .width(Fill)
+            .height(Fill)
+            .style(shell::scrim),
+    )
+    .on_press(Message::Close);
+    let card = container(
+        container(palette)
+            .style(shell::card)
+            .width(Fill)
+            .max_width(680)
+            .padding(16),
+    )
+    .width(Fill)
+    .height(Fill)
+    .align_x(iced::Alignment::Center)
+    .padding([84, 24]);
+    iced::widget::stack![scrim, card].into()
 }
 
 fn fuzzy_contains(value: &str, query: &str) -> bool {

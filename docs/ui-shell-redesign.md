@@ -24,8 +24,16 @@ for the primary view.
   system's native folder picker.
 - With a workspace open, let the canvas take most of the window. Put detailed
   workspace controls in a right inspector with section cards and scrolling.
+- Float the canvas controls over the board rather than stacking them above it,
+  so no control steals height from the work surface. Four clusters: the
+  workspace name and path top left, node and agent creation top center, the
+  inspector toggle top right, and zoom bottom right. Each is a rounded pill on
+  the canvas sheet. A pill only captures the pointer where a control sits, so
+  panning and zooming still work across the rest of the board.
 - Keep zoom out, current zoom/reset, and zoom in controls visible in the canvas
   toolbar. The same commands must work while a terminal or portal has focus.
+- Open the command palette as a centered modal over a dimmed scrim. It must not
+  push the application down the window.
 - Make the mouse wheel zoom the canvas, two-finger trackpad scrolling pan the
   board, and the native trackpad pinch gesture zoom. Option/Alt + scrolling
   passes movement to terminal or portal content under the pointer.
@@ -33,16 +41,45 @@ for the primary view.
 
 ## Components
 
+Surfaces, controls, and layout helpers live in `src/app/shell.rs` and
+`src/app/ui.rs`. Panels build from those instead of restating styling, so the
+canvas renderer, the inspector, and the palette stay in step.
+
+- Three greys carry the whole light theme: chrome behind the rail and the
+  canvas backdrop, white for raised surfaces, and one recessed neutral for
+  tracks, badges, key caps, and hover fills. Iced's derived `weak` neutral is
+  too saturated to sit behind a window, so those values are explicit.
 - Primary actions use a dark or blue filled pill; secondary actions use quiet
-  neutral fills or hairline borders.
+  neutral fills or hairline borders. Destructive actions stay quiet until
+  hovered, then turn red.
 - Section labels are small and muted. Headings use stronger size and weight,
   with more space above than below.
+- Related controls group into titled section cards. Clusters of equal-weight
+  actions lay out in a grid that reflows to the panel width, so a narrow
+  inspector never clips a button.
+- Lists select by highlighting the row, not by prefixing a check mark, and a
+  row's own actions unfold only while it is selected.
+- Mutually exclusive choices use a segmented picker rather than several
+  lookalike buttons.
 - Project selection uses the native folder picker instead of exposing a raw
   filesystem-path input.
 - Accessibility preferences remain reachable but become compact footer
   controls instead of dominating the sidebar.
 - High-contrast mode remains a separate black, white, cyan, yellow, green, and
-  red palette.
+  red palette. Secondary text barely fades there, because in that palette
+  nothing may recede out of legibility.
+
+## Canvas nodes
+
+- A node is a white card with a hairline border, a light header band closed by
+  a hairline, and a narrow accent bar naming its kind. The accent is not the
+  border, so an unselected board reads as one material.
+- Selection is a dashed accent outline plus a small rounded grip in the corner,
+  which reads as a marquee rather than a permanently heavier border.
+- Connections are dashed curves with horizontal control points. A straight
+  center-to-center line passes under the nodes it joins; a curve does not.
+- The grid is orientation, not decoration: visible up close, never competing
+  with the nodes drawn over it.
 
 ## Acceptance
 
@@ -58,3 +95,6 @@ for the primary view.
   terminal, or portal nodes.
 - Mouse-wheel zoom, trackpad pan, and trackpad pinch zoom work without a
   modifier key.
+- Panning and zooming keep working over the canvas everywhere a floating pill
+  is not directly under the pointer.
+- Every panel in the inspector fits its width without clipping a control.

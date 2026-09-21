@@ -43,7 +43,7 @@ fn new_database_enables_wal_foreign_keys_and_schema_version() {
         .pragma_query_value(None, "foreign_keys", |row| row.get(0))
         .unwrap();
 
-    assert_eq!(schema_version, 4);
+    assert_eq!(schema_version, 5);
     assert_eq!(journal_mode, "wal");
     assert_eq!(foreign_keys, 1);
 }
@@ -1138,7 +1138,7 @@ fn unknown_schema_version_does_not_modify_the_database() {
         error,
         PersistenceError::UnsupportedSchemaVersion {
             found: 99,
-            supported: 4,
+            supported: 5,
         }
     ));
     assert_eq!(fs::read(&path).unwrap(), before);
@@ -1194,7 +1194,8 @@ fn version_one_migration_backfills_workspace_registry_and_active_selection() {
         journal
             .connection()
             .execute_batch(
-                "DROP TABLE application_preferences;
+                "DROP TABLE terminal_transcripts;
+                 DROP TABLE application_preferences;
                  DROP TABLE application_shortcuts;
                  DROP TABLE application_state;
                  DROP TABLE workspace_registry;
@@ -1209,7 +1210,7 @@ fn version_one_migration_backfills_workspace_registry_and_active_selection() {
     assert_eq!(journal.active_workspace_id().unwrap(), Some(workspace_id));
     assert!(journal.recover(workspace_id).unwrap().is_some());
     assert!(
-        path.with_file_name("journal.sqlite.backup-v1-before-v4")
+        path.with_file_name("journal.sqlite.backup-v1-before-v5")
             .exists()
     );
 }
@@ -1223,7 +1224,8 @@ fn version_two_migration_adds_persistent_shortcuts() {
         journal
             .connection()
             .execute_batch(
-                "DROP TABLE application_preferences;
+                "DROP TABLE terminal_transcripts;
+                 DROP TABLE application_preferences;
                  DROP TABLE application_shortcuts;
                  PRAGMA user_version = 2;",
             )
@@ -1254,7 +1256,8 @@ fn version_three_migration_adds_application_preferences() {
         journal
             .connection()
             .execute_batch(
-                "DROP TABLE application_preferences;
+                "DROP TABLE terminal_transcripts;
+                 DROP TABLE application_preferences;
                  PRAGMA user_version = 3;",
             )
             .unwrap();
@@ -1292,7 +1295,7 @@ fn migration_failure_reports_versions_and_preserves_a_backup() {
     let backup_path = match error {
         PersistenceError::Migration {
             from: 0,
-            to: 4,
+            to: 5,
             backup_path: Some(path),
             ..
         } => path,
@@ -1362,7 +1365,7 @@ fn database_path(temp: &TempDir) -> PathBuf {
 }
 
 fn migration_backup_path(database: &Path) -> PathBuf {
-    database.with_file_name("journal.sqlite.backup-v0-before-v4")
+    database.with_file_name("journal.sqlite.backup-v0-before-v5")
 }
 
 // Routine persistence. A recovered run must make the same decisions the live
@@ -1625,4 +1628,71 @@ fn a_database_without_routines_still_recovers() {
     assert_eq!(recovered.routines().count(), 0);
     assert_eq!(recovered.routine_runs().count(), 0);
     assert!(recovered.held_routine_reservations().is_empty());
+}
+
+#[test]
+fn version_four_migration_adds_terminal_transcripts() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    {
+        let journal = Journal::open(&path).unwrap();
+        journal
+            .connection()
+            .execute_batch(
+                "DROP TABLE terminal_transcripts;
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+    }
+
+    let mut journal = Journal::open(&path).unwrap();
+    let workspace_id = test_workspace().id();
+    journal
+        .store_terminal_transcript(workspace_id, 7, Timestamp::from_unix_millis(42), b"first")
+        .unwrap();
+    journal
+        .store_terminal_transcript(workspace_id, 3, Timestamp::from_unix_millis(43), b"second")
+        .unwrap();
+    journal
+        .store_terminal_transcript(
+            workspace_id,
+            7,
+            Timestamp::from_unix_millis(44),
+            b"replaced",
+        )
+        .unwrap();
+
+    assert_eq!(
+        journal.terminal_transcripts(workspace_id).unwrap(),
+        vec![(3, b"second".to_vec()), (7, b"replaced".to_vec()),]
+    );
+}
+
+/// A transcript is a display cache, so removing one must never be an error and
+/// must never leave a node claiming output it no longer has.
+#[test]
+fn clearing_a_terminal_transcript_removes_only_that_node() {
+    let temp = TempDir::new().unwrap();
+    let path = database_path(&temp);
+    let mut journal = Journal::open(&path).unwrap();
+    let workspace_id = test_workspace().id();
+    journal
+        .store_terminal_transcript(workspace_id, 1, Timestamp::from_unix_millis(1), b"kept")
+        .unwrap();
+    journal
+        .store_terminal_transcript(workspace_id, 2, Timestamp::from_unix_millis(2), b"dropped")
+        .unwrap();
+
+    journal.clear_terminal_transcript(workspace_id, 2).unwrap();
+    journal.clear_terminal_transcript(workspace_id, 99).unwrap();
+    journal
+        .store_terminal_transcript(workspace_id, 1, Timestamp::from_unix_millis(3), b"")
+        .unwrap();
+
+    assert!(
+        journal
+            .terminal_transcripts(workspace_id)
+            .unwrap()
+            .is_empty()
+    );
 }

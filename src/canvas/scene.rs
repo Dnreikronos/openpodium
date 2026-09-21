@@ -10,14 +10,25 @@ use openpodium::domain::{
 };
 use openpodium::portal::{PortalFrame, PortalFrameTransform, PortalRect};
 
+use crate::app::shell;
 use crate::terminal::{self, BODY_PADDING, CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT};
 
 use super::{Camera, CanvasDocument, NodeKind, ViewportSize, WorldPoint, WorldRect};
 
 const BASE_GRID_STEP: f64 = 40.0;
 const MIN_GRID_PIXELS: f64 = 24.0;
-/// Node bodies, including portal frames, are only drawn at or above this zoom.
+/// Below this zoom a node is too small to aim at, so portals stop taking
+/// pointer input and the header drops its subtitle. Bodies still draw: a node
+/// you cannot read is still a node you need to see.
 pub(super) const BODY_MIN_ZOOM: f64 = 0.4;
+
+/// Below this zoom terminal glyphs are too small to read, so cells render as
+/// ink bars instead. Shaping thousands of illegible glyphs costs a great deal
+/// and shows less than the bars do.
+const GLYPH_MIN_ZOOM: f32 = 0.55;
+
+/// How far a partly covered node may fragment before it is drawn whole.
+const MAX_VISIBLE_REGIONS: usize = 4;
 
 pub(super) struct TerminalOverlay<'a> {
     pub(super) focused: Option<NodeId>,
@@ -34,7 +45,7 @@ pub(super) fn draw(
     theme: &Theme,
 ) {
     let palette = theme.extended_palette();
-    frame.fill_rectangle(Point::ORIGIN, frame.size(), palette.background.base.color);
+    frame.fill_rectangle(Point::ORIGIN, frame.size(), shell::surface_color(palette));
 
     draw_grid(frame, camera, viewport, palette);
     draw_groups(frame, camera, viewport, document, palette);
@@ -83,10 +94,12 @@ fn draw_grid(
             path.line_to(Point::new(viewport.width as f32, screen_y));
         }
     });
+    // The grid is orientation, not decoration: it must be visible up close and
+    // never compete with the nodes drawn on top of it.
     frame.stroke(
         &grid,
         Stroke::default()
-            .with_color(palette.background.weak.color)
+            .with_color(shell::sunken_color(palette))
             .with_width(1.0),
     );
 
@@ -111,7 +124,7 @@ fn draw_grid(
     frame.stroke(
         &axes,
         Stroke::default()
-            .with_color(palette.background.strong.color)
+            .with_color(shell::hairline_color(palette))
             .with_width(1.5),
     );
 }
@@ -175,17 +188,134 @@ fn draw_connections(
         };
         let from = camera.world_to_screen(node_center(source), viewport);
         let to = camera.world_to_screen(node_center(target), viewport);
-        let path = Path::line(
-            Point::new(from.x as f32, from.y as f32),
-            Point::new(to.x as f32, to.y as f32),
-        );
+        let from = Point::new(from.x as f32, from.y as f32);
+        let to = Point::new(to.x as f32, to.y as f32);
+        // A dashed curve reads as a link rather than a hard edge, and the
+        // horizontal control points keep it clear of the node bodies the way a
+        // straight center-to-center line does not.
+        let reach = ((to.x - from.x).abs() * 0.5).clamp(40.0, 220.0);
+        let path = Path::new(|builder| {
+            builder.move_to(from);
+            builder.bezier_curve_to(
+                Point::new(from.x + reach, from.y),
+                Point::new(to.x - reach, to.y),
+                to,
+            );
+        });
         frame.stroke(
             &path,
-            Stroke::default()
-                .with_color(connection_color(connection.kind(), palette))
-                .with_width((2.0 * camera.zoom() as f32).clamp(1.0, 3.0)),
+            Stroke {
+                line_dash: canvas::LineDash {
+                    segments: &[6.0, 5.0],
+                    offset: 0,
+                },
+                ..Stroke::default()
+                    .with_color(connection_color(connection.kind(), palette).scale_alpha(0.7))
+                    .with_width((1.5 * camera.zoom() as f32).clamp(1.0, 2.5))
+            },
         );
     }
+}
+
+/// Emits text only where a node is actually exposed.
+///
+/// The renderer batches canvas text separately from canvas geometry and draws
+/// it last, so a covered node's text would otherwise paint over the node
+/// covering it. Geometry needs no such help: meshes honour draw order. Clipping
+/// meshes here would in fact lose them, which is why only text goes through
+/// this path.
+fn clip_text(
+    frame: &mut canvas::Frame,
+    regions: &[Rectangle],
+    bounds: Rectangle,
+    mut draw: impl FnMut(&mut canvas::Frame),
+) {
+    for region in regions {
+        let Some(clip) = region.intersection(&bounds) else {
+            continue;
+        };
+        if clip.width <= 0.0 || clip.height <= 0.0 {
+            continue;
+        }
+        frame.with_clip(clip, &mut draw);
+    }
+}
+
+/// The parts of `rect` that `occluder` leaves uncovered.
+fn subtract(rect: Rectangle, occluder: Rectangle) -> Vec<Rectangle> {
+    let Some(overlap) = rect.intersection(&occluder) else {
+        return vec![rect];
+    };
+    if overlap.width <= 0.0 || overlap.height <= 0.0 {
+        return vec![rect];
+    }
+
+    let mut parts = Vec::new();
+    let rect_bottom = rect.y + rect.height;
+    let rect_right = rect.x + rect.width;
+    let overlap_bottom = overlap.y + overlap.height;
+    let overlap_right = overlap.x + overlap.width;
+
+    if overlap.y > rect.y {
+        parts.push(Rectangle::new(
+            Point::new(rect.x, rect.y),
+            Size::new(rect.width, overlap.y - rect.y),
+        ));
+    }
+    if overlap_bottom < rect_bottom {
+        parts.push(Rectangle::new(
+            Point::new(rect.x, overlap_bottom),
+            Size::new(rect.width, rect_bottom - overlap_bottom),
+        ));
+    }
+    if overlap.x > rect.x {
+        parts.push(Rectangle::new(
+            Point::new(rect.x, overlap.y),
+            Size::new(overlap.x - rect.x, overlap.height),
+        ));
+    }
+    if overlap_right < rect_right {
+        parts.push(Rectangle::new(
+            Point::new(overlap_right, overlap.y),
+            Size::new(rect_right - overlap_right, overlap.height),
+        ));
+    }
+    parts
+}
+
+/// The parts of `rect` still visible: inside `within`, and not taken by an
+/// occluder.
+///
+/// The renderer batches all canvas text and draws it above all canvas
+/// geometry, so a node covered by another cannot be hidden by draw order, and
+/// a node hanging off the edge is not clipped to the widget either. Its text
+/// would paint straight through the node above it and across the workspace
+/// rail beside it. Clipping each node to what it actually shows is what keeps
+/// both honest.
+fn visible_regions(rect: Rectangle, within: Rectangle, occluders: &[Rectangle]) -> Vec<Rectangle> {
+    let Some(rect) = rect.intersection(&within) else {
+        return Vec::new();
+    };
+    let mut regions = vec![rect];
+    for occluder in occluders {
+        if regions.is_empty() {
+            break;
+        }
+        let split = regions
+            .iter()
+            .flat_map(|region| subtract(*region, *occluder))
+            .collect::<Vec<_>>();
+        // A pathological stack could fragment without bound. Past this point
+        // the clipping costs more than the bleeding it prevents.
+        if split.len() > MAX_VISIBLE_REGIONS {
+            return vec![rect];
+        }
+        regions = split;
+    }
+    regions
+        .into_iter()
+        .filter(|region| region.width > 0.0 && region.height > 0.0)
+        .collect()
 }
 
 fn draw_nodes(
@@ -207,98 +337,179 @@ fn draw_nodes(
         .collect::<Vec<_>>();
     nodes.sort_by_key(|node| (node.z_index(), node.id()));
 
-    for node in nodes {
+    let canvas_bounds = Rectangle::new(
+        Point::ORIGIN,
+        Size::new(viewport.width as f32, viewport.height as f32),
+    );
+
+    // Screen rectangles in the same back-to-front order, so each node can be
+    // clipped to the part of it that the nodes above have not covered.
+    let rects = nodes
+        .iter()
+        .map(|node| {
+            let origin = camera.world_to_screen(
+                WorldPoint::new(
+                    f64::from(node.position().x()),
+                    f64::from(node.position().y()),
+                ),
+                viewport,
+            );
+            Rectangle::new(
+                Point::new(origin.x as f32, origin.y as f32),
+                Size::new(
+                    (f64::from(node.size().width()) * camera.zoom()) as f32,
+                    (f64::from(node.size().height()) * camera.zoom()) as f32,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (index, node) in nodes.iter().enumerate() {
+        let regions = visible_regions(rects[index], canvas_bounds, &rects[index + 1..]);
+        if regions.is_empty() {
+            continue;
+        }
+        draw_node(
+            frame,
+            camera,
+            document,
+            node,
+            rects[index],
+            &regions,
+            selected.contains(&node.id()),
+            terminal_overlay.focused,
+            terminal_overlay.preedit,
+            palette,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_node(
+    frame: &mut canvas::Frame,
+    camera: Camera,
+    document: &CanvasDocument,
+    node: &Node,
+    rect: Rectangle,
+    regions: &[Rectangle],
+    is_selected: bool,
+    focused_terminal: Option<NodeId>,
+    preedit: &str,
+    palette: &palette::Extended,
+) {
+    {
         let label = document.label(node.id());
-        let top_left = camera.world_to_screen(
-            WorldPoint::new(
-                f64::from(node.position().x()),
-                f64::from(node.position().y()),
-            ),
-            viewport,
-        );
-        let top_left = Point::new(top_left.x as f32, top_left.y as f32);
-        let size = Size::new(
-            (f64::from(node.size().width()) * camera.zoom()) as f32,
-            (f64::from(node.size().height()) * camera.zoom()) as f32,
-        );
+        let top_left = rect.position();
+        let size = rect.size();
         let radius = (10.0 * camera.zoom() as f32).clamp(4.0, 14.0);
         let shape = Path::rounded_rectangle(top_left, size, radius.into());
         let accent = node_color(label.kind, palette);
-        let is_selected = selected.contains(&node.id());
 
-        frame.fill(&shape, palette.background.weakest.color);
-        frame.stroke(
-            &shape,
-            Stroke::default()
-                .with_color(if is_selected {
-                    palette.primary.strong.color
-                } else {
-                    accent
-                })
-                .with_width(if is_selected { 3.0 } else { 1.5 }),
-        );
+        // Unselected nodes wear a neutral hairline and carry their kind in the
+        // accent bar alone. Selection is a dashed accent outline, which reads
+        // as a marquee rather than as a heavier permanent border.
+        frame.fill(&shape, shell::surface_color(palette));
         let zoom = camera.zoom() as f32;
         let header_height = (HEADER_HEIGHT * zoom).clamp(28.0, 60.0);
         frame.fill_rectangle(
             top_left,
             Size::new(size.width, header_height),
-            palette.background.weak.color,
+            shell::chrome_color(palette),
+        );
+        frame.fill_rectangle(
+            Point::new(top_left.x, top_left.y + header_height - 1.0),
+            Size::new(size.width, 1.0),
+            shell::hairline_color(palette),
         );
         frame.fill_rectangle(
             top_left,
-            Size::new((5.0 * camera.zoom() as f32).clamp(2.0, 6.0), header_height),
+            Size::new((4.0 * camera.zoom() as f32).clamp(2.0, 5.0), header_height),
             accent,
         );
+        frame.stroke(
+            &shape,
+            if is_selected {
+                Stroke {
+                    line_dash: canvas::LineDash {
+                        segments: &[5.0, 4.0],
+                        offset: 0,
+                    },
+                    ..Stroke::default()
+                        .with_color(palette.primary.base.color)
+                        .with_width(1.5)
+                }
+            } else {
+                Stroke::default()
+                    .with_color(shell::hairline_color(palette))
+                    .with_width(1.0)
+            },
+        );
 
-        if camera.zoom() >= BODY_MIN_ZOOM {
-            let padding = (12.0 * zoom).clamp(7.0, 16.0);
+        // The title is what a node is. It stays legible at every zoom, clipped
+        // to its header so a small node truncates the name instead of spilling
+        // it across the board. Only the detail below it drops away.
+        let padding = (12.0 * zoom).clamp(7.0, 16.0);
+        let shows_detail = camera.zoom() >= BODY_MIN_ZOOM;
+        let title_size = (14.0 * zoom).clamp(9.0, 17.0);
+        let title_y = if shows_detail {
+            top_left.y + padding * 0.45
+        } else {
+            top_left.y + (header_height - title_size) * 0.5
+        };
+        let header = Rectangle::new(top_left, Size::new(size.width, header_height));
+        clip_text(frame, regions, header, |frame| {
             frame.fill_text(canvas::Text {
                 content: label.title.clone(),
-                position: Point::new(top_left.x + padding, top_left.y + padding * 0.45),
-                color: palette.background.weak.text,
-                size: Pixels((14.0 * zoom).clamp(9.0, 17.0)),
+                position: Point::new(top_left.x + padding, title_y),
+                color: palette.background.base.text,
+                size: Pixels(title_size),
                 ..canvas::Text::default()
             });
-            frame.fill_text(canvas::Text {
-                content: label.subtitle.clone(),
-                position: Point::new(top_left.x + padding, top_left.y + header_height * 0.56),
-                color: palette.secondary.base.color,
-                size: Pixels((10.0 * zoom).clamp(7.0, 12.0)),
-                ..canvas::Text::default()
-            });
-            if let Some(terminal) = document.terminal(node.id()) {
-                draw_terminal(
-                    frame,
-                    top_left,
-                    header_height,
-                    zoom,
-                    terminal,
-                    (terminal_overlay.focused == Some(node.id()))
-                        .then_some(terminal_overlay.preedit),
-                );
-            } else {
-                let body_padding = (12.0 * zoom).clamp(7.0, 16.0);
-                let body_top_left = Point::new(
-                    top_left.x + body_padding,
-                    top_left.y + header_height + body_padding,
-                );
-                let body_size = Size::new(
-                    (size.width - body_padding * 2.0).max(1.0),
-                    (size.height - header_height - body_padding * 2.0).max(1.0),
-                );
-                let rendered_portal =
-                    document
-                        .portal_frame(node.id())
-                        .is_some_and(|portal_frame| {
-                            draw_portal_frame(
-                                frame,
-                                node.content(),
-                                portal_frame,
-                                body_top_left,
-                                body_size,
-                            )
-                        });
-                if !rendered_portal {
+            if shows_detail {
+                frame.fill_text(canvas::Text {
+                    content: label.subtitle.clone(),
+                    position: Point::new(top_left.x + padding, top_left.y + header_height * 0.56),
+                    color: shell::muted_color(palette),
+                    size: Pixels((10.0 * zoom).clamp(7.0, 12.0)),
+                    ..canvas::Text::default()
+                });
+            }
+        });
+
+        if let Some(terminal) = document.terminal(node.id()) {
+            draw_terminal(
+                frame,
+                top_left,
+                header_height,
+                zoom,
+                terminal,
+                (focused_terminal == Some(node.id())).then_some(preedit),
+                regions,
+                rect,
+            );
+        } else {
+            let body_padding = (12.0 * zoom).clamp(7.0, 16.0);
+            let body_top_left = Point::new(
+                top_left.x + body_padding,
+                top_left.y + header_height + body_padding,
+            );
+            let body_size = Size::new(
+                (size.width - body_padding * 2.0).max(1.0),
+                (size.height - header_height - body_padding * 2.0).max(1.0),
+            );
+            let rendered_portal = document
+                .portal_frame(node.id())
+                .is_some_and(|portal_frame| {
+                    draw_portal_frame(
+                        frame,
+                        node.content(),
+                        portal_frame,
+                        body_top_left,
+                        body_size,
+                    )
+                });
+            if !rendered_portal {
+                clip_text(frame, regions, rect, |frame| {
                     draw_content(
                         frame,
                         body_top_left,
@@ -308,19 +519,28 @@ fn draw_nodes(
                         document.body(node.id()),
                         palette.background.base.text,
                     );
-                }
+                });
             }
         }
 
         if is_selected {
-            let handle = (12.0 * camera.zoom() as f32).clamp(8.0, 16.0);
-            frame.fill_rectangle(
+            // A small filled grip in the corner, sized to stay grabbable at
+            // low zoom without turning into a block over the node body.
+            let handle = (10.0 * camera.zoom() as f32).clamp(7.0, 13.0);
+            let grip = Path::rounded_rectangle(
                 Point::new(
-                    top_left.x + size.width - handle,
-                    top_left.y + size.height - handle,
+                    top_left.x + size.width - handle - 2.0,
+                    top_left.y + size.height - handle - 2.0,
                 ),
                 Size::new(handle, handle),
-                palette.primary.strong.color,
+                3.0.into(),
+            );
+            frame.fill(&grip, palette.primary.base.color);
+            frame.stroke(
+                &grip,
+                Stroke::default()
+                    .with_color(shell::surface_color(palette))
+                    .with_width(1.5),
             );
         }
     }
@@ -524,6 +744,7 @@ fn canvas_color(color: CanvasColor) -> Color {
     Color::from_rgba8(red, green, blue, f32::from(alpha) / 255.0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_terminal(
     frame: &mut canvas::Frame,
     top_left: Point,
@@ -531,6 +752,8 @@ fn draw_terminal(
     zoom: f32,
     terminal: &terminal::View,
     preedit: Option<&str>,
+    regions: &[Rectangle],
+    bounds: Rectangle,
 ) {
     let origin = Point::new(
         top_left.x + BODY_PADDING * zoom,
@@ -547,28 +770,14 @@ fn draw_terminal(
             background.a = 1.0;
         }
         frame.fill_rectangle(position, cell_size, background);
-        if cell.text != " " {
-            frame.fill_text(canvas::Text {
-                content: cell.text.clone(),
-                position: Point::new(position.x, position.y - cell_size.height * 0.04),
-                color: terminal_color(cell.foreground),
-                size: Pixels((13.0 * zoom).max(5.0)),
-                font: Font {
-                    family: font::Family::Monospace,
-                    weight: if cell.bold {
-                        font::Weight::Bold
-                    } else {
-                        font::Weight::Normal
-                    },
-                    style: if cell.italic {
-                        font::Style::Italic
-                    } else {
-                        font::Style::Normal
-                    },
-                    ..Font::MONOSPACE
-                },
-                ..canvas::Text::default()
-            });
+        if cell.text != " " && zoom < GLYPH_MIN_ZOOM {
+            // Too small to read. An ink bar keeps the shape of the output,
+            // which is the only thing a glyph could convey at this size.
+            frame.fill_rectangle(
+                Point::new(position.x, position.y + cell_size.height * 0.25),
+                Size::new(cell_size.width, (cell_size.height * 0.5).max(1.0)),
+                terminal_color(cell.foreground).scale_alpha(0.85),
+            );
         }
         if cell.underline || cell.hyperlink.is_some() {
             frame.fill_rectangle(
@@ -584,6 +793,41 @@ fn draw_terminal(
                 terminal_color(cell.foreground),
             );
         }
+    }
+
+    if zoom >= GLYPH_MIN_ZOOM {
+        clip_text(frame, regions, bounds, |frame| {
+            for cell in &terminal.cells {
+                if cell.text == " " {
+                    continue;
+                }
+                let position = Point::new(
+                    origin.x + cell.column as f32 * cell_size.width,
+                    origin.y + cell.row as f32 * cell_size.height,
+                );
+                frame.fill_text(canvas::Text {
+                    content: cell.text.clone(),
+                    position: Point::new(position.x, position.y - cell_size.height * 0.04),
+                    color: terminal_color(cell.foreground),
+                    size: Pixels((13.0 * zoom).max(5.0)),
+                    font: Font {
+                        family: font::Family::Monospace,
+                        weight: if cell.bold {
+                            font::Weight::Bold
+                        } else {
+                            font::Weight::Normal
+                        },
+                        style: if cell.italic {
+                            font::Style::Italic
+                        } else {
+                            font::Style::Normal
+                        },
+                        ..Font::MONOSPACE
+                    },
+                    ..canvas::Text::default()
+                });
+            }
+        });
     }
 
     if let Some(cursor) = terminal.cursor {
@@ -611,13 +855,15 @@ fn draw_terminal(
         );
 
         if let Some(preedit) = preedit.filter(|preedit| !preedit.is_empty()) {
-            frame.fill_text(canvas::Text {
-                content: preedit.to_owned(),
-                position,
-                color: Color::WHITE,
-                size: Pixels((13.0 * zoom).max(5.0)),
-                font: Font::MONOSPACE,
-                ..canvas::Text::default()
+            clip_text(frame, regions, bounds, |frame| {
+                frame.fill_text(canvas::Text {
+                    content: preedit.to_owned(),
+                    position,
+                    color: Color::WHITE,
+                    size: Pixels((13.0 * zoom).max(5.0)),
+                    font: Font::MONOSPACE,
+                    ..canvas::Text::default()
+                });
             });
         }
     }
@@ -717,7 +963,23 @@ fn connection_color(kind: ConnectionKind, palette: &palette::Extended) -> Color 
 
 #[cfg(test)]
 mod tests {
-    use super::grid_step;
+    use super::{MAX_VISIBLE_REGIONS, grid_step, visible_regions};
+    use iced::{Point, Rectangle, Size};
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Rectangle {
+        Rectangle::new(Point::new(x, y), Size::new(width, height))
+    }
+
+    fn canvas() -> Rectangle {
+        rect(-1_000.0, -1_000.0, 4_000.0, 4_000.0)
+    }
+
+    fn area(regions: &[Rectangle]) -> f32 {
+        regions
+            .iter()
+            .map(|region| region.width * region.height)
+            .sum()
+    }
 
     #[test]
     fn grid_spacing_never_becomes_visually_dense() {
@@ -725,5 +987,79 @@ mod tests {
         assert_eq!(grid_step(1.0), 40.0);
         assert_eq!(grid_step(0.5), 80.0);
         assert_eq!(grid_step(0.25), 160.0);
+    }
+
+    #[test]
+    fn an_unobstructed_node_is_drawn_whole() {
+        let node = rect(0.0, 0.0, 100.0, 100.0);
+
+        assert_eq!(visible_regions(node, canvas(), &[]), vec![node]);
+        assert_eq!(
+            visible_regions(node, canvas(), &[rect(200.0, 200.0, 50.0, 50.0)]),
+            vec![node]
+        );
+    }
+
+    /// Dragging one node fully over another is the case that made text from the
+    /// covered node paint straight through the one on top.
+    #[test]
+    fn a_fully_covered_node_is_not_drawn() {
+        let node = rect(10.0, 10.0, 80.0, 80.0);
+
+        assert!(visible_regions(node, canvas(), &[rect(0.0, 0.0, 200.0, 200.0)]).is_empty());
+        assert!(visible_regions(node, canvas(), &[node]).is_empty());
+        assert!(
+            visible_regions(
+                node,
+                canvas(),
+                &[rect(0.0, 0.0, 200.0, 50.0), rect(0.0, 50.0, 200.0, 150.0)]
+            )
+            .is_empty(),
+            "coverage by several nodes together still hides it"
+        );
+    }
+
+    #[test]
+    fn a_partly_covered_node_keeps_only_its_exposed_area() {
+        let node = rect(0.0, 0.0, 100.0, 100.0);
+
+        // Covered from the right half.
+        let regions = visible_regions(node, canvas(), &[rect(50.0, -10.0, 100.0, 120.0)]);
+        assert_eq!(regions, vec![rect(0.0, 0.0, 50.0, 100.0)]);
+
+        // Covered through the middle, leaving a band above and below.
+        let regions = visible_regions(node, canvas(), &[rect(-10.0, 40.0, 120.0, 20.0)]);
+        assert_eq!(area(&regions), 8_000.0);
+        assert!(regions.iter().all(|region| region.height > 0.0));
+    }
+
+    /// The text batch is not clipped to the canvas widget, so a node hanging
+    /// off the edge would otherwise print across the workspace rail.
+    #[test]
+    fn a_node_past_the_canvas_edge_is_cut_at_it() {
+        let node = rect(-200.0, 50.0, 300.0, 100.0);
+        let canvas = rect(0.0, 0.0, 800.0, 600.0);
+
+        assert_eq!(
+            visible_regions(node, canvas, &[]),
+            vec![rect(0.0, 50.0, 100.0, 100.0)]
+        );
+        assert!(visible_regions(rect(-400.0, 0.0, 100.0, 100.0), canvas, &[]).is_empty());
+    }
+
+    /// Fragmenting without bound would cost more than the bleeding it avoids.
+    #[test]
+    fn a_heavily_fragmented_node_falls_back_to_one_region() {
+        let node = rect(0.0, 0.0, 100.0, 100.0);
+        let occluders = [
+            rect(20.0, 20.0, 10.0, 10.0),
+            rect(60.0, 20.0, 10.0, 10.0),
+            rect(20.0, 60.0, 10.0, 10.0),
+            rect(60.0, 60.0, 10.0, 10.0),
+        ];
+
+        let regions = visible_regions(node, canvas(), &occluders);
+        assert!(regions.len() <= MAX_VISIBLE_REGIONS.max(1));
+        assert_eq!(regions, vec![node]);
     }
 }
