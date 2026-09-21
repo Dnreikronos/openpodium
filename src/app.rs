@@ -77,6 +77,10 @@ use ui::{
 
 const APP_NAME: &str = "OpenPodium";
 const DATABASE_FILE: &str = "openpodium.sqlite";
+/// Orchestration ticks between terminal transcript captures. The tick runs at
+/// 100ms, so transcripts are written about every three seconds while output is
+/// arriving, rather than on every chunk.
+const TRANSCRIPT_FLUSH_TICKS: u32 = 30;
 
 type TimelineState = (
     BTreeMap<WorkspaceId, Vec<TimelineItem>>,
@@ -131,6 +135,7 @@ struct OpenPodium {
     focused_terminal: Option<NodeId>,
     focused_portal: Option<NodeId>,
     terminal_generation: u64,
+    transcript_ticks: u32,
     chat_ui: chat::UiState,
     timeline_ui: timeline_panel::UiState,
     timeline_items: BTreeMap<WorkspaceId, Vec<TimelineItem>>,
@@ -258,6 +263,7 @@ impl Default for OpenPodium {
             focused_terminal: None,
             focused_portal: None,
             terminal_generation: 0,
+            transcript_ticks: 0,
             chat_ui: chat::UiState::default(),
             timeline_ui: timeline_panel::UiState::default(),
             timeline_items,
@@ -304,6 +310,7 @@ impl Default for OpenPodium {
         };
         load_application_preferences(&mut state);
         state.load_active_settings();
+        state.restore_terminal_transcripts();
         state.sync_ipc_directory();
         refresh_supervisor_snapshot(&mut state);
         navigation::mark_all_stale(&mut state);
@@ -535,6 +542,13 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::Floor(message) => return floors::update(state, message),
         Message::Portal(message) => return portals::update(state, message),
         Message::OrchestrationTick => {
+            state.transcript_ticks = state.transcript_ticks.wrapping_add(1);
+            if state
+                .transcript_ticks
+                .is_multiple_of(TRANSCRIPT_FLUSH_TICKS)
+            {
+                state.flush_terminal_transcripts();
+            }
             run_orchestration_tick(state);
             run_routine_tick(state);
             let contexts = context_nodes::tick(state);
@@ -655,6 +669,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
                     floors::workspace_changed(state);
                     state.reset_canvas_session();
                     state.load_active_settings();
+                    state.restore_terminal_transcripts();
                 }
                 Err(error) => state.notice = Some(error),
             }
@@ -772,6 +787,7 @@ fn create_workspace(state: &mut OpenPodium, directory: &Path) {
             floors::workspace_changed(state);
             state.reset_canvas_session();
             state.load_active_settings();
+            state.restore_terminal_transcripts();
             state.sync_ipc_directory();
         }
         Err(error) => state.notice = Some(error),
@@ -1794,6 +1810,93 @@ impl OpenPodium {
         self.canvas_revision = self.canvas_revision.wrapping_add(1);
     }
 
+    /// Rebuilds offline terminal views for the active workspace from stored
+    /// transcripts, so a reopened node shows the output it had. Nodes with a
+    /// live session keep it; nothing is started here.
+    fn restore_terminal_transcripts(&mut self) {
+        let Some(workspaces) = self.workspaces.as_ref() else {
+            return;
+        };
+        let Some(workspace) = workspaces.active_workspace() else {
+            return;
+        };
+        let workspace_id = workspace.id();
+        let sizes = workspace
+            .canvas_layout()
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.reference(), Some(NodeTarget::Agent(_))))
+            .map(|node| {
+                (
+                    node.id(),
+                    terminal::GridSize::for_node(node.size().width(), node.size().height()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let Ok(transcripts) = workspaces.terminal_transcripts(workspace_id) else {
+            return;
+        };
+
+        let mut orphans = Vec::new();
+        for (node_id, payload) in transcripts {
+            let raw_node_id = node_id;
+            let node_id = NodeId::new(node_id);
+            let Some(size) = sizes.get(&node_id).copied() else {
+                // The node is gone and undo history does not survive a reload,
+                // so nothing can bring it back to claim this transcript.
+                orphans.push(raw_node_id);
+                continue;
+            };
+            let key = TerminalKey {
+                workspace_id,
+                node_id,
+            };
+            if self.terminals.contains_key(&key) {
+                continue;
+            }
+            self.terminal_generation = self.terminal_generation.wrapping_add(1);
+            self.terminals.insert(
+                key,
+                Session::restored(size, self.terminal_generation, payload),
+            );
+        }
+
+        if let Some(workspaces) = self.workspaces.as_mut() {
+            for node_id in orphans {
+                let _ = workspaces.clear_terminal_transcript(workspace_id, node_id);
+            }
+        }
+        self.canvas_revision = self.canvas_revision.wrapping_add(1);
+    }
+
+    /// Writes every transcript that changed since the last capture.
+    fn flush_terminal_transcripts(&mut self) {
+        let pending = self
+            .terminals
+            .iter_mut()
+            .filter_map(|(key, session)| {
+                session
+                    .take_transcript()
+                    .map(|transcript| (*key, transcript.to_vec()))
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(workspaces) = self.workspaces.as_mut() else {
+            return;
+        };
+        let captured_at = now();
+        for (key, payload) in pending {
+            let _ = workspaces.store_terminal_transcript(
+                key.workspace_id,
+                key.node_id.get(),
+                captured_at,
+                &payload,
+            );
+        }
+    }
+
     fn stop_all_terminals(&mut self) {
         for session in self.terminals.values_mut() {
             let _ = session.stop();
@@ -1867,6 +1970,8 @@ impl OpenPodium {
 impl Drop for OpenPodium {
     fn drop(&mut self) {
         portals::shutdown(self);
+        // Capture before stopping: stopping drops the sessions holding them.
+        self.flush_terminal_transcripts();
         self.stop_all_terminals();
     }
 }
@@ -2065,6 +2170,7 @@ fn navigate_to_task(state: &mut OpenPodium, target: NavigationTarget) {
         }
         state.reset_canvas_session();
         state.load_active_settings();
+        state.restore_terminal_transcripts();
     }
     state
         .timeline_ui
@@ -5121,6 +5227,7 @@ mod tests {
             .create_workspace(&project, Timestamp::from_unix_millis(1))
             .unwrap();
         let mut state = OpenPodium {
+            transcript_ticks: 0,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
             inspector_open: false,
@@ -5893,6 +6000,7 @@ mod tests {
         terminals: BTreeMap<TerminalKey, Session>,
     ) -> OpenPodium {
         OpenPodium {
+            transcript_ticks: 0,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
             inspector_open: false,
