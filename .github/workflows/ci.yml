@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
 
       - name: Install the pinned Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal --component clippy --component rustfmt
+        run: rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt
 
       - name: Show the active Rust toolchain
         run: rustup show active-toolchain
@@ -39,7 +39,14 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run automated accessibility checks
+        run: |
+          cargo test --locked --lib accessibility::
+          cargo test --locked --lib localization::
+          cargo test --locked --lib presentation::
+          cargo test --locked --bin openpodium accessibility_
 
       - name: Run tests
-        run: cargo test --all-targets --all-features
+        run: cargo test --all-targets --all-features --locked
