@@ -39,6 +39,14 @@ Owns workspaces, agents, roles, tasks, handoffs, and lifecycle transition rules.
 
 Owns PTYs, agent adapter processes, input/output streams, cancellation, and runtime health. It publishes structured observations but cannot directly mutate domain state.
 
+### Routine scheduler
+
+Owns immutable routine versions, their triggers, and their runs. It decides
+which steps are ready, holds the resources a step declared for as long as it
+executes, and records every dispatch before the work leaves the process. It
+submits work to the orchestrator through an internal path rather than
+impersonating an agent.
+
 ### Orchestrator
 
 Validates and routes typed handoffs. A local OpenPodium command/IPC endpoint will allow agents to list peers, send tasks, report progress, and return responses. PTY text injection may be an adapter mechanism, but it is not the durable messaging protocol.

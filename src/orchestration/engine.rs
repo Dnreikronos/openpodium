@@ -4,11 +4,13 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::domain::{
     AgentId, AgentProgram, Content, DeliveryMechanism, DeliveryOutcome, DomainCommand, Handoff,
-    HandoffId, HandoffMessageId, HandoffPayload, HandoffProgress, HandoffResponse,
+    HandoffId, HandoffMessageId, HandoffOrigin, HandoffPayload, HandoffProgress, HandoffResponse,
     HandoffResponseStatus, HandoffTermination, Name, Task, TaskId, TaskState, Timestamp, Workspace,
     WorkspaceId,
 };
-use crate::ipc::{AcceptedMessage, HandoffKind, MessageId, ProtocolCommand, ResponseStatus};
+use crate::ipc::{
+    AcceptedMessage, HandoffKind, MessageId, MessagePeer, ProtocolCommand, ResponseStatus,
+};
 use crate::persistence::PersistenceError;
 use crate::workspaces::{WorkspaceError, WorkspaceManager};
 
@@ -109,7 +111,7 @@ impl Orchestrator {
             .recent_workspaces()
             .flat_map(|workspace| {
                 workspace.handoffs().flat_map(move |handoff| {
-                    delivery_message_ids(handoff)
+                    recovery_message_ids(handoff)
                         .into_iter()
                         .map(move |message_id| (workspace.id(), handoff.id(), message_id))
                 })
@@ -212,6 +214,7 @@ impl Orchestrator {
                 task_message_id,
                 *status,
                 body,
+                &BTreeMap::new(),
                 accepted_at,
             ),
             ProtocolCommand::RespondToHandoff {
@@ -219,6 +222,7 @@ impl Orchestrator {
                 handoff_message_id,
                 status,
                 body,
+                outputs,
             } => self.accept_response(
                 workspaces,
                 workspace_id,
@@ -227,6 +231,7 @@ impl Orchestrator {
                 handoff_message_id,
                 *status,
                 body,
+                outputs,
                 accepted_at,
             ),
             ProtocolCommand::CancelHandoff {
@@ -252,6 +257,37 @@ impl Orchestrator {
                 "agent-list and portal requests do not enter the orchestration queue".to_owned(),
             )),
         }
+    }
+
+    /// Queues delivery for a handoff the routine scheduler already persisted.
+    ///
+    /// The scheduler records the attempt, its task, and its handoff in one
+    /// journal batch before calling this, so there is nothing to validate or
+    /// create here; this only puts the prompt into the recipient's mailbox.
+    /// Agent-submitted handoffs must still go through [`Orchestrator::accept`],
+    /// which authenticates them.
+    pub fn submit_routine_handoff(
+        &mut self,
+        workspaces: &mut WorkspaceManager,
+        workspace_id: WorkspaceId,
+        handoff_id: HandoffId,
+        now: Timestamp,
+    ) -> Result<(), OrchestrationError> {
+        let handoff = handoff(workspaces, workspace_id, handoff_id)?;
+        if handoff.origin().run().is_none() {
+            return Err(OrchestrationError::InvalidMessage(format!(
+                "handoff {handoff_id} was not submitted by a routine"
+            )));
+        }
+        let message_id = handoff
+            .message_id()
+            .ok_or_else(|| {
+                OrchestrationError::InvalidMessage(format!(
+                    "routine handoff {handoff_id} has no message ID"
+                ))
+            })?
+            .clone();
+        self.enqueue(workspaces, workspace_id, handoff_id, &message_id, now)
     }
 
     pub fn cancel_task(
@@ -325,7 +361,7 @@ impl Orchestrator {
                 let handoff = Handoff::tracked(
                     handoff_id,
                     message_id.clone(),
-                    previous.source(),
+                    previous.origin(),
                     previous.recipient(),
                     HandoffPayload::Task(task_id),
                     None,
@@ -384,7 +420,7 @@ impl Orchestrator {
         let handoff = Handoff::tracked(
             retry_handoff_id,
             retry_message_id.clone(),
-            original_handoff.source(),
+            original_handoff.origin(),
             original_handoff.recipient(),
             HandoffPayload::Task(retry_task_id),
             None,
@@ -478,7 +514,7 @@ impl Orchestrator {
                 let handoff = Handoff::tracked(
                     handoff_id,
                     handoff_message_id.clone(),
-                    source,
+                    HandoffOrigin::Agent(source),
                     recipient,
                     payload.clone(),
                     parent,
@@ -492,7 +528,7 @@ impl Orchestrator {
                 let handoff = Handoff::tracked(
                     handoff_id,
                     handoff_message_id.clone(),
-                    source,
+                    HandoffOrigin::Agent(source),
                     recipient,
                     payload.clone(),
                     parent,
@@ -547,6 +583,9 @@ impl Orchestrator {
         {
             transition_task_running(workspaces, workspace_id, *task_id, accepted_at)?;
         }
+        if !notifies_origin(handoff(workspaces, workspace_id, handoff_id)?) {
+            return Ok(());
+        }
         self.enqueue(
             workspaces,
             workspace_id,
@@ -566,6 +605,7 @@ impl Orchestrator {
         handoff_message_id: &MessageId,
         status: ResponseStatus,
         body: &str,
+        outputs: &BTreeMap<String, String>,
         accepted_at: Timestamp,
     ) -> Result<(), OrchestrationError> {
         let root_id = domain_message_id(handoff_message_id)?;
@@ -580,18 +620,24 @@ impl Orchestrator {
             .is_none_or(|response| response.message_id() != &response_id)
         {
             let mut after = before.clone();
-            after.respond(HandoffResponse::new(
-                response_id.clone(),
-                response_status(status),
-                Content::new(body.to_owned())?,
-                accepted_at,
-            ))?;
+            after.respond(
+                HandoffResponse::new(
+                    response_id.clone(),
+                    response_status(status),
+                    Content::new(body.to_owned())?,
+                    accepted_at,
+                )
+                .with_outputs(domain_outputs(outputs)?),
+            )?;
             execute_handoff_update(workspaces, workspace_id, before, after, accepted_at)?;
         }
         if let HandoffPayload::Task(task_id) =
             handoff(workspaces, workspace_id, handoff_id)?.payload()
         {
             transition_task_response(workspaces, workspace_id, *task_id, status, accepted_at)?;
+        }
+        if !notifies_origin(handoff(workspaces, workspace_id, handoff_id)?) {
+            return Ok(());
         }
         self.enqueue(
             workspaces,
@@ -939,7 +985,7 @@ fn delivery_details(
         .find(|progress| progress.message_id() == message_id)
     {
         return Ok((
-            handoff.source(),
+            originating_agent(handoff)?,
             progress.reported_at(),
             prompt::progress(handoff, progress),
         ));
@@ -949,7 +995,7 @@ fn delivery_details(
         .filter(|response| response.message_id() == message_id)
     {
         return Ok((
-            handoff.source(),
+            originating_agent(handoff)?,
             response.responded_at(),
             prompt::response(handoff, response),
         ));
@@ -975,22 +1021,40 @@ fn delivery_details(
     )))
 }
 
+/// The messages of a handoff that still need delivering after a restart.
+///
+/// Work the routine scheduler dispatched is deliberately excluded once an
+/// attempt exists. That attempt's outcome is unknown, the scheduler marks its
+/// step interrupted, and pasting the prompt a second time would ask an agent
+/// that may already be working to start over. The scheduler re-submits it
+/// itself once a person confirms the previous run stopped.
+fn recovery_message_ids(handoff: &Handoff) -> Vec<HandoffMessageId> {
+    if handoff.origin().run().is_some() && !handoff.delivery_attempts().is_empty() {
+        return Vec::new();
+    }
+    delivery_message_ids(handoff)
+}
+
 fn delivery_message_ids(handoff: &Handoff) -> Vec<HandoffMessageId> {
     let mut messages = Vec::new();
     if handoff.termination().is_none() || handoff.is_delivered() {
         messages.extend(handoff.message_id().cloned());
     }
-    messages.extend(
-        handoff
-            .progress()
-            .iter()
-            .map(|progress| progress.message_id().clone()),
-    );
-    messages.extend(
-        handoff
-            .response()
-            .map(|response| response.message_id().clone()),
-    );
+    // Progress and responses travel back to the submitting agent. The routine
+    // scheduler has no terminal, so it reads them from durable state instead.
+    if handoff.source().is_some() {
+        messages.extend(
+            handoff
+                .progress()
+                .iter()
+                .map(|progress| progress.message_id().clone()),
+        );
+        messages.extend(
+            handoff
+                .response()
+                .map(|response| response.message_id().clone()),
+        );
+    }
     if let Some(HandoffTermination::Cancelled { message_id, .. }) = handoff.termination() {
         messages.push(message_id.clone());
     }
@@ -1020,17 +1084,58 @@ fn validate_routed_participants(
     message: &AcceptedMessage,
     from_recipient: bool,
 ) -> Result<(), OrchestrationError> {
-    let (sender, recipient) = if from_recipient {
-        (handoff.recipient(), handoff.source())
-    } else {
-        (handoff.source(), handoff.recipient())
+    let origin = match handoff.origin() {
+        crate::domain::HandoffOrigin::Agent(agent_id) => MessagePeer::Agent(agent_id.get()),
+        crate::domain::HandoffOrigin::Routine { .. } => MessagePeer::Routine,
     };
-    if message.sender_agent_id != sender.get() || message.recipient_agent_id != recipient.get() {
+    let recipient = MessagePeer::Agent(handoff.recipient().get());
+    let (expected_sender, expected_peer) = if from_recipient {
+        (recipient, origin)
+    } else {
+        (origin, recipient)
+    };
+    if expected_sender != MessagePeer::Agent(message.sender_agent_id)
+        || message.recipient != expected_peer
+    {
         return Err(OrchestrationError::InvalidMessage(
             "routed message participants do not match the handoff".to_owned(),
         ));
     }
     Ok(())
+}
+
+/// Whether progress and responses travel back to a terminal at all. The routine
+/// scheduler has none; it reads a completion from durable state instead.
+fn notifies_origin(handoff: &Handoff) -> bool {
+    handoff.source().is_some()
+}
+
+/// The agent a back-channel message is delivered to. Routine-submitted work
+/// has none: nothing is pasted into a terminal for the scheduler.
+fn originating_agent(handoff: &Handoff) -> Result<AgentId, OrchestrationError> {
+    handoff.source().ok_or_else(|| {
+        OrchestrationError::InvalidMessage(format!(
+            "handoff {} was submitted by a routine and has no agent to notify",
+            handoff.id()
+        ))
+    })
+}
+
+fn domain_outputs(
+    outputs: &BTreeMap<String, String>,
+) -> Result<
+    BTreeMap<crate::domain::RoutineOutputKey, crate::domain::RoutineValue>,
+    OrchestrationError,
+> {
+    outputs
+        .iter()
+        .map(|(key, value)| {
+            Ok((
+                crate::domain::RoutineOutputKey::new(key.clone())?,
+                crate::domain::RoutineValue::new(value.clone())?,
+            ))
+        })
+        .collect()
 }
 
 fn response_status(status: ResponseStatus) -> HandoffResponseStatus {
@@ -1301,6 +1406,7 @@ pub enum OrchestrationError {
     UnknownWorkspace(WorkspaceId),
     UnknownHandoff(String),
     UnsafeAdapter { agent_id: AgentId, program: String },
+    Routine(crate::domain::RoutineError),
     IdentifierExhausted(&'static str),
     TimeOverflow(&'static str),
     InvalidMessage(String),
@@ -1329,6 +1435,7 @@ impl Display for OrchestrationError {
                 formatter,
                 "agent {agent_id} uses {program}, which has no safe automatic prompt delivery"
             ),
+            Self::Routine(source) => source.fmt(formatter),
             Self::IdentifierExhausted(entity) => {
                 write!(formatter, "cannot allocate another {entity} identifier")
             }
@@ -1344,6 +1451,7 @@ impl Error for OrchestrationError {
             Self::Workspace(source) => Some(source),
             Self::Validation(source) => Some(source),
             Self::Handoff(source) => Some(source),
+            Self::Routine(source) => Some(source),
             Self::UnknownWorkspace(_)
             | Self::UnknownHandoff(_)
             | Self::UnsafeAdapter { .. }
@@ -1369,5 +1477,11 @@ impl From<crate::domain::ValidationError> for OrchestrationError {
 impl From<crate::domain::HandoffMutationError> for OrchestrationError {
     fn from(error: crate::domain::HandoffMutationError) -> Self {
         Self::Handoff(error)
+    }
+}
+
+impl From<crate::domain::RoutineError> for OrchestrationError {
+    fn from(error: crate::domain::RoutineError) -> Self {
+        Self::Routine(error)
     }
 }

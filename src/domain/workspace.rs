@@ -2,15 +2,17 @@
 mod floors;
 pub use floors::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     Agent, AgentId, CanvasLayout, ChatAttachment, ChatAttachmentId, ChatAuthor, ChatDraft,
     ChatMessage, ChatThread, ChatThreadId, CommandPreset, CommandPresetId, Connection,
     ConnectionId, ConnectionKind, Content, DomainCommand, DomainError, DomainEvent, EntityRef,
     EnvironmentProfile, EnvironmentProfileId, Handoff, HandoffId, HandoffPayload,
-    MAX_HANDOFF_DEPTH, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId, Task,
-    TaskId, TaskState, TimelineEvent, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
+    MAX_HANDOFF_DEPTH, Name, Node, NodeGroup, NodeGroupId, NodeId, NodeTarget, Role, RoleId,
+    Routine, RoutineId, RoutineOccurrenceKey, RoutineReservation, RoutineRun, RoutineRunId,
+    RoutineTriggerId, RoutineVersion, Task, TaskId, TaskState, TimelineEvent, WorkspaceDirectory,
+    WorkspaceIcon, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +71,8 @@ pub struct Workspace {
     nodes: BTreeMap<NodeId, Node>,
     groups: BTreeMap<NodeGroupId, NodeGroup>,
     connections: BTreeMap<ConnectionId, Connection>,
+    routines: BTreeMap<RoutineId, Routine>,
+    routine_runs: BTreeMap<RoutineRunId, RoutineRun>,
 }
 
 impl Workspace {
@@ -88,6 +92,8 @@ impl Workspace {
             nodes: BTreeMap::new(),
             groups: BTreeMap::new(),
             connections: BTreeMap::new(),
+            routines: BTreeMap::new(),
+            routine_runs: BTreeMap::new(),
         }
     }
 
@@ -157,6 +163,67 @@ impl Workspace {
 
     pub(crate) fn connections(&self) -> impl Iterator<Item = &Connection> {
         self.connections.values()
+    }
+
+    /// The largest task identifier in use, or zero. The routine scheduler
+    /// allocates from here without needing access to every task.
+    pub fn highest_task_id(&self) -> u64 {
+        self.tasks.keys().next_back().map_or(0, |id| id.get())
+    }
+
+    pub fn highest_handoff_id(&self) -> u64 {
+        self.handoffs.keys().next_back().map_or(0, |id| id.get())
+    }
+
+    pub fn routines(&self) -> impl Iterator<Item = &Routine> {
+        self.routines.values()
+    }
+
+    pub fn routine(&self, id: RoutineId) -> Option<&Routine> {
+        self.routines.get(&id)
+    }
+
+    pub fn routine_runs(&self) -> impl Iterator<Item = &RoutineRun> {
+        self.routine_runs.values()
+    }
+
+    pub fn routine_run(&self, id: RoutineRunId) -> Option<&RoutineRun> {
+        self.routine_runs.get(&id)
+    }
+
+    /// Runs that have not reached a terminal state, oldest first.
+    pub fn active_routine_runs(&self) -> impl Iterator<Item = &RoutineRun> {
+        self.routine_runs.values().filter(|run| run.is_active())
+    }
+
+    /// Every reservation currently held across all active runs. The scheduler
+    /// compares a candidate step's claims against this set before dispatching.
+    pub fn held_routine_reservations(&self) -> BTreeSet<RoutineReservation> {
+        self.routine_runs
+            .values()
+            .filter(|run| run.is_active())
+            .flat_map(RoutineRun::held_reservations)
+            .collect()
+    }
+
+    /// Whether the trigger already consumed this occurrence, in a run or in the
+    /// trigger's own firing record. Duplicate observations are common: a
+    /// filesystem watcher and a restart can both report the same change.
+    pub fn routine_occurrence_consumed(
+        &self,
+        trigger_id: RoutineTriggerId,
+        occurrence: &RoutineOccurrenceKey,
+    ) -> bool {
+        self.routine_runs
+            .values()
+            .any(|run| run.trigger_id() == Some(trigger_id) && run.occurrence() == Some(occurrence))
+            || self.routines.values().any(|routine| {
+                routine.trigger(trigger_id).is_some_and(|trigger| {
+                    trigger
+                        .last_firing()
+                        .is_some_and(|firing| firing.occurrence() == occurrence)
+                })
+            })
     }
 
     pub fn floors(&self) -> &Floors {
@@ -464,6 +531,100 @@ impl Workspace {
                         to,
                     }
                 }
+                DomainCommand::AddRoutine(routine) => DomainEvent::RoutineAdded(routine),
+                DomainCommand::AddRoutineVersion {
+                    routine_id,
+                    version,
+                } => DomainEvent::RoutineVersionAdded {
+                    routine_id,
+                    version,
+                },
+                DomainCommand::UpdateRoutine {
+                    routine_id,
+                    name,
+                    description,
+                } => {
+                    let routine = self
+                        .routines
+                        .get(&routine_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Routine(routine_id)))?;
+                    if routine.name() == &name && routine.description() == description.as_ref() {
+                        return Err(DomainError::UnchangedRoutine);
+                    }
+                    DomainEvent::RoutineChanged {
+                        routine_id,
+                        from_name: routine.name().clone(),
+                        to_name: name,
+                        from_description: routine.description().cloned(),
+                        to_description: description,
+                    }
+                }
+                DomainCommand::PutRoutineTrigger {
+                    routine_id,
+                    trigger,
+                } => {
+                    let routine = self
+                        .routines
+                        .get(&routine_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Routine(routine_id)))?;
+                    DomainEvent::RoutineTriggerChanged {
+                        routine_id,
+                        from: routine.trigger(trigger.id()).cloned(),
+                        to: trigger,
+                    }
+                }
+                DomainCommand::RemoveRoutineTrigger {
+                    routine_id,
+                    trigger_id,
+                } => {
+                    let trigger = self
+                        .routines
+                        .get(&routine_id)
+                        .and_then(|routine| routine.trigger(trigger_id))
+                        .ok_or(DomainError::EntityNotFound(EntityRef::RoutineTrigger(
+                            trigger_id,
+                        )))?;
+                    DomainEvent::RoutineTriggerRemoved {
+                        routine_id,
+                        trigger: trigger.clone(),
+                    }
+                }
+                DomainCommand::StartRoutineRun {
+                    run,
+                    firing,
+                    next_occurrence,
+                } => DomainEvent::RoutineRunStarted {
+                    run,
+                    firing,
+                    next_occurrence,
+                },
+                DomainCommand::SkipRoutineOccurrences {
+                    routine_id,
+                    trigger_id,
+                    skipped,
+                    next_occurrence,
+                } => DomainEvent::RoutineOccurrencesSkipped {
+                    routine_id,
+                    trigger_id,
+                    skipped,
+                    next_occurrence,
+                },
+                DomainCommand::AdvanceRoutineRun { run_id, transition } => {
+                    DomainEvent::RoutineRunAdvanced { run_id, transition }
+                }
+                DomainCommand::DispatchRoutineStep {
+                    run_id,
+                    step_id,
+                    attempt,
+                    task,
+                    handoff,
+                } => DomainEvent::RoutineStepDispatched {
+                    run_id,
+                    step_id,
+                    attempt,
+                    task,
+                    handoff,
+                },
             };
 
         self.apply(&event)?;
@@ -1060,8 +1221,323 @@ impl Workspace {
                     .expect("task existence was checked before mutation")
                     .set_state(*to);
             }
+            DomainEvent::RoutineAdded(routine) => {
+                self.ensure_absent(EntityRef::Routine(routine.id()))?;
+                for version in routine.versions() {
+                    self.validate_routine_version(version)?;
+                }
+                for trigger in routine.triggers() {
+                    if trigger.routine_id() != routine.id() {
+                        return Err(DomainError::InvalidReference {
+                            entity: EntityRef::RoutineTrigger(trigger.id()),
+                            field: "routine_id",
+                            target: EntityRef::Routine(routine.id()),
+                        });
+                    }
+                }
+                self.routines.insert(routine.id(), routine.clone());
+            }
+            DomainEvent::RoutineVersionAdded {
+                routine_id,
+                version,
+            } => {
+                if !self.routines.contains_key(routine_id) {
+                    return Err(DomainError::EntityNotFound(EntityRef::Routine(*routine_id)));
+                }
+                if version.routine_id() != *routine_id {
+                    return Err(DomainError::InvalidReference {
+                        entity: EntityRef::RoutineVersion(version.id()),
+                        field: "routine_id",
+                        target: EntityRef::Routine(*routine_id),
+                    });
+                }
+                self.validate_routine_version(version)?;
+                self.routines
+                    .get_mut(routine_id)
+                    .expect("routine existence was checked before mutation")
+                    .push_version(version.clone())?;
+            }
+            DomainEvent::RoutineChanged {
+                routine_id,
+                from_name,
+                to_name,
+                from_description,
+                to_description,
+            } => {
+                let routine = self
+                    .routines
+                    .get(routine_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Routine(*routine_id)))?;
+                if routine.name() != from_name || routine.description() != from_description.as_ref()
+                {
+                    return Err(DomainError::RoutineConflict(*routine_id));
+                }
+                self.routines
+                    .get_mut(routine_id)
+                    .expect("routine existence was checked before mutation")
+                    .set_appearance(to_name.clone(), to_description.clone());
+            }
+            DomainEvent::RoutineTriggerChanged {
+                routine_id,
+                from,
+                to,
+            } => {
+                let routine = self
+                    .routines
+                    .get(routine_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Routine(*routine_id)))?;
+                if to.routine_id() != *routine_id
+                    || from.as_ref().is_some_and(|t| t.id() != to.id())
+                {
+                    return Err(DomainError::InvalidReference {
+                        entity: EntityRef::RoutineTrigger(to.id()),
+                        field: "routine_id",
+                        target: EntityRef::Routine(*routine_id),
+                    });
+                }
+                if routine.trigger(to.id()) != from.as_ref() {
+                    return Err(DomainError::RoutineTriggerConflict(to.id()));
+                }
+                to.kind().validate()?;
+                self.routines
+                    .get_mut(routine_id)
+                    .expect("routine existence was checked before mutation")
+                    .put_trigger(to.clone());
+            }
+            DomainEvent::RoutineTriggerRemoved {
+                routine_id,
+                trigger,
+            } => {
+                let routine = self
+                    .routines
+                    .get(routine_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Routine(*routine_id)))?;
+                if routine.trigger(trigger.id()) != Some(trigger) {
+                    return Err(DomainError::RoutineTriggerConflict(trigger.id()));
+                }
+                self.routines
+                    .get_mut(routine_id)
+                    .expect("routine existence was checked before mutation")
+                    .remove_trigger(trigger.id());
+            }
+            DomainEvent::RoutineRunStarted {
+                run,
+                firing,
+                next_occurrence,
+            } => {
+                self.ensure_absent(EntityRef::RoutineRun(run.id()))?;
+                let routine =
+                    self.routines
+                        .get(&run.routine_id())
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Routine(
+                            run.routine_id(),
+                        )))?;
+                if routine.version(run.version_id()) != Some(run.pin().version()) {
+                    return Err(DomainError::RoutineRunMismatch {
+                        run_id: run.id(),
+                        routine_id: run.routine_id(),
+                    });
+                }
+                if let Some(active) = self
+                    .routine_runs
+                    .values()
+                    .find(|other| other.routine_id() == run.routine_id() && other.is_active())
+                {
+                    return Err(DomainError::RoutineRunAlreadyActive {
+                        routine_id: run.routine_id(),
+                        run_id: active.id(),
+                    });
+                }
+                for step in run.pin().version().steps() {
+                    let agent_id =
+                        run.pin()
+                            .agent(step.id())
+                            .ok_or(DomainError::InvalidRoutine(
+                                super::RoutineError::UnpinnedStepBinding { step_id: step.id() },
+                            ))?;
+                    self.ensure_reference(
+                        EntityRef::RoutineRun(run.id()),
+                        "agent",
+                        EntityRef::Agent(agent_id),
+                    )?;
+                }
+                match (run.trigger_id(), firing) {
+                    (Some(trigger_id), Some(firing)) => {
+                        let trigger =
+                            routine
+                                .trigger(trigger_id)
+                                .ok_or(DomainError::EntityNotFound(EntityRef::RoutineTrigger(
+                                    trigger_id,
+                                )))?;
+                        if run.occurrence() != Some(firing.occurrence())
+                            || !trigger.enabled()
+                            || self.routine_occurrence_consumed(trigger_id, firing.occurrence())
+                        {
+                            return Err(DomainError::RoutineOccurrenceConsumed { trigger_id });
+                        }
+                        let trigger = self
+                            .routines
+                            .get_mut(&run.routine_id())
+                            .and_then(|routine| routine.trigger_mut(trigger_id))
+                            .expect("trigger existence was checked before mutation");
+                        trigger.fire(firing.occurrence().clone(), firing.fired_at())?;
+                        trigger.set_schedule_next(*next_occurrence);
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(DomainError::RoutineRunMismatch {
+                            run_id: run.id(),
+                            routine_id: run.routine_id(),
+                        });
+                    }
+                }
+                self.routine_runs.insert(run.id(), run.clone());
+            }
+            DomainEvent::RoutineOccurrencesSkipped {
+                routine_id,
+                trigger_id,
+                skipped,
+                next_occurrence,
+            } => {
+                let trigger = self
+                    .routines
+                    .get_mut(routine_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Routine(*routine_id)))?
+                    .trigger_mut(*trigger_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::RoutineTrigger(
+                        *trigger_id,
+                    )))?;
+                trigger.skip(*skipped);
+                trigger.set_schedule_next(*next_occurrence);
+            }
+            DomainEvent::RoutineRunAdvanced { run_id, transition } => {
+                self.routine_runs
+                    .get_mut(run_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::RoutineRun(*run_id)))?
+                    .apply_transition(transition)?;
+            }
+            DomainEvent::RoutineStepDispatched {
+                run_id,
+                step_id,
+                attempt,
+                task,
+                handoff,
+            } => {
+                self.validate_routine_dispatch(*run_id, *step_id, attempt, task, handoff)?;
+                self.validate_new_task(task)?;
+                self.validate_new_handoff(handoff, Some(task))?;
+                self.routine_runs
+                    .get_mut(run_id)
+                    .expect("run existence was checked before mutation")
+                    .dispatch(*step_id, attempt.clone())?;
+                self.tasks.insert(task.id(), task.clone());
+                self.handoffs.insert(handoff.id(), handoff.clone());
+            }
         }
 
+        Ok(())
+    }
+
+    /// Reinstates a run from a snapshot. The run's own invariants were checked
+    /// when it was created and are rechecked by `RoutineRun::restore`; this
+    /// only revalidates the references that tie it to this workspace.
+    pub(crate) fn restore_routine_run(&mut self, run: RoutineRun) -> Result<(), DomainError> {
+        self.ensure_absent(EntityRef::RoutineRun(run.id()))?;
+        let routine = self
+            .routines
+            .get(&run.routine_id())
+            .ok_or(DomainError::EntityNotFound(EntityRef::Routine(
+                run.routine_id(),
+            )))?;
+        if routine.version(run.version_id()) != Some(run.pin().version()) {
+            return Err(DomainError::RoutineRunMismatch {
+                run_id: run.id(),
+                routine_id: run.routine_id(),
+            });
+        }
+        for step in run.pin().version().steps() {
+            let agent_id = run
+                .pin()
+                .agent(step.id())
+                .ok_or(DomainError::InvalidRoutine(
+                    super::RoutineError::UnpinnedStepBinding { step_id: step.id() },
+                ))?;
+            self.ensure_reference(
+                EntityRef::RoutineRun(run.id()),
+                "agent",
+                EntityRef::Agent(agent_id),
+            )?;
+        }
+        self.routine_runs.insert(run.id(), run);
+        Ok(())
+    }
+
+    /// Steps may only bind agents and floors this workspace actually has.
+    fn validate_routine_version(&self, version: &RoutineVersion) -> Result<(), DomainError> {
+        for step in version.steps() {
+            self.ensure_reference(
+                EntityRef::RoutineVersion(version.id()),
+                "agent_id",
+                EntityRef::Agent(step.agent_id()),
+            )?;
+            if let super::RoutineCheckoutClaim::Floor(floor) = step.claims().checkout()
+                && !self.floors.entries.contains_key(&floor)
+            {
+                return Err(DomainError::InvalidRoutine(
+                    super::RoutineError::UnpinnedStepCheckout { step_id: step.id() },
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The dispatch record, its task, and its handoff must describe the same
+    /// work, and no other run may hold a claim this attempt needs.
+    fn validate_routine_dispatch(
+        &self,
+        run_id: RoutineRunId,
+        step_id: super::RoutineStepId,
+        attempt: &super::RoutineAttempt,
+        task: &Task,
+        handoff: &Handoff,
+    ) -> Result<(), DomainError> {
+        let run = self
+            .routine_runs
+            .get(&run_id)
+            .ok_or(DomainError::EntityNotFound(EntityRef::RoutineRun(run_id)))?;
+        let mismatch = DomainError::RoutineStepTaskMismatch { run_id, step_id };
+        if attempt.task_id() != task.id()
+            || attempt.handoff_id() != handoff.id()
+            || handoff.payload() != &HandoffPayload::Task(task.id())
+            || handoff.origin() != (super::HandoffOrigin::Routine { run_id, step_id })
+            || handoff.recipient() != attempt.agent_id()
+            || task.assignee() != Some(attempt.agent_id())
+            || run.pin().agent(step_id) != Some(attempt.agent_id())
+            || run.pin().checkout(step_id) != Some(attempt.checkout())
+        {
+            return Err(mismatch);
+        }
+
+        let mut required = vec![
+            RoutineReservation::Agent(attempt.agent_id()),
+            RoutineReservation::Checkout(attempt.checkout().clone()),
+        ];
+        required.extend(attempt.resources().cloned().map(RoutineReservation::Named));
+        // The step being dispatched holds nothing yet, so every claim any
+        // active run holds — including a sibling step of this run — conflicts.
+        let held: BTreeSet<_> = self
+            .routine_runs
+            .values()
+            .filter(|other| other.is_active())
+            .flat_map(RoutineRun::held_reservations)
+            .collect();
+        if let Some(conflict) = required.iter().find(|claim| held.contains(claim)) {
+            return Err(DomainError::RoutineReservationHeld {
+                run_id,
+                step_id,
+                detail: conflict.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -1118,17 +1594,34 @@ impl Workspace {
         pending_task: Option<&Task>,
     ) -> Result<(), DomainError> {
         self.ensure_absent(EntityRef::Handoff(handoff.id()))?;
-        if handoff.source() == handoff.recipient() {
-            return Err(DomainError::SameHandoffParticipant {
-                handoff_id: handoff.id(),
-                agent_id: handoff.source(),
-            });
+        match handoff.origin() {
+            super::HandoffOrigin::Agent(source) => {
+                if source == handoff.recipient() {
+                    return Err(DomainError::SameHandoffParticipant {
+                        handoff_id: handoff.id(),
+                        agent_id: source,
+                    });
+                }
+                self.ensure_reference(
+                    EntityRef::Handoff(handoff.id()),
+                    "source",
+                    EntityRef::Agent(source),
+                )?;
+            }
+            super::HandoffOrigin::Routine { run_id, step_id } => {
+                let run = self
+                    .routine_runs
+                    .get(&run_id)
+                    .ok_or(DomainError::EntityNotFound(EntityRef::RoutineRun(run_id)))?;
+                if run.step(step_id).is_none() {
+                    return Err(DomainError::InvalidReference {
+                        entity: EntityRef::Handoff(handoff.id()),
+                        field: "origin",
+                        target: EntityRef::RoutineRun(run_id),
+                    });
+                }
+            }
         }
-        self.ensure_reference(
-            EntityRef::Handoff(handoff.id()),
-            "source",
-            EntityRef::Agent(handoff.source()),
-        )?;
         self.ensure_reference(
             EntityRef::Handoff(handoff.id()),
             "recipient",
@@ -1211,6 +1704,16 @@ impl Workspace {
             EntityRef::NodeGroup(id) => self.groups.contains_key(&id),
             EntityRef::Connection(id) => self.connections.contains_key(&id),
             EntityRef::TimelineEvent(_) => false,
+            EntityRef::Routine(id) => self.routines.contains_key(&id),
+            EntityRef::RoutineVersion(id) => self
+                .routines
+                .values()
+                .any(|routine| routine.version(id).is_some()),
+            EntityRef::RoutineTrigger(id) => self
+                .routines
+                .values()
+                .any(|routine| routine.trigger(id).is_some()),
+            EntityRef::RoutineRun(id) => self.routine_runs.contains_key(&id),
         }
     }
 

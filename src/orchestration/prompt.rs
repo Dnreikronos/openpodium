@@ -1,19 +1,30 @@
 use crate::domain::{Handoff, HandoffProgress, HandoffResponse, HandoffTermination, Task};
 
+/// How a prompt names the party that submitted the handoff. The routine
+/// scheduler is not an agent, so it is labelled by its run and step instead.
+fn origin_label(handoff: &Handoff) -> String {
+    match handoff.origin() {
+        crate::domain::HandoffOrigin::Agent(agent_id) => format!("agent {agent_id}"),
+        crate::domain::HandoffOrigin::Routine { run_id, step_id } => {
+            format!("routine run {run_id} step {step_id}")
+        }
+    }
+}
+
 pub(super) fn handoff(handoff: &Handoff, task: Option<&Task>) -> String {
     let id = handoff
         .message_id()
         .expect("orchestrated handoffs have message IDs");
     let body = match (handoff.payload(), task) {
         (crate::domain::HandoffPayload::Task(_), Some(task)) => format!(
-            "[OpenPodium task {id}]\nFrom agent {}\nTitle: {}\n\n{}\n\nUse `openpodium ipc progress report --handoff {id} --body <text>` for updates and `openpodium ipc respond --handoff {id} --status <completed|failed|blocked> --body <text>` when finished.",
-            handoff.source(),
+            "[OpenPodium task {id}]\nFrom {}\nTitle: {}\n\n{}\n\nUse `openpodium ipc progress report --handoff {id} --body <text>` for updates and `openpodium ipc respond --handoff {id} --status <completed|failed|blocked> --body <text>` when finished.",
+            origin_label(handoff),
             sanitize(task.title().as_str()),
             sanitize(task.prompt().as_str()),
         ),
         (crate::domain::HandoffPayload::Question(body), None) => format!(
-            "[OpenPodium question {id}]\nFrom agent {}\n\n{}\n\nReply with `openpodium ipc respond --handoff {id} --status completed --body <text>`.",
-            handoff.source(),
+            "[OpenPodium question {id}]\nFrom {}\n\n{}\n\nReply with `openpodium ipc respond --handoff {id} --status completed --body <text>`.",
+            origin_label(handoff),
             sanitize(body.as_str()),
         ),
         _ => "[OpenPodium] Invalid handoff payload".to_owned(),
@@ -49,11 +60,11 @@ pub(super) fn cancellation(handoff: &Handoff, termination: &HandoffTermination) 
         return "[OpenPodium] Handoff timed out".to_owned();
     };
     sanitize(&format!(
-        "[OpenPodium cancellation for {}]\nFrom agent {}\n\n{}",
+        "[OpenPodium cancellation for {}]\nFrom {}\n\n{}",
         handoff
             .message_id()
             .expect("orchestrated handoffs have message IDs"),
-        handoff.source(),
+        origin_label(handoff),
         reason.as_str(),
     ))
 }
@@ -69,7 +80,9 @@ fn sanitize(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{AgentId, Content, HandoffId, HandoffMessageId, HandoffPayload, Timestamp};
+    use crate::domain::{
+        AgentId, Content, HandoffId, HandoffMessageId, HandoffOrigin, HandoffPayload, Timestamp,
+    };
 
     use super::*;
 
@@ -78,7 +91,7 @@ mod tests {
         let tracked_handoff = Handoff::tracked(
             HandoffId::new(1),
             HandoffMessageId::new("question-1").unwrap(),
-            AgentId::new(1),
+            HandoffOrigin::Agent(AgentId::new(1)),
             AgentId::new(2),
             HandoffPayload::Question(Content::new("safe\u{1b}[31m text").unwrap()),
             None,

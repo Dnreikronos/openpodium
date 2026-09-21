@@ -32,7 +32,7 @@ const USAGE: &str = "Usage:
   openpodium ipc task send --to <agent-id> --title <title> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]
   openpodium ipc question send --to <agent-id> --body <text> [--parent <handoff-id>] [--timeout-ms <milliseconds>] [--message-id <id>]
   openpodium ipc progress report --handoff <message-id> --body <text> [--message-id <id>]
-  openpodium ipc respond --handoff <message-id> --status <completed|failed|blocked> --body <text> [--message-id <id>]
+  openpodium ipc respond --handoff <message-id> --status <completed|failed|blocked> --body <text> [--output <key>=<value>]... [--message-id <id>]
   openpodium ipc cancel --handoff <message-id> --reason <text> [--message-id <id>]";
 
 pub fn run_cli(arguments: impl IntoIterator<Item = String>) -> u8 {
@@ -301,7 +301,7 @@ fn parse_command(arguments: &[String]) -> Result<ProtocolCommand, CliUsageError>
             })
         }
         ["ipc", "respond", options @ ..] => {
-            let options = parse_options(
+            let (options, outputs) = parse_options_with_outputs(
                 options,
                 &["--handoff", "--status", "--body", "--message-id"],
             )?;
@@ -320,6 +320,7 @@ fn parse_command(arguments: &[String]) -> Result<ProtocolCommand, CliUsageError>
                 handoff_message_id: required_id(&options, "--handoff")?,
                 status,
                 body: required(&options, "--body")?.to_owned(),
+                outputs,
             })
         }
         ["ipc", "cancel", options @ ..] => {
@@ -334,8 +335,39 @@ fn parse_command(arguments: &[String]) -> Result<ProtocolCommand, CliUsageError>
     }
 }
 
+/// Splits repeatable `--output key=value` pairs out of the argument list so a
+/// routine step can return structured results alongside its body text.
+type ParsedOptions<'a> = (BTreeMap<&'a str, &'a str>, BTreeMap<String, String>);
+
+fn parse_options_with_outputs<'a>(
+    arguments: &[&'a str],
+    allowed: &[&str],
+) -> Result<ParsedOptions<'a>, CliUsageError> {
+    let mut remaining = Vec::new();
+    let mut outputs = BTreeMap::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "--output" {
+            let pair = arguments
+                .get(index + 1)
+                .ok_or_else(|| CliUsageError("--output requires a key=value pair".to_owned()))?;
+            let (key, value) = pair
+                .split_once('=')
+                .ok_or_else(|| CliUsageError("--output requires a key=value pair".to_owned()))?;
+            if outputs.insert(key.to_owned(), value.to_owned()).is_some() {
+                return Err(CliUsageError(format!("--output {key} was given twice")));
+            }
+            index += 2;
+            continue;
+        }
+        remaining.push(arguments[index]);
+        index += 1;
+    }
+    Ok((parse_options(&remaining, allowed)?, outputs))
+}
+
 fn parse_options<'a>(
-    arguments: &'a [&'a str],
+    arguments: &[&'a str],
     allowed: &[&str],
 ) -> Result<BTreeMap<&'a str, &'a str>, CliUsageError> {
     let mut parsed = BTreeMap::new();

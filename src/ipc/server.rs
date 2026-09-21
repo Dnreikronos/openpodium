@@ -77,11 +77,40 @@ impl fmt::Debug for ConnectionInfo {
     }
 }
 
+/// The other end of a routed message. Most messages travel between two
+/// authenticated agents; work the routine scheduler submitted has no peer
+/// agent, and naming that explicitly is safer than reserving an agent ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MessagePeer {
+    Agent(u64),
+    Routine,
+}
+
+impl MessagePeer {
+    pub const fn agent(self) -> Option<u64> {
+        match self {
+            Self::Agent(agent_id) => Some(agent_id),
+            Self::Routine => None,
+        }
+    }
+
+    pub(super) fn to_storage(self) -> String {
+        match self {
+            Self::Agent(agent_id) => agent_id.to_string(),
+            Self::Routine => ROUTINE_PEER_MARKER.to_owned(),
+        }
+    }
+}
+
+/// Stored in place of an agent ID for scheduler-submitted work. Agent IDs are
+/// decimal, so this can never collide with one.
+pub(super) const ROUTINE_PEER_MARKER: &str = "routine";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedMessage {
     pub workspace_id: u64,
     pub sender_agent_id: u64,
-    pub recipient_agent_id: u64,
+    pub recipient: MessagePeer,
     pub command: ProtocolCommand,
 }
 
@@ -351,6 +380,44 @@ impl IpcService {
     pub fn release(&self, message: &AcceptedMessage) {
         mutex_lock(&self.leased_messages).remove(&message_key(message));
     }
+
+    /// Publishes a handoff the routine scheduler dispatched, so the assigned
+    /// agent can report progress and return structured outputs against it.
+    ///
+    /// The record is inserted already processed: the scheduler delivered the
+    /// work itself, and re-queueing it would create a second handoff. Calling
+    /// this again with the same identity is a no-op, which is what recovery
+    /// after a crash between the journal write and this call needs.
+    pub fn register_routine_handoff(
+        &self,
+        workspace_id: u64,
+        message_id: &MessageId,
+        recipient_agent_id: u64,
+        title: &str,
+        body: &str,
+    ) -> Result<(), ServiceError> {
+        let command = ProtocolCommand::SendHandoff {
+            message_id: message_id.clone(),
+            recipient_agent_id,
+            kind: super::HandoffKind::Task,
+            title: Some(title.to_owned()),
+            body: body.to_owned(),
+            parent_message_id: None,
+            response_timeout_ms: None,
+        };
+        match mutex_lock(&self.messages).insert_routine_handoff(
+            workspace_id,
+            message_id,
+            recipient_agent_id,
+            &command,
+        )? {
+            InsertResult::Inserted | InsertResult::Duplicate => Ok(()),
+            InsertResult::Conflict => Err(ServiceError::RoutineHandoffConflict {
+                message_id: message_id.as_str().to_owned(),
+            }),
+            InsertResult::CapacityExhausted => Err(ServiceError::RoutineHandoffCapacity),
+        }
+    }
 }
 
 impl Drop for IpcService {
@@ -585,7 +652,9 @@ fn execute_command(
         .message(credentials.workspace_id, &message_id)
         .map_err(store_protocol_error)?
     {
-        if published.sender_agent_id == credentials.agent_id && published.command == command {
+        if published.origin == MessagePeer::Agent(credentials.agent_id)
+            && published.command == command
+        {
             return Ok(ProtocolResult::Accepted {
                 message_id,
                 duplicate: true,
@@ -597,35 +666,39 @@ fn execute_command(
         ));
     }
 
-    let recipient_agent_id = route_message(credentials, &command, &messages)?;
-    if recipient_agent_id == credentials.agent_id {
-        return Err(ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            "sender and recipient agents must be different",
-        ));
+    let recipient = route_message(credentials, &command, &messages)?;
+    // The routine scheduler is not an agent: it is never a visibility target
+    // and it negotiates no adapter capabilities.
+    if let Some(recipient_agent_id) = recipient.agent() {
+        if recipient_agent_id == credentials.agent_id {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "sender and recipient agents must be different",
+            ));
+        }
+        if !agent_is_visible(
+            &context.directory,
+            credentials.workspace_id,
+            recipient_agent_id,
+        ) {
+            return Err(ProtocolError::new(
+                ErrorCode::AgentNotVisible,
+                "recipient agent is not visible in the authenticated workspace",
+            ));
+        }
+        validate_capabilities(
+            &context.directory,
+            credentials.workspace_id,
+            credentials.agent_id,
+            recipient_agent_id,
+            &command,
+        )?;
     }
-    if !agent_is_visible(
-        &context.directory,
-        credentials.workspace_id,
-        recipient_agent_id,
-    ) {
-        return Err(ProtocolError::new(
-            ErrorCode::AgentNotVisible,
-            "recipient agent is not visible in the authenticated workspace",
-        ));
-    }
-    validate_capabilities(
-        &context.directory,
-        credentials.workspace_id,
-        credentials.agent_id,
-        recipient_agent_id,
-        &command,
-    )?;
 
     let accepted = AcceptedMessage {
         workspace_id: credentials.workspace_id,
         sender_agent_id: credentials.agent_id,
-        recipient_agent_id,
+        recipient,
         command: command.clone(),
     };
     match messages
@@ -874,11 +947,11 @@ fn route_message(
     credentials: &Credentials,
     command: &ProtocolCommand,
     messages: &MessageStore,
-) -> Result<u64, ProtocolError> {
+) -> Result<MessagePeer, ProtocolError> {
     match command {
         ProtocolCommand::SendTask {
             recipient_agent_id, ..
-        } => Ok(*recipient_agent_id),
+        } => Ok(MessagePeer::Agent(*recipient_agent_id)),
         ProtocolCommand::SendHandoff {
             recipient_agent_id,
             parent_message_id,
@@ -888,8 +961,8 @@ fn route_message(
                 let parent =
                     handoff_message(messages, credentials.workspace_id, parent_message_id)?
                         .filter(|parent| {
-                            parent.sender_agent_id == credentials.agent_id
-                                || parent.recipient_agent_id == credentials.agent_id
+                            parent.origin == MessagePeer::Agent(credentials.agent_id)
+                                || parent.recipient == MessagePeer::Agent(credentials.agent_id)
                         })
                         .ok_or_else(|| {
                             ProtocolError::new(
@@ -899,7 +972,7 @@ fn route_message(
                         })?;
                 let _ = parent;
             }
-            Ok(*recipient_agent_id)
+            Ok(MessagePeer::Agent(*recipient_agent_id))
         }
         ProtocolCommand::ReportProgress {
             task_message_id, ..
@@ -911,7 +984,7 @@ fn route_message(
                 .message(credentials.workspace_id, task_message_id)
                 .map_err(store_protocol_error)?
                 .filter(|message| {
-                    message.recipient_agent_id == credentials.agent_id
+                    message.recipient == MessagePeer::Agent(credentials.agent_id)
                         && matches!(message.command, ProtocolCommand::SendTask { .. })
                 })
                 .ok_or_else(|| {
@@ -920,7 +993,7 @@ fn route_message(
                         "task message does not identify a task assigned to this agent",
                     )
                 })?;
-            Ok(task.sender_agent_id)
+            Ok(task.origin)
         }
         ProtocolCommand::ReportHandoffProgress {
             handoff_message_id, ..
@@ -929,27 +1002,27 @@ fn route_message(
             handoff_message_id, ..
         } => {
             let handoff = handoff_message(messages, credentials.workspace_id, handoff_message_id)?
-                .filter(|message| message.recipient_agent_id == credentials.agent_id)
+                .filter(|message| message.recipient == MessagePeer::Agent(credentials.agent_id))
                 .ok_or_else(|| {
                     ProtocolError::new(
                         ErrorCode::InvalidRequest,
                         "handoff message does not identify work assigned to this agent",
                     )
                 })?;
-            Ok(handoff.sender_agent_id)
+            Ok(handoff.origin)
         }
         ProtocolCommand::CancelHandoff {
             handoff_message_id, ..
         } => {
             let handoff = handoff_message(messages, credentials.workspace_id, handoff_message_id)?
-                .filter(|message| message.sender_agent_id == credentials.agent_id)
+                .filter(|message| message.origin == MessagePeer::Agent(credentials.agent_id))
                 .ok_or_else(|| {
                     ProtocolError::new(
                         ErrorCode::InvalidRequest,
                         "only the originating agent can cancel a handoff",
                     )
                 })?;
-            Ok(handoff.recipient_agent_id)
+            Ok(handoff.recipient)
         }
         ProtocolCommand::ListAgents
         | ProtocolCommand::ListPortals
@@ -1053,6 +1126,10 @@ pub enum ServiceError {
         thread: &'static str,
         source: io::Error,
     },
+    RoutineHandoffConflict {
+        message_id: String,
+    },
+    RoutineHandoffCapacity,
 }
 
 impl Display for ServiceError {
@@ -1067,6 +1144,13 @@ impl Display for ServiceError {
             Self::Store(message) => formatter.write_str(message),
             Self::Portal(message) => formatter.write_str(message),
             Self::Bind(source) => write!(formatter, "failed to bind local IPC service: {source}"),
+            Self::RoutineHandoffConflict { message_id } => write!(
+                formatter,
+                "routine handoff {message_id} conflicts with a different stored message"
+            ),
+            Self::RoutineHandoffCapacity => {
+                formatter.write_str("the durable IPC message capacity is exhausted")
+            }
             Self::Configure(source) => {
                 write!(formatter, "failed to configure local IPC service: {source}")
             }
@@ -1085,7 +1169,10 @@ impl Error for ServiceError {
             | Self::Configure(source)
             | Self::Spawn { source, .. } => Some(source),
             Self::Authentication(source) => Some(source),
-            Self::Store(_) | Self::Portal(_) => None,
+            Self::Store(_)
+            | Self::Portal(_)
+            | Self::RoutineHandoffConflict { .. }
+            | Self::RoutineHandoffCapacity => None,
         }
     }
 }

@@ -4,7 +4,7 @@ use super::{
     AgentId, AgentState, CanvasNodeContent, CanvasPoint, CanvasSize, CommandPresetId, ConnectionId,
     Content, DeliveryAttempt, EnvironmentProfileId, HandoffId, HandoffMessageId, HandoffProgress,
     HandoffResponse, HandoffTermination, Name, NodeGroupId, NodeId, RoleColor, RoleIcon, RoleId,
-    TaskId, TaskState, Timestamp,
+    RoutineRunId, RoutineStepId, TaskId, TaskState, Timestamp,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,10 +227,38 @@ pub enum HandoffPayload {
     Question(Content),
 }
 
+/// Who submitted a handoff. Agents authenticate over IPC; the routine
+/// scheduler submits internally and has no agent identity of its own, so it is
+/// named explicitly rather than borrowing some agent's credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffOrigin {
+    Agent(AgentId),
+    Routine {
+        run_id: RoutineRunId,
+        step_id: RoutineStepId,
+    },
+}
+
+impl HandoffOrigin {
+    pub const fn agent(self) -> Option<AgentId> {
+        match self {
+            Self::Agent(agent_id) => Some(agent_id),
+            Self::Routine { .. } => None,
+        }
+    }
+
+    pub const fn run(self) -> Option<(RoutineRunId, RoutineStepId)> {
+        match self {
+            Self::Routine { run_id, step_id } => Some((run_id, step_id)),
+            Self::Agent(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handoff {
     pub(super) id: HandoffId,
-    pub(super) source: AgentId,
+    pub(super) origin: HandoffOrigin,
     pub(super) recipient: AgentId,
     pub(super) payload: HandoffPayload,
     pub(super) message_id: Option<HandoffMessageId>,
@@ -250,9 +278,18 @@ impl Handoff {
         recipient: AgentId,
         payload: HandoffPayload,
     ) -> Self {
+        Self::with_origin(id, HandoffOrigin::Agent(source), recipient, payload)
+    }
+
+    pub const fn with_origin(
+        id: HandoffId,
+        origin: HandoffOrigin,
+        recipient: AgentId,
+        payload: HandoffPayload,
+    ) -> Self {
         Self {
             id,
-            source,
+            origin,
             recipient,
             payload,
             message_id: None,
@@ -270,8 +307,13 @@ impl Handoff {
         self.id
     }
 
-    pub const fn source(&self) -> AgentId {
-        self.source
+    pub const fn origin(&self) -> HandoffOrigin {
+        self.origin
+    }
+
+    /// The submitting agent, or `None` when the routine scheduler submitted it.
+    pub const fn source(&self) -> Option<AgentId> {
+        self.origin.agent()
     }
 
     pub const fn recipient(&self) -> AgentId {

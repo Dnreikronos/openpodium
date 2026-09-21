@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{AcceptedMessage, MessageId, ProtocolCommand};
+use super::server::ROUTINE_PEER_MARKER;
+use super::{AcceptedMessage, MessageId, MessagePeer, ProtocolCommand};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -16,8 +17,10 @@ pub(super) struct MessageStore {
 
 #[derive(Debug)]
 pub(super) struct StoredMessage {
-    pub sender_agent_id: u64,
-    pub recipient_agent_id: u64,
+    /// Who submitted the message: an authenticated agent, or the routine
+    /// scheduler for work it dispatched internally.
+    pub origin: MessagePeer,
+    pub recipient: MessagePeer,
     pub command: ProtocolCommand,
 }
 
@@ -80,8 +83,8 @@ impl MessageStore {
             .map_err(|source| StoreError::database("read message", source))?
             .map(|(sender, recipient, command)| {
                 Ok(StoredMessage {
-                    sender_agent_id: parse_id(&sender, "sender agent")?,
-                    recipient_agent_id: parse_id(&recipient, "recipient agent")?,
+                    origin: parse_peer(&sender)?,
+                    recipient: parse_peer(&recipient)?,
                     command: serde_json::from_str(&command).map_err(StoreError::Decode)?,
                 })
             })
@@ -99,8 +102,8 @@ impl MessageStore {
             .expect("accepted messages always have an ID");
         if let Some(existing) = self.message(message.workspace_id, message_id)? {
             return Ok(
-                if existing.sender_agent_id == message.sender_agent_id
-                    && existing.recipient_agent_id == message.recipient_agent_id
+                if existing.origin == MessagePeer::Agent(message.sender_agent_id)
+                    && existing.recipient == message.recipient
                     && existing.command == message.command
                 {
                     InsertResult::Duplicate
@@ -127,17 +130,60 @@ impl MessageStore {
             .execute(
                 "INSERT INTO ipc_messages (
                     workspace_id, message_id, sender_agent_id,
-                    recipient_agent_id, command_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    recipient_agent_id, command_json, processed
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     message.workspace_id.to_string(),
                     message_id.as_str(),
                     message.sender_agent_id.to_string(),
-                    message.recipient_agent_id.to_string(),
+                    message.recipient.to_storage(),
                     command,
+                    0_i64,
                 ],
             )
             .map_err(|source| StoreError::database("insert message", source))?;
+        Ok(InsertResult::Inserted)
+    }
+
+    /// Records work the routine scheduler submitted internally. The row exists
+    /// only so the assigned agent's completion can be routed back to its
+    /// handoff, so it is stored as already processed: the scheduler dispatched
+    /// the work itself instead of queueing it for the orchestrator.
+    pub fn insert_routine_handoff(
+        &mut self,
+        workspace_id: u64,
+        message_id: &MessageId,
+        recipient_agent_id: u64,
+        command: &ProtocolCommand,
+    ) -> Result<InsertResult, StoreError> {
+        if let Some(existing) = self.message(workspace_id, message_id)? {
+            return Ok(
+                if existing.origin == MessagePeer::Routine
+                    && existing.recipient == MessagePeer::Agent(recipient_agent_id)
+                    && &existing.command == command
+                {
+                    InsertResult::Duplicate
+                } else {
+                    InsertResult::Conflict
+                },
+            );
+        }
+        let encoded = serde_json::to_string(command).map_err(StoreError::Encode)?;
+        self.connection
+            .execute(
+                "INSERT INTO ipc_messages (
+                    workspace_id, message_id, sender_agent_id,
+                    recipient_agent_id, command_json, processed
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                params![
+                    workspace_id.to_string(),
+                    message_id.as_str(),
+                    MessagePeer::Routine.to_storage(),
+                    MessagePeer::Agent(recipient_agent_id).to_storage(),
+                    encoded,
+                ],
+            )
+            .map_err(|source| StoreError::database("insert routine handoff", source))?;
         Ok(InsertResult::Inserted)
     }
 
@@ -180,7 +226,7 @@ impl MessageStore {
             return Ok(Some(AcceptedMessage {
                 workspace_id,
                 sender_agent_id: parse_id(&sender, "sender agent")?,
-                recipient_agent_id: parse_id(&recipient, "recipient agent")?,
+                recipient: parse_peer(&recipient)?,
                 command: serde_json::from_str(&command).map_err(StoreError::Decode)?,
             }));
         }
@@ -202,6 +248,13 @@ impl MessageStore {
             .map(|updated| updated == 1)
             .map_err(|source| StoreError::database("mark message processed", source))
     }
+}
+
+fn parse_peer(value: &str) -> Result<MessagePeer, StoreError> {
+    if value == ROUTINE_PEER_MARKER {
+        return Ok(MessagePeer::Routine);
+    }
+    parse_id(value, "recipient agent").map(MessagePeer::Agent)
 }
 
 fn parse_id(value: &str, field: &'static str) -> Result<u64, StoreError> {

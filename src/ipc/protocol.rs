@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 
@@ -10,6 +11,9 @@ const MAX_TITLE_CHARS: usize = 255;
 const MAX_BODY_CHARS: usize = 32_768;
 const MAX_PORTAL_TARGET_CHARS: usize = 2_048;
 const MAX_PORTAL_ELEMENT_CHARS: usize = 256;
+const MAX_OUTPUT_KEY_CHARS: usize = 64;
+const MAX_OUTPUT_VALUE_CHARS: usize = 16_384;
+const MAX_OUTPUTS: usize = 64;
 pub(crate) const MAX_PORTAL_FRAME_CHUNK_BYTES: u32 = 512 * 1024;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -165,6 +169,10 @@ pub enum ProtocolCommand {
         handoff_message_id: MessageId,
         status: ResponseStatus,
         body: String,
+        /// Structured results a routine step binds to its declared outputs.
+        /// Absent for ordinary agent-to-agent handoffs.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        outputs: BTreeMap<String, String>,
     },
     CancelHandoff {
         message_id: MessageId,
@@ -193,12 +201,15 @@ impl ProtocolCommand {
         }
     }
 
-    pub const fn minimum_version(&self) -> u16 {
+    pub fn minimum_version(&self) -> u16 {
         match self {
             Self::ListAgents
             | Self::SendTask { .. }
             | Self::ReportProgress { .. }
             | Self::Respond { .. } => 1,
+            // Structured outputs are the only part of a response that needs a
+            // newer client; a plain completion stays on version 2.
+            Self::RespondToHandoff { outputs, .. } if !outputs.is_empty() => 4,
             Self::SendHandoff { .. }
             | Self::ReportHandoffProgress { .. }
             | Self::RespondToHandoff { .. }
@@ -295,15 +306,42 @@ impl ProtocolCommand {
             }
             Self::ReportProgress { body, .. }
             | Self::Respond { body, .. }
-            | Self::ReportHandoffProgress { body, .. }
-            | Self::RespondToHandoff { body, .. } => {
+            | Self::ReportHandoffProgress { body, .. } => {
                 validate_text(body, MAX_BODY_CHARS, "message body")
+            }
+            Self::RespondToHandoff { body, outputs, .. } => {
+                validate_text(body, MAX_BODY_CHARS, "message body")?;
+                validate_outputs(outputs)
             }
             Self::CancelHandoff { reason, .. } => {
                 validate_text(reason, MAX_BODY_CHARS, "cancellation reason")
             }
         }
     }
+}
+
+/// Output keys use the same restricted alphabet as message identifiers so they
+/// round-trip through the journal and the routine model without escaping.
+fn validate_outputs(outputs: &BTreeMap<String, String>) -> Result<(), ProtocolValidationError> {
+    if outputs.len() > MAX_OUTPUTS {
+        return Err(ProtocolValidationError::TooManyOutputs { max: MAX_OUTPUTS });
+    }
+    for (key, value) in outputs {
+        if key.is_empty()
+            || key.chars().count() > MAX_OUTPUT_KEY_CHARS
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ProtocolValidationError::InvalidOutputKey);
+        }
+        if value.chars().count() > MAX_OUTPUT_VALUE_CHARS {
+            return Err(ProtocolValidationError::OutputValueTooLong {
+                max_chars: MAX_OUTPUT_VALUE_CHARS,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -687,6 +725,13 @@ pub enum ProtocolValidationError {
     MissingTaskTitle,
     UnexpectedQuestionTitle,
     InvalidResponseTimeout,
+    InvalidOutputKey,
+    TooManyOutputs {
+        max: usize,
+    },
+    OutputValueTooLong {
+        max_chars: usize,
+    },
     EmptyText {
         field: &'static str,
     },
@@ -723,6 +768,15 @@ impl Display for ProtocolValidationError {
             }
             Self::InvalidResponseTimeout => {
                 formatter.write_str("response timeout must be greater than zero")
+            }
+            Self::InvalidOutputKey => formatter.write_str(
+                "output key must contain 1 to 64 ASCII letters, digits, dots, dashes, or underscores",
+            ),
+            Self::TooManyOutputs { max } => {
+                write!(formatter, "a response cannot carry more than {max} outputs")
+            }
+            Self::OutputValueTooLong { max_chars } => {
+                write!(formatter, "output values cannot exceed {max_chars} characters")
             }
             Self::EmptyText { field } => write!(formatter, "{field} cannot be empty"),
             Self::TextTooLong { field, max_chars } => {

@@ -627,7 +627,7 @@ fn typed_task_handoffs_record_atomic_delivery_progress_and_response() {
     let handoff = Handoff::tracked(
         HandoffId::new(1),
         HandoffMessageId::new("task-1").unwrap(),
-        AgentId::new(1),
+        HandoffOrigin::Agent(AgentId::new(1)),
         AgentId::new(2),
         HandoffPayload::Task(task.id()),
         None,
@@ -733,7 +733,7 @@ fn task_cancellation_does_not_mutate_the_handoff_when_the_transition_is_invalid(
     let handoff = Handoff::tracked(
         HandoffId::new(1),
         HandoffMessageId::new("task-1").unwrap(),
-        AgentId::new(1),
+        HandoffOrigin::Agent(AgentId::new(1)),
         AgentId::new(2),
         HandoffPayload::Task(task_id),
         None,
@@ -802,7 +802,7 @@ fn handoff_updates_reject_combined_transitions_and_bound_parent_chains() {
         let handoff = Handoff::tracked(
             id,
             HandoffMessageId::new(format!("question-{raw_id}")).unwrap(),
-            AgentId::new(source),
+            HandoffOrigin::Agent(AgentId::new(source)),
             AgentId::new(recipient),
             HandoffPayload::Question(content("Ask back")),
             parent,
@@ -819,7 +819,7 @@ fn handoff_updates_reject_combined_transitions_and_bound_parent_chains() {
     let too_deep = Handoff::tracked(
         HandoffId::new(17),
         HandoffMessageId::new("question-17").unwrap(),
-        AgentId::new(1),
+        HandoffOrigin::Agent(AgentId::new(1)),
         AgentId::new(2),
         HandoffPayload::Question(content("One too many")),
         parent,
@@ -1046,6 +1046,245 @@ fn adding_an_agent_and_its_node_is_atomic() {
             .is_err()
     );
     assert_eq!(workspace, before);
+}
+
+// Routine version validation. A stored version is executed unchanged for the
+// life of every run that pinned it, so a bad graph must be refused up front.
+
+fn routine_step(
+    id: u64,
+    depends_on: Vec<u64>,
+    bindings: Vec<(&str, RoutineBindingSource)>,
+    outputs: Vec<&str>,
+) -> RoutineStep {
+    RoutineStep::new(
+        RoutineStepId::new(id),
+        name(&format!("Step {id}")),
+        AgentId::new(1),
+        content("Work"),
+        depends_on.into_iter().map(RoutineStepId::new),
+        bindings
+            .into_iter()
+            .map(|(key, source)| (RoutineInputKey::new(key).unwrap(), source)),
+        outputs
+            .into_iter()
+            .map(|key| RoutineOutputKey::new(key).unwrap()),
+        RoutineApproval::NotRequired,
+        RoutineRetryPolicy::default(),
+        RoutineStepClaims::default(),
+    )
+    .unwrap()
+}
+
+fn routine_version(steps: Vec<RoutineStep>) -> Result<RoutineVersion, RoutineError> {
+    RoutineVersion::new(
+        RoutineVersionId::new(1),
+        RoutineId::new(1),
+        1,
+        Vec::new(),
+        steps,
+        None,
+        Timestamp::from_unix_millis(1),
+    )
+}
+
+#[test]
+fn routine_versions_reject_dependency_cycles() {
+    let cycle = routine_version(vec![
+        routine_step(1, vec![2], Vec::new(), Vec::new()),
+        routine_step(2, vec![1], Vec::new(), Vec::new()),
+    ]);
+    assert!(matches!(cycle, Err(RoutineError::DependencyCycle { .. })));
+
+    let self_cycle = RoutineStep::new(
+        RoutineStepId::new(1),
+        name("Step"),
+        AgentId::new(1),
+        content("Work"),
+        [RoutineStepId::new(1)],
+        [],
+        [],
+        RoutineApproval::NotRequired,
+        RoutineRetryPolicy::default(),
+        RoutineStepClaims::default(),
+    );
+    assert!(matches!(
+        self_cycle,
+        Err(RoutineError::DependencyCycle { .. })
+    ));
+}
+
+#[test]
+fn routine_versions_reject_invalid_output_references() {
+    let undeclared = routine_version(vec![
+        routine_step(1, Vec::new(), Vec::new(), Vec::new()),
+        routine_step(
+            2,
+            vec![1],
+            vec![(
+                "report",
+                RoutineBindingSource::StepOutput {
+                    step_id: RoutineStepId::new(1),
+                    key: RoutineOutputKey::new("finding").unwrap(),
+                },
+            )],
+            Vec::new(),
+        ),
+    ]);
+    assert!(matches!(
+        undeclared,
+        Err(RoutineError::UndeclaredOutputReference { .. })
+    ));
+
+    // Reading an output without depending on the step that produces it has no
+    // guaranteed ordering, so it is rejected even though the output exists.
+    let unordered = routine_version(vec![
+        routine_step(1, Vec::new(), Vec::new(), vec!["finding"]),
+        routine_step(
+            2,
+            Vec::new(),
+            vec![(
+                "report",
+                RoutineBindingSource::StepOutput {
+                    step_id: RoutineStepId::new(1),
+                    key: RoutineOutputKey::new("finding").unwrap(),
+                },
+            )],
+            Vec::new(),
+        ),
+    ]);
+    assert!(matches!(
+        unordered,
+        Err(RoutineError::UnorderedOutputReference { .. })
+    ));
+
+    let missing_dependency =
+        routine_version(vec![routine_step(1, vec![9], Vec::new(), Vec::new())]);
+    assert!(matches!(
+        missing_dependency,
+        Err(RoutineError::UnknownDependency { .. })
+    ));
+}
+
+#[test]
+fn routine_versions_accept_a_diamond_and_order_it() {
+    let version = routine_version(vec![
+        routine_step(1, Vec::new(), Vec::new(), vec!["seed"]),
+        routine_step(
+            2,
+            vec![1],
+            vec![(
+                "seed",
+                RoutineBindingSource::StepOutput {
+                    step_id: RoutineStepId::new(1),
+                    key: RoutineOutputKey::new("seed").unwrap(),
+                },
+            )],
+            Vec::new(),
+        ),
+        routine_step(3, vec![1], Vec::new(), Vec::new()),
+        routine_step(
+            4,
+            vec![2, 3],
+            vec![(
+                "seed",
+                RoutineBindingSource::StepOutput {
+                    step_id: RoutineStepId::new(1),
+                    key: RoutineOutputKey::new("seed").unwrap(),
+                },
+            )],
+            Vec::new(),
+        ),
+    ])
+    .unwrap();
+    assert_eq!(version.steps().len(), 4);
+}
+
+#[test]
+fn routine_prompts_must_bind_every_placeholder() {
+    let unbound = routine_version(vec![
+        RoutineStep::new(
+            RoutineStepId::new(1),
+            name("Step"),
+            AgentId::new(1),
+            content("Build {{target}}"),
+            [],
+            [],
+            [],
+            RoutineApproval::NotRequired,
+            RoutineRetryPolicy::default(),
+            RoutineStepClaims::default(),
+        )
+        .unwrap(),
+    ]);
+    assert!(matches!(
+        unbound,
+        Err(RoutineError::UnboundPlaceholder { .. })
+    ));
+}
+
+#[test]
+fn editing_a_routine_appends_a_version_instead_of_replacing_one() {
+    let first = routine_version(vec![routine_step(1, Vec::new(), Vec::new(), Vec::new())]).unwrap();
+    let mut routine =
+        Routine::new(RoutineId::new(1), name("Nightly"), None, first.clone()).unwrap();
+    let second = RoutineVersion::new(
+        RoutineVersionId::new(2),
+        RoutineId::new(1),
+        2,
+        Vec::new(),
+        vec![routine_step(1, Vec::new(), Vec::new(), Vec::new())],
+        None,
+        Timestamp::from_unix_millis(2),
+    )
+    .unwrap();
+    routine.push_version(second).unwrap();
+
+    assert_eq!(routine.versions().len(), 2);
+    assert_eq!(routine.latest_version().number(), 2);
+    assert_eq!(
+        routine.version(RoutineVersionId::new(1)),
+        Some(&first),
+        "an earlier version stays byte-for-byte available to the runs that pinned it"
+    );
+
+    // Numbering must follow the stored history.
+    let out_of_order = RoutineVersion::new(
+        RoutineVersionId::new(3),
+        RoutineId::new(1),
+        5,
+        Vec::new(),
+        vec![routine_step(1, Vec::new(), Vec::new(), Vec::new())],
+        None,
+        Timestamp::from_unix_millis(3),
+    )
+    .unwrap();
+    assert!(matches!(
+        routine.push_version(out_of_order),
+        Err(RoutineError::InvalidVersionNumber { .. })
+    ));
+}
+
+#[test]
+fn schedule_occurrences_follow_the_stored_timezone_offset() {
+    let cadence = RoutineCadence::Daily {
+        hour: 9,
+        minute: 30,
+    };
+    let day = 86_400_000_u64;
+    // 00:00 UTC on 1970-01-02, in a zone two hours ahead of UTC.
+    let from = Timestamp::from_unix_millis(day);
+    let next = cadence.next_occurrence(from, 120).unwrap();
+    assert_eq!(
+        next.as_unix_millis(),
+        day + 7 * 3_600_000 + 30 * 60_000,
+        "09:30 local in UTC+2 is 07:30 UTC"
+    );
+    assert!(cadence.next_occurrence(next, 120).unwrap() == next);
+    let following = cadence
+        .next_occurrence(Timestamp::from_unix_millis(next.as_unix_millis() + 1), 120)
+        .unwrap();
+    assert_eq!(following.as_unix_millis(), next.as_unix_millis() + day);
 }
 
 fn test_workspace() -> Workspace {

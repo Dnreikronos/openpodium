@@ -3,6 +3,7 @@ mod canvas;
 mod chat;
 mod navigation_panel;
 mod notifications;
+mod routines_panel;
 mod terminal;
 mod timeline_panel;
 

@@ -350,6 +350,10 @@ pub struct ImportPreview {
 pub struct PortableImport {
     pub commands: Vec<DomainCommand>,
     pub preview: ImportPreview,
+    /// The agent each symbolic document identifier became. Callers that must
+    /// keep a durable binding to an instantiated arrangement — a routine run,
+    /// for one — need this to follow the fresh identifiers.
+    pub agents: BTreeMap<String, AgentId>,
 }
 
 pub fn export_template(
@@ -362,17 +366,6 @@ pub fn export_template(
         return Err(PortableError::EmptySelection);
     }
 
-    let origin = layout
-        .nodes()
-        .iter()
-        .filter(|node| selected.contains(&node.id()))
-        .map(Node::position)
-        .map(PointV1::from)
-        .reduce(|left, right| PointV1 {
-            x: left.x.min(right.x),
-            y: left.y.min(right.y),
-        })
-        .ok_or(PortableError::EmptySelection)?;
     let layout = CanvasLayout::new(
         layout
             .nodes()
@@ -395,6 +388,22 @@ pub fn export_template(
             .cloned()
             .collect(),
     );
+    let portable_handoffs = workspace
+        .handoffs()
+        .filter(|handoff| handoff.source().is_some())
+        .map(|handoff| handoff.id())
+        .collect();
+    let layout = without_handoff_nodes(&layout, &portable_handoffs);
+    let origin = layout
+        .nodes()
+        .iter()
+        .map(Node::position)
+        .map(PointV1::from)
+        .reduce(|left, right| PointV1 {
+            x: left.x.min(right.x),
+            y: left.y.min(right.y),
+        })
+        .ok_or(PortableError::EmptySelection)?;
 
     let references = referenced_entities(workspace, &layout)?;
     let body = build_body(workspace, &layout, references, Some(origin))?;
@@ -422,12 +431,21 @@ pub fn decode_template(payload: &str) -> Result<TemplateDocumentV1, PortableErro
 }
 
 pub fn export_workspace_archive(workspace: &Workspace) -> Result<String, PortableError> {
-    let layout = workspace.all_canvas_layout();
+    // A handoff the routine scheduler submitted is an execution record of one
+    // run, not reusable workspace structure: it names a run and step that the
+    // destination has no counterpart for. The tasks it produced are ordinary
+    // tasks and still travel, so nothing a person authored is lost.
+    let handoffs: BTreeSet<_> = workspace
+        .handoffs()
+        .filter(|handoff| handoff.source().is_some())
+        .map(|handoff| handoff.id())
+        .collect();
+    let layout = without_handoff_nodes(&workspace.all_canvas_layout(), &handoffs);
     let references = ReferencedEntities {
         roles: workspace.roles().map(|role| role.id()).collect(),
         agents: workspace.agents().map(|agent| agent.id()).collect(),
         tasks: workspace.tasks().map(|task| task.id()).collect(),
-        handoffs: workspace.handoffs().map(|handoff| handoff.id()).collect(),
+        handoffs,
     };
     let body = build_body(workspace, &layout, references, None)?;
     let archive = WorkspaceArchiveV1 {
@@ -536,7 +554,7 @@ pub fn import_template_with_mappings(
     validate_template(document)?;
     let preview = preview_template_import(document, workspace)?;
     ensure_launchers_resolved(&preview, workspace, launcher_mappings)?;
-    let commands = build_commands(
+    let (commands, agents) = build_commands(
         workspace,
         &document.template.roles,
         &document.template.agents,
@@ -548,7 +566,11 @@ pub fn import_template_with_mappings(
         path_mappings,
         None,
     )?;
-    Ok(PortableImport { commands, preview })
+    Ok(PortableImport {
+        commands,
+        preview,
+        agents,
+    })
 }
 
 pub fn import_workspace_archive(
@@ -568,7 +590,7 @@ pub fn import_workspace_archive_with_mappings(
     validate_archive(archive)?;
     let preview = preview_workspace_archive_import(archive, workspace)?;
     ensure_launchers_resolved(&preview, workspace, launcher_mappings)?;
-    let commands = build_commands(
+    let (commands, agents) = build_commands(
         workspace,
         &archive.archive.roles,
         &archive.archive.agents,
@@ -580,7 +602,11 @@ pub fn import_workspace_archive_with_mappings(
         path_mappings,
         Some(&archive.archive.settings),
     )?;
-    Ok(PortableImport { commands, preview })
+    Ok(PortableImport {
+        commands,
+        preview,
+        agents,
+    })
 }
 
 fn encode<T: Serialize>(document: &T) -> Result<String, PortableError> {
@@ -715,7 +741,7 @@ fn referenced_entities(
                     let handoff = workspace
                         .handoff(id)
                         .ok_or_else(|| PortableError::MissingReference(format!("handoff {id}")))?;
-                    pending.push(NodeTarget::Agent(handoff.source()));
+                    pending.extend(handoff.source().map(NodeTarget::Agent));
                     pending.push(NodeTarget::Agent(handoff.recipient()));
                     if let HandoffPayload::Task(task_id) = handoff.payload() {
                         pending.push(NodeTarget::Task(*task_id));
@@ -725,6 +751,44 @@ fn referenced_entities(
         }
     }
     Ok(references)
+}
+
+/// Drops canvas nodes that point at a handoff the export is not carrying, and
+/// the connections that touched them, so the document stays self-consistent.
+fn without_handoff_nodes(layout: &CanvasLayout, kept: &BTreeSet<HandoffId>) -> CanvasLayout {
+    let dropped: BTreeSet<NodeId> = layout
+        .nodes()
+        .iter()
+        .filter(
+            |node| matches!(node.reference(), Some(NodeTarget::Handoff(id)) if !kept.contains(&id)),
+        )
+        .map(Node::id)
+        .collect();
+    if dropped.is_empty() {
+        return layout.clone();
+    }
+    CanvasLayout::new(
+        layout
+            .nodes()
+            .iter()
+            .filter(|node| !dropped.contains(&node.id()))
+            .cloned()
+            .collect(),
+        layout
+            .groups()
+            .iter()
+            .filter(|group| group.members().all(|node| !dropped.contains(&node)))
+            .cloned()
+            .collect(),
+        layout
+            .connections()
+            .iter()
+            .filter(|connection| {
+                !dropped.contains(&connection.source()) && !dropped.contains(&connection.target())
+            })
+            .cloned()
+            .collect(),
+    )
 }
 
 fn build_body(
@@ -825,9 +889,17 @@ fn handoff_record(handoff: &Handoff) -> Result<HandoffV1, PortableError> {
             content: content.as_str().to_owned(),
         },
     };
+    // Routine-submitted handoffs are execution records, not reusable canvas
+    // structure, and callers filter them out before they reach this point.
+    let source = handoff.source().ok_or_else(|| {
+        PortableError::InvalidDocument(format!(
+            "handoff {} was submitted by a routine and cannot be exported",
+            handoff.id()
+        ))
+    })?;
     Ok(HandoffV1 {
         id: symbolic("handoff", handoff.id().get()),
-        source: symbolic("agent", handoff.source().get()),
+        source: symbolic("agent", source.get()),
         recipient: symbolic("agent", handoff.recipient().get()),
         payload,
     })
@@ -955,7 +1027,7 @@ fn build_commands(
     launcher_mappings: &BTreeMap<String, crate::domain::CommandPresetId>,
     path_mappings: &BTreeMap<String, String>,
     settings: Option<&PortableSettingsV1>,
-) -> Result<Vec<DomainCommand>, PortableError> {
+) -> Result<(Vec<DomainCommand>, BTreeMap<String, AgentId>), PortableError> {
     let mut commands = Vec::new();
     let mut role_ids = IdAllocator::new(workspace.roles().map(|role| role.id().get()));
     let mut agent_ids = IdAllocator::new(workspace.agents().map(|agent| agent.id().get()));
@@ -1213,7 +1285,7 @@ fn build_commands(
         before: workspace.canvas_layout(),
         after: combined,
     });
-    Ok(commands)
+    Ok((commands, agent_map))
 }
 
 fn append_task_order(

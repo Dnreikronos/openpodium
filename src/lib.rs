@@ -6,6 +6,7 @@ pub mod navigation;
 pub mod orchestration;
 pub mod persistence;
 pub mod portal;
+pub mod routines;
 pub mod runtime;
 pub mod timeline;
 pub mod workspaces;

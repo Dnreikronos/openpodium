@@ -18,8 +18,10 @@ use openpodium::domain::{
     ChatDraft, ChatMessageId, ChatThread, ChatThreadId, CommandPreset, CommandPresetId,
     ContainerEnvironment, Content, CustomEnvironment, DomainCommand, EnvironmentKind,
     EnvironmentProfile, EnvironmentProfileId, Name, Node, NodeId, NodeTarget, ProjectPath, Role,
-    RoleColor, RoleIcon, RoleId, SshEnvironment, ThreadColor, TimelineEventId, Timestamp,
-    Workspace, WorkspaceDirectory, WorkspaceId,
+    RoleColor, RoleIcon, RoleId, Routine, RoutineApproval, RoutineCadence, RoutineRetryPolicy,
+    RoutineSchedule, RoutineStep, RoutineStepClaims, RoutineStepId, RoutineTrigger,
+    RoutineTriggerId, RoutineTriggerKind, RoutineVersion, SshEnvironment, ThreadColor,
+    TimelineEventId, Timestamp, Workspace, WorkspaceDirectory, WorkspaceId,
 };
 use openpodium::ipc::{
     AGENT_ID_ENV, AVAILABLE_ENV, AgentCapabilities, AgentRegistration, CLI_ENV, ENDPOINT_ENV,
@@ -32,6 +34,9 @@ use openpodium::persistence::{
     import_role,
 };
 use openpodium::portal::{PortalAction, PortalFrame};
+use openpodium::routines::{
+    MissedOccurrences, RoutineDispatch, RoutineScheduler, RunRequest, TriggerEvent, TriggerWatcher,
+};
 use openpodium::runtime::{
     EnvironmentHealth, LocalProcessRuntime, ProcessEvent, ProcessRuntime, ProcessSpec,
     RuntimeError, check_agent_capability, check_environment, prepare_environment_process,
@@ -44,6 +49,7 @@ use crate::canvas::{self, Alignment, Camera, History, ZOrder};
 use crate::chat::{self, AttachmentStore, LinkTarget};
 use crate::navigation_panel;
 use crate::notifications::NotificationRequest;
+use crate::routines_panel;
 use crate::terminal;
 use crate::terminal::session::{self, Action as TerminalAction, ProcessStream, Session};
 use crate::timeline_panel;
@@ -109,6 +115,9 @@ struct OpenPodium {
     attachment_store: Option<AttachmentStore>,
     ipc: Option<IpcService>,
     orchestrator: Orchestrator,
+    routines: RoutineScheduler,
+    trigger_watcher: TriggerWatcher,
+    routines_ui: routines_panel::UiState,
     workspaces: Option<WorkspaceManager>,
     create_directory: String,
     name: String,
@@ -173,6 +182,16 @@ impl Default for OpenPodium {
             },
             None => Orchestrator::default(),
         };
+        let routines = match workspaces.as_mut() {
+            Some(workspaces) => match RoutineScheduler::recover(workspaces, now()) {
+                Ok(scheduler) => scheduler,
+                Err(error) => {
+                    notice = Some(error.to_string());
+                    RoutineScheduler::default()
+                }
+            },
+            None => RoutineScheduler::default(),
+        };
         let (timeline_items, timeline_high_watermarks) =
             match workspaces.as_ref().map(load_timeline_state) {
                 Some(Ok(timeline)) => timeline,
@@ -217,6 +236,9 @@ impl Default for OpenPodium {
             attachment_store,
             ipc,
             orchestrator,
+            routines,
+            trigger_watcher: TriggerWatcher::new(now()),
+            routines_ui: routines_panel::UiState::default(),
             workspaces,
             create_directory: String::new(),
             name: String::new(),
@@ -261,6 +283,7 @@ enum Message {
     Canvas(canvas::Message),
     Chat(chat::Message),
     Timeline(timeline_panel::Message),
+    Routines(routines_panel::Message),
     Navigation(navigation_panel::Message),
     NavigationKey {
         navigation_key: navigation::NavigationKey,
@@ -391,6 +414,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::Portal(message) => return portals::update(state, message),
         Message::OrchestrationTick => {
             run_orchestration_tick(state);
+            run_routine_tick(state);
             let contexts = context_nodes::tick(state);
             let timelines = refresh_timelines(state);
             let floors = floors::tick(state);
@@ -435,6 +459,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::CancelPortableImport => state.portable_import = None,
         Message::Chat(message) => return handle_chat_message(state, message),
         Message::Timeline(message) => return handle_timeline_message(state, message),
+        Message::Routines(message) => return handle_routines_message(state, message),
         Message::Navigation(message) => return navigation::update(state, message),
         Message::NavigationKey {
             navigation_key,
@@ -909,6 +934,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .map_or(&[][..], Vec::as_slice);
         settings = column![
             timeline_panel::panel(workspace, items, &state.timeline_ui).map(Message::Timeline),
+            routines_panel::panel(workspace, &state.routines_ui).map(Message::Routines),
             settings,
         ]
         .spacing(20);
@@ -1487,6 +1513,550 @@ fn navigate_to_task(state: &mut OpenPodium, target: NavigationTarget) {
     state.focused_terminal = None;
     state.canvas_revision = state.canvas_revision.wrapping_add(1);
     state.notice = Some(format!("Inspecting task {}", target.task_id));
+}
+
+fn handle_routines_message(
+    state: &mut OpenPodium,
+    message: routines_panel::Message,
+) -> Task<Message> {
+    let Some(workspace_id) = active_workspace_id(state) else {
+        state.notice = Some("Create or select a workspace first".to_owned());
+        return Task::none();
+    };
+    match message {
+        routines_panel::Message::SelectRoutine(routine_id) => {
+            if let Some(workspace) = state
+                .workspaces
+                .as_ref()
+                .and_then(|manager| manager.workspace(workspace_id))
+            {
+                state.routines_ui.select(workspace, routine_id);
+            }
+        }
+        routines_panel::Message::EditName(value) => state.routines_ui.name = value,
+        routines_panel::Message::EditStepName(value) => state.routines_ui.step_name = value,
+        routines_panel::Message::EditStepPrompt(value) => state.routines_ui.step_prompt = value,
+        routines_panel::Message::EditStepAgent(value) => state.routines_ui.step_agent = value,
+        routines_panel::Message::EditInput { key, value } => {
+            state.routines_ui.inputs.insert(key, value);
+        }
+        routines_panel::Message::SelectRun(run_id) => state.routines_ui.selected_run = run_id,
+        routines_panel::Message::AddStep => {
+            let result = state
+                .routines_ui
+                .step_agent
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| "Agent ID must be a number".to_owned())
+                .and_then(|agent| {
+                    if state.routines_ui.step_name.trim().is_empty()
+                        || state.routines_ui.step_prompt.trim().is_empty()
+                    {
+                        return Err("A step needs a name and a prompt".to_owned());
+                    }
+                    Ok(routines_panel::PendingStep {
+                        name: state.routines_ui.step_name.trim().to_owned(),
+                        prompt: state.routines_ui.step_prompt.trim().to_owned(),
+                        agent_id: AgentId::new(agent),
+                    })
+                });
+            match result {
+                Ok(step) => {
+                    state.routines_ui.pending_steps.push(step);
+                    state.routines_ui.step_name.clear();
+                    state.routines_ui.step_prompt.clear();
+                }
+                Err(error) => state.notice = Some(error),
+            }
+        }
+        routines_panel::Message::ToggleCanvasTemplate => {
+            state.routines_ui.capture_canvas = !state.routines_ui.capture_canvas;
+            if state.routines_ui.capture_canvas && state.canvas_selection.is_empty() {
+                state.notice = Some("Select the canvas nodes each run should rebuild".to_owned());
+            }
+        }
+        routines_panel::Message::SaveRoutine => {
+            state.notice = Some(save_routine(state, workspace_id).unwrap_or_else(|error| error));
+            return refresh_timelines(state);
+        }
+        routines_panel::Message::StartRun => {
+            let Some(routine_id) = state.routines_ui.selected_routine else {
+                state.notice = Some("Select a routine to run".to_owned());
+                return Task::none();
+            };
+            let request = RunRequest {
+                inputs: state.routines_ui.input_values(),
+                ..RunRequest::default()
+            };
+            let result = state
+                .workspaces
+                .as_mut()
+                .ok_or_else(|| "workspace storage is unavailable".to_owned())
+                .and_then(|workspaces| {
+                    state
+                        .routines
+                        .start_run(workspaces, workspace_id, routine_id, request, now())
+                        .map_err(|error| error.to_string())
+                });
+            state.notice = Some(match result {
+                Ok(run_id) => format!("Routine started as run {run_id}"),
+                Err(error) => error,
+            });
+            return refresh_timelines(state);
+        }
+        routines_panel::Message::ToggleTrigger {
+            trigger_id,
+            enabled,
+        } => {
+            state.notice = Some(
+                toggle_trigger(state, workspace_id, trigger_id, enabled).unwrap_or_else(|e| e),
+            );
+            return refresh_timelines(state);
+        }
+        routines_panel::Message::AddScheduleTrigger => {
+            state.notice = Some(
+                add_trigger(state, workspace_id, ScheduleOrWatch::Schedule).unwrap_or_else(|e| e),
+            );
+            return refresh_timelines(state);
+        }
+        routines_panel::Message::AddFilesystemTrigger => {
+            state.notice = Some(
+                add_trigger(state, workspace_id, ScheduleOrWatch::Filesystem).unwrap_or_else(|e| e),
+            );
+            return refresh_timelines(state);
+        }
+        routines_panel::Message::Approve {
+            run_id,
+            step_id,
+            approved,
+        } => {
+            let result = state
+                .workspaces
+                .as_mut()
+                .ok_or_else(|| "workspace storage is unavailable".to_owned())
+                .and_then(|workspaces| {
+                    state
+                        .routines
+                        .decide_approval(
+                            workspaces,
+                            workspace_id,
+                            run_id,
+                            step_id,
+                            routines_panel::decision(approved),
+                            None,
+                            now(),
+                        )
+                        .map_err(|error| error.to_string())
+                });
+            state.notice = Some(result.map_or_else(
+                |error| error,
+                |()| {
+                    if approved {
+                        "Step approved".to_owned()
+                    } else {
+                        "Step rejected".to_owned()
+                    }
+                },
+            ));
+            return refresh_timelines(state);
+        }
+        routines_panel::Message::ResolveInterruption { run_id, step_id } => {
+            let result = state
+                .workspaces
+                .as_mut()
+                .ok_or_else(|| "workspace storage is unavailable".to_owned())
+                .and_then(|workspaces| {
+                    state
+                        .routines
+                        .resolve_interruption(workspaces, workspace_id, run_id, step_id, now())
+                        .map_err(|error| error.to_string())
+                });
+            state.notice = Some(result.map_or_else(
+                |error| error,
+                |()| "Interruption resolved; the step can run again".to_owned(),
+            ));
+            return refresh_timelines(state);
+        }
+        routines_panel::Message::CancelRun(run_id) => {
+            let result = match state.workspaces.as_mut() {
+                Some(workspaces) => state
+                    .routines
+                    .cancel_run(
+                        workspaces,
+                        &mut state.orchestrator,
+                        workspace_id,
+                        run_id,
+                        now(),
+                    )
+                    .map_err(|error| error.to_string()),
+                None => Err("workspace storage is unavailable".to_owned()),
+            };
+            state.notice = Some(result.map_or_else(
+                |error| error,
+                |()| "Cancellation requested; steps stay reserved until confirmed".to_owned(),
+            ));
+            return refresh_timelines(state);
+        }
+    }
+    Task::none()
+}
+
+enum ScheduleOrWatch {
+    Schedule,
+    Filesystem,
+}
+
+/// Saves the drafted routine. A routine that already exists gains a version;
+/// the stored one keeps running unchanged for any run that pinned it.
+fn save_routine(state: &mut OpenPodium, workspace_id: WorkspaceId) -> Result<String, String> {
+    let name =
+        Name::new(state.routines_ui.name.trim().to_owned()).map_err(|error| error.to_string())?;
+    if state.routines_ui.capture_canvas && state.canvas_selection.is_empty() {
+        return Err("Select the canvas nodes each run should rebuild".to_owned());
+    }
+    let selection = state.canvas_selection.clone();
+    let workspaces = state
+        .workspaces
+        .as_mut()
+        .ok_or_else(|| "workspace storage is unavailable".to_owned())?;
+    let workspace = workspaces
+        .workspace(workspace_id)
+        .ok_or_else(|| "workspace is not loaded".to_owned())?;
+    let existing = state
+        .routines_ui
+        .selected_routine
+        .and_then(|id| workspace.routine(id))
+        .cloned();
+    if existing.is_none() && state.routines_ui.pending_steps.is_empty() {
+        return Err("Add at least one step before saving".to_owned());
+    }
+    let (next_routine_id, next_version_id, _) = openpodium::routines::next_routine_ids(workspace);
+
+    // An edit appends to the latest immutable version. Preserve every saved
+    // step verbatim so the basic panel cannot erase bindings, outputs,
+    // approvals, retry policies, resource claims, or an existing DAG.
+    let mut steps = existing.as_ref().map_or_else(Vec::new, |routine| {
+        routine.latest_version().steps().to_vec()
+    });
+    let mut previous = steps.last().map(RoutineStep::id);
+    let mut next_step_id = steps.iter().map(|step| step.id().get()).max().unwrap_or(0);
+    for pending in &state.routines_ui.pending_steps {
+        next_step_id = next_step_id
+            .checked_add(1)
+            .ok_or_else(|| "Routine step IDs are exhausted".to_owned())?;
+        let step_id = RoutineStepId::new(next_step_id);
+        steps.push(
+            RoutineStep::new(
+                step_id,
+                Name::new(pending.name.clone()).map_err(|error| error.to_string())?,
+                pending.agent_id,
+                Content::new(pending.prompt.clone()).map_err(|error| error.to_string())?,
+                previous,
+                [],
+                [],
+                RoutineApproval::NotRequired,
+                RoutineRetryPolicy::default(),
+                RoutineStepClaims::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        previous = Some(step_id);
+    }
+
+    let routine_id = existing.as_ref().map_or(next_routine_id, Routine::id);
+    let number = existing
+        .as_ref()
+        .map_or(1, |routine| routine.latest_version().number() + 1);
+    // Capturing the selection now freezes the arrangement into the version, so
+    // later canvas edits cannot change what an already-saved version rebuilds.
+    let template = if state.routines_ui.capture_canvas {
+        let document = workspaces
+            .export_template(workspace_id, &selection)
+            .map_err(|error| error.to_string())?;
+        Some(Content::new(document).map_err(|error| error.to_string())?)
+    } else {
+        existing
+            .as_ref()
+            .and_then(|routine| routine.latest_version().template().cloned())
+    };
+    let inputs = existing.as_ref().map_or_else(Vec::new, |routine| {
+        routine.latest_version().inputs().to_vec()
+    });
+    let version = RoutineVersion::new(
+        next_version_id,
+        routine_id,
+        number,
+        inputs,
+        steps,
+        template,
+        now(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let commands = if let Some(routine) = existing {
+        let mut commands = Vec::with_capacity(2);
+        if routine.name() != &name {
+            commands.push(DomainCommand::UpdateRoutine {
+                routine_id,
+                name,
+                description: routine.description().cloned(),
+            });
+        }
+        commands.push(DomainCommand::AddRoutineVersion {
+            routine_id,
+            version,
+        });
+        commands
+    } else {
+        vec![DomainCommand::AddRoutine(
+            Routine::new(routine_id, name, None, version).map_err(|error| error.to_string())?,
+        )]
+    };
+    workspaces
+        .execute_batch(workspace_id, commands, now())
+        .map_err(|error| error.to_string())?;
+    state.routines_ui.pending_steps.clear();
+    if let Some(workspace) = state
+        .workspaces
+        .as_ref()
+        .and_then(|manager| manager.workspace(workspace_id))
+    {
+        state.routines_ui.select(workspace, Some(routine_id));
+    }
+    Ok(format!("Saved routine {routine_id} version {number}"))
+}
+
+fn toggle_trigger(
+    state: &mut OpenPodium,
+    workspace_id: WorkspaceId,
+    trigger_id: RoutineTriggerId,
+    enabled: bool,
+) -> Result<String, String> {
+    let workspaces = state
+        .workspaces
+        .as_mut()
+        .ok_or_else(|| "workspace storage is unavailable".to_owned())?;
+    let workspace = workspaces
+        .workspace(workspace_id)
+        .ok_or_else(|| "workspace is not loaded".to_owned())?;
+    let routine = openpodium::routines::routine_of_trigger(workspace, trigger_id)
+        .ok_or_else(|| format!("trigger {trigger_id} does not exist"))?;
+    let routine_id = routine.id();
+    let trigger = routine
+        .trigger(trigger_id)
+        .expect("the trigger was just located on this routine")
+        .clone()
+        .with_enabled(enabled);
+    workspaces
+        .execute(
+            workspace_id,
+            DomainCommand::PutRoutineTrigger {
+                routine_id,
+                trigger,
+            },
+            now(),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(if enabled {
+        "Trigger enabled".to_owned()
+    } else {
+        "Trigger disabled".to_owned()
+    })
+}
+
+fn add_trigger(
+    state: &mut OpenPodium,
+    workspace_id: WorkspaceId,
+    kind: ScheduleOrWatch,
+) -> Result<String, String> {
+    let routine_id = state
+        .routines_ui
+        .selected_routine
+        .ok_or_else(|| "Select a routine first".to_owned())?;
+    let workspaces = state
+        .workspaces
+        .as_mut()
+        .ok_or_else(|| "workspace storage is unavailable".to_owned())?;
+    let workspace = workspaces
+        .workspace(workspace_id)
+        .ok_or_else(|| "workspace is not loaded".to_owned())?;
+    let (_, _, trigger_id) = openpodium::routines::next_routine_ids(workspace);
+    let (name, kind) = match kind {
+        ScheduleOrWatch::Schedule => (
+            "Hourly",
+            RoutineTriggerKind::Schedule(
+                RoutineSchedule::new(
+                    RoutineCadence::Hourly { minute: 0 },
+                    0,
+                    None,
+                    RoutineCadence::Hourly { minute: 0 }.next_occurrence(now(), 0),
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+        ),
+        ScheduleOrWatch::Filesystem => (
+            "Watched files",
+            RoutineTriggerKind::Filesystem {
+                patterns: vec!["**/*".to_owned()],
+                debounce_ms: 2_000,
+            },
+        ),
+    };
+    let trigger = RoutineTrigger::new(
+        trigger_id,
+        routine_id,
+        Name::new(name).map_err(|error| error.to_string())?,
+        kind,
+        true,
+        BTreeMap::new(),
+    )
+    .map_err(|error| error.to_string())?;
+    workspaces
+        .execute(
+            workspace_id,
+            DomainCommand::PutRoutineTrigger {
+                routine_id,
+                trigger,
+            },
+            now(),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(format!("Added trigger {trigger_id}"))
+}
+
+/// Observes triggers, starts the runs they justify, and advances every run.
+///
+/// Trigger events are advisory: consuming the occurrence and creating the run
+/// happen together inside `start_run`, so a duplicate observation is refused
+/// there rather than producing a second run here.
+fn run_routine_tick(state: &mut OpenPodium) {
+    let current_time = now();
+    let Some(workspaces) = state.workspaces.as_mut() else {
+        return;
+    };
+    let poll = state.trigger_watcher.poll(workspaces, current_time);
+    for warning in poll.warnings {
+        state.notice = Some(format!(
+            "Routine {} trigger {} was not scanned: {}",
+            warning.routine_id, warning.trigger_id, warning.detail
+        ));
+    }
+    for missed in poll.missed {
+        record_missed_occurrences(workspaces, &missed, current_time, &mut state.notice);
+    }
+    for event in poll.events {
+        start_triggered_run(state, &event, current_time);
+    }
+
+    let Some(workspaces) = state.workspaces.as_mut() else {
+        return;
+    };
+    let dispatches = match state
+        .routines
+        .tick(workspaces, &mut state.orchestrator, current_time)
+    {
+        Ok(dispatches) => dispatches,
+        Err(error) => {
+            state.notice = Some(format!("Routine scheduling failed: {error}"));
+            return;
+        }
+    };
+    for dispatch in dispatches {
+        register_routine_dispatch(state, &dispatch);
+    }
+}
+
+fn record_missed_occurrences(
+    workspaces: &mut WorkspaceManager,
+    missed: &MissedOccurrences,
+    at: Timestamp,
+    notice: &mut Option<String>,
+) {
+    if let Err(error) = workspaces.execute(
+        missed.workspace_id,
+        DomainCommand::SkipRoutineOccurrences {
+            routine_id: missed.routine_id,
+            trigger_id: missed.trigger_id,
+            skipped: missed.skipped,
+            next_occurrence: missed.next_occurrence,
+        },
+        at,
+    ) {
+        *notice = Some(format!("Could not record missed schedule runs: {error}"));
+    } else {
+        *notice = Some(format!(
+            "Skipped {} scheduled run(s) that came due while OpenPodium was closed",
+            missed.skipped
+        ));
+    }
+}
+
+fn start_triggered_run(state: &mut OpenPodium, event: &TriggerEvent, at: Timestamp) {
+    let Some(workspaces) = state.workspaces.as_mut() else {
+        return;
+    };
+    let request = RunRequest {
+        observed: event.observed.clone(),
+        trigger: Some(event.firing.clone()),
+        ..RunRequest::default()
+    };
+    match state.routines.start_run(
+        workspaces,
+        event.workspace_id,
+        event.routine_id,
+        request,
+        at,
+    ) {
+        Ok(run_id) => {
+            state.trigger_watcher.mark_consumed(event);
+            state.notice = Some(format!("Trigger started routine run {run_id}"));
+        }
+        Err(error) if !error.is_retryable() => {
+            // A repeated trigger for a routine that is already running, or an
+            // occurrence that was already consumed, is expected: it coalesces
+            // onto the run in flight rather than starting a second one.
+            state.trigger_watcher.mark_consumed(event);
+            state.notice = Some(format!("Trigger did not start a run: {error}"));
+        }
+        Err(error) => {
+            state.notice = Some(format!("Trigger will retry: {error}"));
+        }
+    }
+}
+
+/// Publishes a dispatched routine handoff to the IPC service so the assigned
+/// agent can return structured outputs against it.
+fn register_routine_dispatch(state: &mut OpenPodium, dispatch: &RoutineDispatch) {
+    let Some(ipc) = state.ipc.as_ref() else {
+        return;
+    };
+    let Ok(message_id) = openpodium::ipc::MessageId::new(dispatch.message_id().as_str()) else {
+        state.notice = Some("Routine handoff has an unusable message ID".to_owned());
+        return;
+    };
+    let (title, body) = state
+        .workspaces
+        .as_ref()
+        .and_then(|workspaces| workspaces.workspace(dispatch.workspace_id()))
+        .and_then(|workspace| {
+            let run = workspace.routine_run(dispatch.run_id())?;
+            let task_id = run.step(dispatch.step_id())?.attempts().last()?.task_id();
+            let task = workspace.task(task_id)?;
+            Some((
+                task.title().as_str().to_owned(),
+                task.prompt().as_str().to_owned(),
+            ))
+        })
+        .unwrap_or_else(|| ("Routine step".to_owned(), "Routine step".to_owned()));
+    if let Err(error) = ipc.register_routine_handoff(
+        dispatch.workspace_id().get(),
+        &message_id,
+        dispatch.agent_id().get(),
+        &title,
+        &body,
+    ) {
+        state.notice = Some(format!("Routine handoff registration failed: {error}"));
+    }
 }
 
 fn run_orchestration_tick(state: &mut OpenPodium) {
@@ -3906,7 +4476,7 @@ mod tests {
                 &openpodium::ipc::AcceptedMessage {
                     workspace_id: first_id.get(),
                     sender_agent_id: 1,
-                    recipient_agent_id: 2,
+                    recipient: openpodium::ipc::MessagePeer::Agent(2),
                     command: openpodium::ipc::ProtocolCommand::SendHandoff {
                         message_id: openpodium::ipc::MessageId::new("task-1").unwrap(),
                         recipient_agent_id: 2,
@@ -3985,6 +4555,9 @@ mod tests {
             attachment_store: None,
             ipc: None,
             orchestrator: Orchestrator::default(),
+            routines: RoutineScheduler::default(),
+            trigger_watcher: TriggerWatcher::default(),
+            routines_ui: routines_panel::UiState::default(),
             workspaces: Some(workspaces),
             create_directory: String::new(),
             name: String::new(),
@@ -4322,7 +4895,7 @@ mod tests {
         let handoff = openpodium::domain::Handoff::tracked(
             openpodium::domain::HandoffId::new(1),
             openpodium::domain::HandoffMessageId::new("inspect-1").unwrap(),
-            AgentId::new(1),
+            openpodium::domain::HandoffOrigin::Agent(AgentId::new(1)),
             AgentId::new(2),
             openpodium::domain::HandoffPayload::Task(task_id),
             None,
@@ -4525,6 +5098,116 @@ mod tests {
         );
     }
 
+    #[test]
+    fn saving_an_existing_routine_preserves_its_contract_and_rename() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("openpodium.sqlite")).unwrap();
+        let workspace_id = workspaces
+            .create_workspace(&project, Timestamp::from_unix_millis(1))
+            .unwrap();
+        workspaces
+            .execute(
+                workspace_id,
+                DomainCommand::AddAgent(Agent::with_program(
+                    AgentId::new(1),
+                    Name::new("Builder").unwrap(),
+                    None,
+                    AgentProgram::Codex,
+                )),
+                Timestamp::from_unix_millis(2),
+            )
+            .unwrap();
+
+        let routine_id = openpodium::domain::RoutineId::new(1);
+        let input = openpodium::domain::RoutineInputDeclaration::new(
+            openpodium::domain::RoutineInputKey::new("scope").unwrap(),
+            Name::new("Scope").unwrap(),
+            true,
+            None,
+        );
+        let original_step = RoutineStep::new(
+            RoutineStepId::new(7),
+            Name::new("Plan").unwrap(),
+            AgentId::new(1),
+            Content::new("Plan {{scope}}").unwrap(),
+            [],
+            [(
+                openpodium::domain::RoutineInputKey::new("scope").unwrap(),
+                openpodium::domain::RoutineBindingSource::Input(
+                    openpodium::domain::RoutineInputKey::new("scope").unwrap(),
+                ),
+            )],
+            [openpodium::domain::RoutineOutputKey::new("plan").unwrap()],
+            RoutineApproval::Required,
+            RoutineRetryPolicy::new(3).unwrap(),
+            RoutineStepClaims::default(),
+        )
+        .unwrap();
+        let version = RoutineVersion::new(
+            openpodium::domain::RoutineVersionId::new(1),
+            routine_id,
+            1,
+            vec![input.clone()],
+            vec![original_step.clone()],
+            None,
+            Timestamp::from_unix_millis(3),
+        )
+        .unwrap();
+        workspaces
+            .execute(
+                workspace_id,
+                DomainCommand::AddRoutine(
+                    Routine::new(routine_id, Name::new("Draft").unwrap(), None, version).unwrap(),
+                ),
+                Timestamp::from_unix_millis(4),
+            )
+            .unwrap();
+
+        let mut state = test_state(workspaces, BTreeMap::new());
+        state.routines_ui.select(
+            state
+                .workspaces
+                .as_ref()
+                .unwrap()
+                .workspace(workspace_id)
+                .unwrap(),
+            Some(routine_id),
+        );
+        state.routines_ui.name = "Renamed".to_owned();
+        state
+            .routines_ui
+            .pending_steps
+            .push(routines_panel::PendingStep {
+                name: "Build".to_owned(),
+                prompt: "Build the plan".to_owned(),
+                agent_id: AgentId::new(1),
+            });
+
+        save_routine(&mut state, workspace_id).unwrap();
+
+        let routine = state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .workspace(workspace_id)
+            .unwrap()
+            .routine(routine_id)
+            .unwrap();
+        assert_eq!(routine.name().as_str(), "Renamed");
+        assert_eq!(routine.latest_version().number(), 2);
+        assert_eq!(routine.latest_version().inputs(), &[input]);
+        assert_eq!(routine.latest_version().steps().len(), 2);
+        assert_eq!(routine.latest_version().steps()[0], original_step);
+        assert_eq!(
+            routine.latest_version().steps()[1]
+                .depends_on()
+                .collect::<Vec<_>>(),
+            vec![RoutineStepId::new(7)]
+        );
+    }
+
     fn test_state(
         workspaces: WorkspaceManager,
         terminals: BTreeMap<TerminalKey, Session>,
@@ -4552,6 +5235,9 @@ mod tests {
             attachment_store: None,
             ipc: None,
             orchestrator: Orchestrator::default(),
+            routines: RoutineScheduler::default(),
+            trigger_watcher: TriggerWatcher::default(),
+            routines_ui: routines_panel::UiState::default(),
             workspaces: Some(workspaces),
             create_directory: String::new(),
             name: String::new(),
