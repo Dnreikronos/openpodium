@@ -7,6 +7,7 @@ pub mod orchestration;
 pub mod persistence;
 pub mod plugins;
 pub mod portal;
+pub mod remote;
 pub mod routines;
 pub mod runtime;
 pub mod security;
