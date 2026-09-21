@@ -241,4 +241,10 @@ mod tests {
         state.query = ">".to_owned();
         assert_eq!(items(&state, &commands).len(), CommandId::ALL.len());
     }
+
+    #[test]
+    fn accessibility_shortcuts_use_the_logical_character_from_the_active_layout() {
+        let shortcut = shortcut_from_key(&Key::Character("ж".into()), Modifiers::CTRL).unwrap();
+        assert_eq!(shortcut.key(), "ж");
+    }
 }

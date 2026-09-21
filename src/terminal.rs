@@ -762,6 +762,33 @@ mod tests {
     }
 
     #[test]
+    fn accessibility_preserves_dead_key_ime_and_right_to_left_commits() {
+        let mode = InputMode::default();
+        for committed in ["é", "かな", "مَرْحَبًا", "👩🏽‍💻"] {
+            assert_eq!(
+                encode_key(
+                    &Key::Character(committed.into()),
+                    Some(committed),
+                    Modifiers::empty(),
+                    mode,
+                ),
+                Some(committed.as_bytes().to_vec())
+            );
+        }
+
+        let mut model = model();
+        model.feed("עברית العربية".as_bytes());
+        let rendered = model
+            .view(Status::Running)
+            .cells
+            .into_iter()
+            .map(|cell| cell.text)
+            .collect::<String>();
+        assert!(rendered.contains("עברית"));
+        assert!(rendered.contains("العربية"));
+    }
+
+    #[test]
     fn derives_grid_size_from_node_body() {
         assert_eq!(
             GridSize::for_node(360.0, 260.0),
