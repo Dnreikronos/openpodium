@@ -21,6 +21,7 @@ pub(super) struct UiState {
 
 #[derive(Default)]
 struct ScanState {
+    directory: Option<PathBuf>,
     busy: bool,
     last_poll: Option<Instant>,
     signature: Option<String>,
@@ -30,7 +31,11 @@ struct ScanState {
 
 #[derive(Clone)]
 pub(crate) enum Message {
-    Completed(openpodium::domain::WorkspaceId, Result<ScanResult, String>),
+    Completed(
+        openpodium::domain::WorkspaceId,
+        PathBuf,
+        Result<ScanResult, String>,
+    ),
 }
 
 #[derive(Clone)]
@@ -41,24 +46,18 @@ pub(crate) struct ScanResult {
 }
 
 pub(super) fn scan(state: &mut OpenPodium, force: bool) -> Task<AppMessage> {
-    let Some(workspaces) = state.workspaces.as_ref() else {
-        return Task::none();
-    };
-    let active_id = workspaces.active_workspace_id();
-    let candidates = workspaces
-        .recent_workspaces()
-        .filter_map(|workspace| {
-            Some((
-                workspace.id(),
-                PathBuf::from(workspace.settings().working_directory()?.as_str()),
-            ))
-        })
-        .collect::<Vec<_>>();
-    state
-        .floor_ui
-        .status
+    let active_id = state
         .workspaces
-        .retain(|workspace_id, _| candidates.iter().any(|(id, _)| id == workspace_id));
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace_id);
+    let candidates = scan_candidates(state);
+    if align_with_candidates(
+        &mut state.floor_ui.status,
+        &mut state.supervisor_collisions,
+        &candidates,
+    ) {
+        refresh_supervisor_snapshot(state);
+    }
 
     let mut tasks = Vec::new();
     for (id, directory) in candidates {
@@ -79,32 +78,47 @@ pub(super) fn scan(state: &mut OpenPodium, force: bool) -> Task<AppMessage> {
         };
         scan.busy = true;
         scan.last_poll = Some(Instant::now());
+        let inspect_directory = directory.clone();
         tasks.push(Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || inspect(&directory, previous.as_deref()))
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result)
+                tokio::task::spawn_blocking(move || {
+                    inspect(&inspect_directory, previous.as_deref())
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result)
             },
-            move |result| AppMessage::Floor(super::Message::Status(Message::Completed(id, result))),
+            move |result| {
+                AppMessage::Floor(super::Message::Status(Message::Completed(
+                    id,
+                    directory.clone(),
+                    result,
+                )))
+            },
         ));
     }
     Task::batch(tasks)
 }
 
 pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessage> {
-    let Message::Completed(id, result) = message;
-    let workspace_exists = state
-        .workspaces
-        .as_ref()
-        .is_some_and(|workspaces| workspaces.workspace(id).is_some());
-    if !workspace_exists {
-        state.floor_ui.status.workspaces.remove(&id);
-        state.supervisor_collisions.remove(&id);
+    let Message::Completed(id, directory, result) = message;
+    let candidates = scan_candidates(state);
+    if align_with_candidates(
+        &mut state.floor_ui.status,
+        &mut state.supervisor_collisions,
+        &candidates,
+    ) {
         refresh_supervisor_snapshot(state);
+    }
+    if !scan_is_current(&state.floor_ui.status, &candidates, id, &directory) {
         return Task::none();
     }
-    let scan = state.floor_ui.status.workspaces.entry(id).or_default();
+    let scan = state
+        .floor_ui
+        .status
+        .workspaces
+        .get_mut(&id)
+        .expect("current scan state must exist");
     scan.busy = false;
     match result {
         Ok(result) => {
@@ -177,6 +191,63 @@ pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessag
         Err(error) => state.notice = Some(format!("Git collision refresh failed: {error}")),
     }
     Task::none()
+}
+
+fn scan_candidates(state: &OpenPodium) -> BTreeMap<WorkspaceId, PathBuf> {
+    state
+        .workspaces
+        .as_ref()
+        .into_iter()
+        .flat_map(|workspaces| workspaces.recent_workspaces())
+        .filter_map(|workspace| {
+            Some((
+                workspace.id(),
+                PathBuf::from(workspace.settings().working_directory()?.as_str()),
+            ))
+        })
+        .collect()
+}
+
+fn align_with_candidates(
+    status: &mut UiState,
+    collisions: &mut BTreeMap<WorkspaceId, Vec<CollisionObservation>>,
+    candidates: &BTreeMap<WorkspaceId, PathBuf>,
+) -> bool {
+    status
+        .workspaces
+        .retain(|workspace_id, _| candidates.contains_key(workspace_id));
+    let collision_count = collisions.len();
+    collisions.retain(|workspace_id, _| candidates.contains_key(workspace_id));
+    let mut collisions_changed = collision_count != collisions.len();
+
+    for (workspace_id, directory) in candidates {
+        let scan = status.workspaces.entry(*workspace_id).or_default();
+        if scan.directory.as_ref() != Some(directory) {
+            *scan = ScanState {
+                directory: Some(directory.clone()),
+                ..ScanState::default()
+            };
+            collisions_changed |= collisions.remove(workspace_id).is_some();
+        }
+    }
+
+    collisions_changed
+}
+
+fn scan_is_current(
+    status: &UiState,
+    candidates: &BTreeMap<WorkspaceId, PathBuf>,
+    workspace_id: WorkspaceId,
+    directory: &Path,
+) -> bool {
+    candidates
+        .get(&workspace_id)
+        .is_some_and(|candidate| candidate == directory)
+        && status
+            .workspaces
+            .get(&workspace_id)
+            .and_then(|scan| scan.directory.as_deref())
+            .is_some_and(|current| current == directory)
 }
 
 pub(super) fn severity_for_main(
@@ -324,5 +395,80 @@ fn same_path(left: &Path, right: &Path) -> bool {
     match (dunce::canonicalize(left), dunce::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
         _ => dunce::simplified(left) == dunce::simplified(right),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_alignment_prunes_stale_collision_state() {
+        let retained = WorkspaceId::new(1);
+        let removed = WorkspaceId::new(2);
+        let directory = PathBuf::from("/project");
+        let mut status = UiState::default();
+        status.workspaces.insert(
+            retained,
+            ScanState {
+                directory: Some(directory.clone()),
+                ..ScanState::default()
+            },
+        );
+        status.workspaces.insert(removed, ScanState::default());
+        let mut collisions = BTreeMap::from([(retained, Vec::new()), (removed, Vec::new())]);
+        let candidates = BTreeMap::from([(retained, directory)]);
+
+        assert!(align_with_candidates(
+            &mut status,
+            &mut collisions,
+            &candidates
+        ));
+        assert!(status.workspaces.contains_key(&retained));
+        assert!(!status.workspaces.contains_key(&removed));
+        assert!(collisions.contains_key(&retained));
+        assert!(!collisions.contains_key(&removed));
+    }
+
+    #[test]
+    fn directory_change_resets_scan_and_rejects_old_completion() {
+        let workspace_id = WorkspaceId::new(1);
+        let old_directory = PathBuf::from("/old");
+        let new_directory = PathBuf::from("/new");
+        let mut status = UiState::default();
+        status.workspaces.insert(
+            workspace_id,
+            ScanState {
+                directory: Some(old_directory.clone()),
+                busy: true,
+                signature: Some("old signature".to_owned()),
+                ..ScanState::default()
+            },
+        );
+        let mut collisions = BTreeMap::from([(workspace_id, Vec::new())]);
+        let candidates = BTreeMap::from([(workspace_id, new_directory.clone())]);
+
+        assert!(align_with_candidates(
+            &mut status,
+            &mut collisions,
+            &candidates
+        ));
+        let scan = status.workspaces.get(&workspace_id).unwrap();
+        assert_eq!(scan.directory.as_ref(), Some(&new_directory));
+        assert!(!scan.busy);
+        assert!(scan.signature.is_none());
+        assert!(collisions.is_empty());
+        assert!(!scan_is_current(
+            &status,
+            &candidates,
+            workspace_id,
+            &old_directory
+        ));
+        assert!(scan_is_current(
+            &status,
+            &candidates,
+            workspace_id,
+            &new_directory
+        ));
     }
 }
