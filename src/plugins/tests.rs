@@ -1,4 +1,5 @@
 use super::*;
+use proptest::prelude::*;
 
 fn manifest_json(extra: &str) -> String {
     format!(
@@ -60,4 +61,13 @@ fn paths_and_duplicate_contributions_are_rejected() {
         .unwrap()
         .push(command);
     assert!(PluginManifest::from_json(&value.to_string()).is_err());
+}
+
+proptest! {
+    #[test]
+    fn arbitrary_manifest_input_is_rejected_or_fully_validated(input in any::<String>()) {
+        if let Ok(manifest) = PluginManifest::from_json(&input) {
+            prop_assert!(manifest.validate().is_ok());
+        }
+    }
 }

@@ -5,8 +5,8 @@ mod manifest;
 mod protocol;
 
 pub use catalog::{
-    CatalogError, DiagnosticKind, PermissionGrant, PluginCatalog, PluginDiagnostic, PluginRecord,
-    PluginState,
+    CatalogError, DiagnosticKind, PermissionGrant, PermissionImpact, PermissionReview,
+    PermissionReviewItem, PluginCatalog, PluginDiagnostic, PluginRecord, PluginState,
 };
 pub use manifest::{
     Capability, CommandContribution, CompatibilityError, Contributions, HOST_SDK_VERSION,
