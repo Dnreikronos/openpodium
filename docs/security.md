@@ -1,6 +1,6 @@
 # Security, privacy, and local trust boundaries
 
-Status: Issue #24 security contract  
+Status: Issue #24 security contract
 Updated: 2026-09-21
 
 ## Trust model
