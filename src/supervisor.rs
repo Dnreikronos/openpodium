@@ -280,11 +280,10 @@ fn add_workspace_claims(snapshot: &mut Snapshot, activity: WorkspaceActivity<'_>
             | AgentState::Stopped => None,
         };
         let Some(class) = class else { continue };
-        let expected_start = format!("{}:", agent.name());
         let expected_end = format!("→ {}", agent.state());
         if let Some(item) = activity.timeline.iter().rev().find(|item| {
-            item.title() == "Agent state changed"
-                && item.detail().starts_with(&expected_start)
+            item.agent_id() == Some(agent.id())
+                && item.title() == "Agent state changed"
                 && item.detail().ends_with(&expected_end)
         }) {
             agent_evidence
@@ -651,6 +650,67 @@ mod tests {
                 .iter()
                 .any(|claim| claim.text().contains("agent(s) failed"))
         );
+    }
+
+    #[test]
+    fn duplicate_agent_names_keep_distinct_timeline_evidence() {
+        let workspace_id = WorkspaceId::new(1);
+        let mut workspace = Workspace::new(workspace_id, Name::new("Project").unwrap());
+        let mut domain_events = Vec::new();
+        for agent_id in [AgentId::new(1), AgentId::new(2)] {
+            domain_events.push(
+                workspace
+                    .execute(DomainCommand::AddAgent(Agent::new(
+                        agent_id,
+                        Name::new("Builder").unwrap(),
+                        None,
+                    )))
+                    .unwrap(),
+            );
+            domain_events.push(
+                workspace
+                    .execute(DomainCommand::TransitionAgent {
+                        agent_id,
+                        to: AgentState::Failed,
+                    })
+                    .unwrap(),
+            );
+        }
+        let events = domain_events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| {
+                TimelineEvent::new(
+                    TimelineEventId::new(index as u64 + 1),
+                    workspace_id,
+                    Timestamp::from_unix_millis(index as u64 + 1),
+                    event,
+                )
+            })
+            .collect::<Vec<_>>();
+        let items = timeline::project(&workspace, &events);
+
+        let snapshot = aggregate(
+            [WorkspaceActivity {
+                workspace: &workspace,
+                timeline: &items,
+            }],
+            [],
+        );
+        let event_ids = snapshot
+            .claims()
+            .iter()
+            .filter(|claim| claim.text().contains("agent(s) failed"))
+            .flat_map(Claim::evidence)
+            .filter_map(|evidence| match evidence {
+                Evidence::Timeline { event_id, .. } => Some(*event_id),
+                Evidence::Collision { .. } => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(event_ids.len(), 2);
+        assert!(event_ids.contains(&TimelineEventId::new(2)));
+        assert!(event_ids.contains(&TimelineEventId::new(4)));
     }
 
     struct Adapter {
