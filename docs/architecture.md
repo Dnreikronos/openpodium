@@ -39,6 +39,14 @@ Owns workspaces, agents, roles, tasks, handoffs, and lifecycle transition rules.
 
 Owns PTYs, agent adapter processes, input/output streams, cancellation, and runtime health. It publishes structured observations but cannot directly mutate domain state.
 
+### Plugin host
+
+Discovers and validates third-party manifests, negotiates the public SDK,
+applies capability grants, and supervises each native plugin in a separate
+process. Plugin responses remain untrusted data: the application validates and
+applies any resulting command, adapter plan, setting change, event, or
+host-rendered UI contribution. See the [plugin SDK contract](plugins.md).
+
 ### Routine scheduler
 
 Owns immutable routine versions, their triggers, and their runs. It decides
