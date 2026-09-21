@@ -21,6 +21,7 @@ pub(super) enum NavigationKey {
     Down,
     Enter,
     Escape,
+    Tab { reverse: bool },
     Other,
 }
 
@@ -34,6 +35,9 @@ pub(super) fn subscription() -> Subscription<Message> {
             Key::Named(Named::ArrowDown) => NavigationKey::Down,
             Key::Named(Named::Enter) => NavigationKey::Enter,
             Key::Named(Named::Escape) => NavigationKey::Escape,
+            Key::Named(Named::Tab) => NavigationKey::Tab {
+                reverse: modifiers.shift(),
+            },
             _ => NavigationKey::Other,
         };
         Some(Message::NavigationKey {
@@ -211,8 +215,28 @@ pub(super) fn handle_key(
             NavigationKey::Down => update(state, navigation_panel::Message::MoveSelection(true)),
             NavigationKey::Enter => update(state, navigation_panel::Message::ActivateSelection),
             NavigationKey::Escape => update(state, navigation_panel::Message::Close),
+            NavigationKey::Tab { reverse } => {
+                if reverse {
+                    iced::widget::operation::focus_previous()
+                } else {
+                    iced::widget::operation::focus_next()
+                }
+            }
             NavigationKey::Other => Task::none(),
         };
+    }
+    if let NavigationKey::Tab { reverse } = navigation_key {
+        if status == Status::Ignored
+            && state.focused_terminal.is_none()
+            && state.focused_portal.is_none()
+        {
+            return if reverse {
+                iced::widget::operation::focus_previous()
+            } else {
+                iced::widget::operation::focus_next()
+            };
+        }
+        return Task::none();
     }
     let Some(shortcut) = shortcut else {
         return Task::none();
@@ -220,8 +244,15 @@ pub(super) fn handle_key(
     let Some(command) = state.command_registry.command_for(&shortcut) else {
         return Task::none();
     };
+    let embedded_content_focused =
+        state.focused_terminal.is_some() || state.focused_portal.is_some();
     if status == Status::Captured
         && !matches!(command, CommandId::OpenPalette | CommandId::FocusCanvas)
+        && !(embedded_content_focused
+            && matches!(
+                command,
+                CommandId::ZoomIn | CommandId::ZoomOut | CommandId::ResetZoom
+            ))
     {
         return Task::none();
     }
@@ -286,7 +317,7 @@ fn save_binding(state: &mut OpenPodium, unbind: bool) -> Task<Message> {
     Task::none()
 }
 
-fn execute_command(state: &mut OpenPodium, command: CommandId) -> Task<Message> {
+pub(super) fn execute_command(state: &mut OpenPodium, command: CommandId) -> Task<Message> {
     match command {
         CommandId::OpenPalette => return update(state, navigation_panel::Message::Open),
         CommandId::NextWorkspace => return cycle_workspace(state, true),

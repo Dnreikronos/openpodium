@@ -7,13 +7,15 @@ pub(crate) use camera::Camera;
 pub(crate) use editor::{Alignment, History, ZOrder};
 pub(crate) use surface::{Message, view};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use iced::Color;
+use openpodium::accessibility::{CanvasNodeKind, CanvasSemanticSnapshot, RuntimeNodeSemantics};
 use openpodium::domain::{
     AgentProgram, CanvasLayout, CanvasNodeContent, NodeId, NodeTarget, Workspace,
 };
 use openpodium::git::CollisionSeverity;
+use openpodium::localization::Localizer;
 use openpodium::portal::PortalFrame;
 
 use crate::terminal;
@@ -52,147 +54,94 @@ impl CanvasDocument {
         workspace: &Workspace,
         layout: CanvasLayout,
         terminals: BTreeMap<NodeId, terminal::View>,
+        localizer: &Localizer,
     ) -> Self {
-        let labels = layout
+        let agent_nodes = layout
             .nodes()
             .iter()
-            .map(|node| {
-                let label = match node.content() {
-                    CanvasNodeContent::Reference(NodeTarget::Agent(agent_id)) => {
-                        workspace.agent(*agent_id).map_or_else(
-                            || NodeLabel {
-                                title: format!("Missing agent {agent_id}"),
-                                subtitle: "Unavailable".to_owned(),
-                                kind: NodeKind::Agent {
-                                    program: AgentProgram::Shell,
-                                    role_color: None,
-                                },
+            .filter(|node| {
+                matches!(
+                    node.content(),
+                    CanvasNodeContent::Reference(NodeTarget::Agent(_))
+                )
+            })
+            .map(|node| node.id())
+            .collect::<BTreeSet<_>>();
+        let semantics =
+            CanvasSemanticSnapshot::build(workspace, &layout, &[], localizer, |node_id| {
+                terminals.get(&node_id).map_or_else(
+                    || RuntimeNodeSemantics {
+                        status: agent_nodes
+                            .contains(&node_id)
+                            .then(|| terminal::Status::Offline.label(localizer)),
+                        can_start: agent_nodes.contains(&node_id),
+                        ..RuntimeNodeSemantics::default()
+                    },
+                    |terminal| RuntimeNodeSemantics {
+                        title: terminal.title.clone(),
+                        status: Some(terminal.status.label(localizer)),
+                        value: terminal_text(terminal),
+                        can_start: matches!(
+                            terminal.status,
+                            terminal::Status::Offline
+                                | terminal::Status::Exited(_)
+                                | terminal::Status::Stopped
+                                | terminal::Status::Failed(_)
+                        ),
+                        can_stop: matches!(
+                            terminal.status,
+                            terminal::Status::Starting | terminal::Status::Running
+                        ),
+                    },
+                )
+            });
+        let labels = semantics
+            .nodes
+            .into_iter()
+            .map(|semantic| {
+                let kind = match semantic.kind {
+                    CanvasNodeKind::Agent => layout
+                        .nodes()
+                        .iter()
+                        .find(|node| node.id() == semantic.id)
+                        .and_then(|node| node.content().reference())
+                        .and_then(|target| match target {
+                            NodeTarget::Agent(agent_id) => workspace.agent(agent_id),
+                            NodeTarget::Task(_) | NodeTarget::Handoff(_) => None,
+                        })
+                        .map_or(
+                            NodeKind::Agent {
+                                program: AgentProgram::Shell,
+                                role_color: None,
                             },
-                            |agent| {
-                                let status = terminals.get(&node.id()).map_or_else(
-                                    || "terminal offline".to_owned(),
-                                    |terminal| terminal.status.label(),
-                                );
-                                let title = terminals
-                                    .get(&node.id())
-                                    .and_then(|terminal| terminal.title.as_deref())
-                                    .map_or_else(
-                                        || agent.name().as_str().to_owned(),
-                                        |title| format!("{} — {title}", agent.name().as_str()),
-                                    );
-                                let role =
-                                    agent.role_id().and_then(|role_id| workspace.role(role_id));
-                                NodeLabel {
-                                    title: role.map_or(title.clone(), |role| {
-                                        format!("{} {title}", role.icon())
-                                    }),
-                                    subtitle: role.map_or_else(
-                                        || format!("{} · {status}", program_name(agent.program())),
-                                        |role| {
-                                            format!(
-                                                "{} · {} · {status}",
-                                                role.name(),
-                                                program_name(agent.program())
-                                            )
-                                        },
-                                    ),
-                                    kind: NodeKind::Agent {
-                                        program: agent.program(),
-                                        role_color: role
-                                            .map(|role| role_color(role.color().as_str())),
-                                    },
-                                }
-                            },
-                        )
-                    }
-                    CanvasNodeContent::Reference(NodeTarget::Task(task_id)) => {
-                        workspace.task(*task_id).map_or_else(
-                            || NodeLabel {
-                                title: format!("Missing task {task_id}"),
-                                subtitle: "Unavailable".to_owned(),
-                                kind: NodeKind::Task,
-                            },
-                            |task| NodeLabel {
-                                title: task.title().as_str().to_owned(),
-                                subtitle: task.state().to_string(),
-                                kind: NodeKind::Task,
-                            },
-                        )
-                    }
-                    CanvasNodeContent::Reference(NodeTarget::Handoff(handoff_id)) => NodeLabel {
-                        title: format!("Handoff {handoff_id}"),
-                        subtitle: workspace.handoff(*handoff_id).map_or_else(
-                            || "Unavailable".to_owned(),
-                            |handoff| match handoff.origin() {
-                                openpodium::domain::HandoffOrigin::Agent(source) => {
-                                    format!("Agent {source} → Agent {}", handoff.recipient())
-                                }
-                                openpodium::domain::HandoffOrigin::Routine { run_id, step_id } => {
-                                    format!(
-                                        "Run {run_id} step {step_id} → Agent {}",
-                                        handoff.recipient()
-                                    )
-                                }
+                            |agent| NodeKind::Agent {
+                                program: agent.program(),
+                                role_color: agent
+                                    .role_id()
+                                    .and_then(|role_id| workspace.role(role_id))
+                                    .map(|role| role_color(role.color().as_str())),
                             },
                         ),
-                        kind: NodeKind::Handoff,
-                    },
-                    CanvasNodeContent::Note { path, title } => NodeLabel {
-                        title: title.as_str().to_owned(),
-                        subtitle: path.as_str().to_owned(),
-                        kind: NodeKind::Context,
-                    },
-                    CanvasNodeContent::FileTree { root } => NodeLabel {
-                        title: "Project files".to_owned(),
-                        subtitle: root.as_str().to_owned(),
-                        kind: NodeKind::Context,
-                    },
-                    CanvasNodeContent::Artifact { path } => NodeLabel {
-                        title: path
-                            .as_str()
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(path.as_str())
-                            .to_owned(),
-                        subtitle: path.as_str().to_owned(),
-                        kind: NodeKind::Context,
-                    },
-                    CanvasNodeContent::Diff { path, .. } => NodeLabel {
-                        title: format!("Diff · {path}"),
-                        subtitle: "Working tree against HEAD".to_owned(),
-                        kind: NodeKind::Context,
-                    },
-                    CanvasNodeContent::Text { .. } => NodeLabel {
-                        title: "Text".to_owned(),
-                        subtitle: "Canvas annotation".to_owned(),
-                        kind: NodeKind::Context,
-                    },
-                    CanvasNodeContent::Portal(config) => NodeLabel {
-                        title: "Portal".to_owned(),
-                        subtitle: format!(
-                            "{:?} · {}",
-                            config.target().kind(),
-                            config.target().selector()
-                        ),
-                        kind: NodeKind::Context,
-                    },
-                    CanvasNodeContent::Shape(shape) => NodeLabel {
-                        title: format!("{:?}", shape.kind()),
-                        subtitle: "Canvas shape".to_owned(),
-                        kind: NodeKind::Context,
-                    },
-                    CanvasNodeContent::Arrow(_) => NodeLabel {
-                        title: "Arrow".to_owned(),
-                        subtitle: "Canvas annotation".to_owned(),
-                        kind: NodeKind::Context,
-                    },
-                    CanvasNodeContent::Freehand(_) => NodeLabel {
-                        title: "Drawing".to_owned(),
-                        subtitle: "Freehand annotation".to_owned(),
-                        kind: NodeKind::Context,
-                    },
+                    CanvasNodeKind::Task => NodeKind::Task,
+                    CanvasNodeKind::Handoff => NodeKind::Handoff,
+                    CanvasNodeKind::Note
+                    | CanvasNodeKind::FileTree
+                    | CanvasNodeKind::Artifact
+                    | CanvasNodeKind::Diff
+                    | CanvasNodeKind::Text
+                    | CanvasNodeKind::Portal
+                    | CanvasNodeKind::Shape
+                    | CanvasNodeKind::Arrow
+                    | CanvasNodeKind::Drawing => NodeKind::Context,
                 };
-                (node.id(), label)
+                (
+                    semantic.id,
+                    NodeLabel {
+                        title: semantic.name,
+                        subtitle: semantic.description,
+                        kind,
+                    },
+                )
             })
             .collect();
         Self {
@@ -249,15 +198,28 @@ impl CanvasDocument {
     }
 }
 
-fn program_name(program: AgentProgram) -> &'static str {
-    program.label()
-}
-
 fn role_color(value: &str) -> Color {
     let red = u8::from_str_radix(&value[1..3], 16).expect("role colors are validated");
     let green = u8::from_str_radix(&value[3..5], 16).expect("role colors are validated");
     let blue = u8::from_str_radix(&value[5..7], 16).expect("role colors are validated");
     Color::from_rgb8(red, green, blue)
+}
+
+fn terminal_text(terminal: &terminal::View) -> Option<String> {
+    let mut rows = BTreeMap::<usize, String>::new();
+    for cell in &terminal.cells {
+        let row = rows.entry(cell.row).or_default();
+        if row.len() < cell.column {
+            row.push_str(&" ".repeat(cell.column - row.len()));
+        }
+        row.push_str(&cell.text);
+    }
+    let text = rows
+        .into_values()
+        .map(|row| row.trim_end().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 #[cfg(test)]
@@ -296,11 +258,16 @@ mod tests {
         );
         workspace.execute(DomainCommand::AddNode(node)).unwrap();
 
-        let document = CanvasDocument::new(&workspace, workspace.canvas_layout(), BTreeMap::new())
-            .with_git_severity(BTreeMap::from([(
-                NodeId::new(1),
-                CollisionSeverity::Critical,
-            )]));
+        let document = CanvasDocument::new(
+            &workspace,
+            workspace.canvas_layout(),
+            BTreeMap::new(),
+            &Localizer::new(openpodium::localization::Locale::EnUs),
+        )
+        .with_git_severity(BTreeMap::from([(
+            NodeId::new(1),
+            CollisionSeverity::Critical,
+        )]));
         let label = document.label(NodeId::new(1));
 
         assert_eq!(label.title, "review Ada");

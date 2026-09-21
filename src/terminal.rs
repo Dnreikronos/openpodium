@@ -9,6 +9,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, Color, CursorShape, NamedColor, Rgb};
 use iced::keyboard::{Key, Modifiers, key::Named};
+use openpodium::localization::Localizer;
 
 pub(crate) mod session;
 
@@ -29,14 +30,14 @@ pub(crate) enum Status {
 }
 
 impl Status {
-    pub(crate) fn label(&self) -> String {
+    pub(crate) fn label(&self, localizer: &Localizer) -> String {
         match self {
-            Self::Offline => "terminal offline".to_owned(),
-            Self::Starting => "terminal starting".to_owned(),
-            Self::Running => "terminal running".to_owned(),
-            Self::Exited(detail) => format!("terminal exited ({detail})"),
-            Self::Stopped => "terminal stopped".to_owned(),
-            Self::Failed(detail) => format!("terminal failed: {detail}"),
+            Self::Offline => localizer.text("terminal-offline"),
+            Self::Starting => localizer.text("terminal-starting"),
+            Self::Running => localizer.text("terminal-running"),
+            Self::Exited(detail) => localizer.with_str("terminal-exited", "detail", detail),
+            Self::Stopped => localizer.text("terminal-stopped"),
+            Self::Failed(detail) => localizer.with_str("terminal-failed", "detail", detail),
         }
     }
 }
@@ -759,6 +760,33 @@ mod tests {
         mode.bracketed_paste = true;
         assert_eq!(encode_paste("a\r\nb", mode), b"\x1b[200~a\nb\x1b[201~");
         assert_eq!(encode_mouse_wheel(2, 4, true), b"\x1b[<64;5;3M");
+    }
+
+    #[test]
+    fn accessibility_preserves_dead_key_ime_and_right_to_left_commits() {
+        let mode = InputMode::default();
+        for committed in ["é", "かな", "مَرْحَبًا", "👩🏽‍💻"] {
+            assert_eq!(
+                encode_key(
+                    &Key::Character(committed.into()),
+                    Some(committed),
+                    Modifiers::empty(),
+                    mode,
+                ),
+                Some(committed.as_bytes().to_vec())
+            );
+        }
+
+        let mut model = model();
+        model.feed("עברית العربية".as_bytes());
+        let rendered = model
+            .view(Status::Running)
+            .cells
+            .into_iter()
+            .map(|cell| cell.text)
+            .collect::<String>();
+        assert!(rendered.contains("עברית"));
+        assert!(rendered.contains("العربية"));
     }
 
     #[test]

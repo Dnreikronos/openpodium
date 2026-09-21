@@ -2,6 +2,8 @@ mod context_nodes;
 mod floors;
 mod navigation;
 mod portals;
+mod shell;
+mod trackpad;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -11,8 +13,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use iced::widget::{button, column, container, row, scrollable, text, text_editor, text_input};
-use iced::{Element, Fill, Subscription, Task, Theme, clipboard, event};
+use iced::widget::{
+    button as iced_button, column, container, row, scrollable, text, text_editor,
+    text_input as iced_text_input,
+};
+use iced::{
+    Alignment as IcedAlignment, Color, Element, Fill, Size, Subscription, Task, Theme, clipboard,
+    event, theme,
+};
 use openpodium::domain::{
     Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, ChatAttachmentId,
     ChatDraft, ChatMessageId, ChatThread, ChatThreadId, CommandPreset, CommandPresetId,
@@ -27,13 +35,17 @@ use openpodium::ipc::{
     AGENT_ID_ENV, AVAILABLE_ENV, AgentCapabilities, AgentRegistration, CLI_ENV, ENDPOINT_ENV,
     IpcService, SUPPORTED_VERSIONS, TOKEN_ENV, VERSIONS_ENV, WORKSPACE_ID_ENV,
 };
-use openpodium::navigation::{CommandRegistry, Shortcut};
+use openpodium::localization::{LOCALE_KEY, Locale, Localizer};
+use openpodium::navigation::{CommandId, CommandRegistry, Shortcut};
 use openpodium::orchestration::{DeliveryRequest, Orchestrator};
 use openpodium::persistence::{
     ImportPreview, PointV1, export_canvas_fragment, export_role, import_canvas_fragment,
     import_role,
 };
 use openpodium::portal::{PortalAction, PortalFrame};
+use openpodium::presentation::{
+    HIGH_CONTRAST_KEY, PresentationPreferences, REDUCED_MOTION_KEY, TEXT_SCALE_KEY,
+};
 use openpodium::routines::{
     MissedOccurrences, RoutineDispatch, RoutineScheduler, RunRequest, TriggerEvent, TriggerWatcher,
 };
@@ -60,6 +72,24 @@ use crate::timeline_panel;
 
 const APP_NAME: &str = "OpenPodium";
 const DATABASE_FILE: &str = "openpodium.sqlite";
+
+fn button<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> iced::widget::Button<'a, Message> {
+    iced_button(content)
+        .padding([8, 12])
+        .style(shell::secondary_button)
+}
+
+fn text_input<'a, Message: Clone + 'a>(
+    placeholder: &str,
+    value: &'a str,
+) -> iced::widget::TextInput<'a, Message> {
+    iced_text_input(placeholder, value)
+        .padding([10, 12])
+        .style(shell::input)
+}
+
 type TimelineState = (
     BTreeMap<WorkspaceId, Vec<TimelineItem>>,
     BTreeMap<WorkspaceId, TimelineEventId>,
@@ -97,6 +127,9 @@ struct PortableImportDraft {
 }
 
 struct OpenPodium {
+    localizer: Localizer,
+    presentation: PresentationPreferences,
+    inspector_open: bool,
     floor_ui: floors::UiState,
     context_ui: context_nodes::UiState,
     portal_ui: portals::UiState,
@@ -127,7 +160,6 @@ struct OpenPodium {
     trigger_watcher: TriggerWatcher,
     routines_ui: routines_panel::UiState,
     workspaces: Option<WorkspaceManager>,
-    create_directory: String,
     name: String,
     icon: String,
     working_directory: String,
@@ -222,6 +254,9 @@ impl Default for OpenPodium {
             }
         }
         let mut state = Self {
+            localizer: Localizer::default(),
+            presentation: PresentationPreferences::default(),
+            inspector_open: false,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
             portal_ui: portals::UiState::default(),
@@ -252,7 +287,6 @@ impl Default for OpenPodium {
             trigger_watcher: TriggerWatcher::new(now()),
             routines_ui: routines_panel::UiState::default(),
             workspaces,
-            create_directory: String::new(),
             name: String::new(),
             icon: String::new(),
             working_directory: String::new(),
@@ -280,6 +314,7 @@ impl Default for OpenPodium {
             portable_import: None,
             notice,
         };
+        load_application_preferences(&mut state);
         state.load_active_settings();
         state.sync_ipc_directory();
         refresh_supervisor_snapshot(&mut state);
@@ -294,6 +329,13 @@ enum Message {
     Portal(portals::Message),
     OrchestrationTick,
     Canvas(canvas::Message),
+    CycleTextScale,
+    CycleLocale,
+    ToggleHighContrast,
+    ToggleReducedMotion,
+    ToggleInspector,
+    TrackpadMagnified(f64),
+    ExecuteCommand(CommandId),
     Chat(chat::Message),
     Timeline(timeline_panel::Message),
     Supervisor(supervisor_panel::Message),
@@ -331,8 +373,8 @@ enum Message {
     SaveNote(bool),
     ReloadNote,
     SaveCanvasText,
-    CreateDirectoryChanged(String),
-    CreateWorkspace,
+    OpenProject,
+    ProjectDirectorySelected(Option<PathBuf>),
     SwitchWorkspace(WorkspaceId),
     NameChanged(String),
     IconChanged(String),
@@ -409,21 +451,99 @@ enum CanvasAction {
 }
 
 pub(crate) fn run() -> iced::Result {
+    trackpad::install();
     iced::application(OpenPodium::default, update, view)
         .title(APP_NAME)
-        .theme(Theme::Dark)
+        .theme(|state: &OpenPodium| application_theme(state.presentation))
+        .scale_factor(|state: &OpenPodium| state.presentation.text_scale())
+        .window(iced::window::Settings {
+            size: Size::new(1_280.0, 820.0),
+            min_size: Some(Size::new(900.0, 620.0)),
+            ..iced::window::Settings::default()
+        })
         .subscription(|_| {
             Subscription::batch([
                 iced::time::every(Duration::from_millis(100)).map(|_| Message::OrchestrationTick),
                 navigation::subscription(),
+                trackpad::subscription().map(Message::TrackpadMagnified),
             ])
         })
         .centered()
         .run()
 }
 
+fn application_theme(preferences: PresentationPreferences) -> Theme {
+    if preferences.high_contrast() {
+        Theme::custom(
+            "OpenPodium high contrast",
+            theme::Palette {
+                background: Color::BLACK,
+                text: Color::WHITE,
+                primary: Color::from_rgb8(0, 255, 255),
+                success: Color::from_rgb8(0, 255, 0),
+                warning: Color::from_rgb8(255, 255, 0),
+                danger: Color::from_rgb8(255, 96, 96),
+            },
+        )
+    } else {
+        shell::theme()
+    }
+}
+
+fn load_application_preferences(state: &mut OpenPodium) {
+    let Some(workspaces) = state.workspaces.as_ref() else {
+        return;
+    };
+    match workspaces.preferences() {
+        Ok(values) => {
+            if let Some((_, locale)) = values.iter().find(|(key, _)| key == LOCALE_KEY) {
+                state.localizer = Localizer::new(Locale::from_tag(locale));
+            }
+            state.presentation.apply_stored(values);
+        }
+        Err(error) => state.notice = Some(error.to_string()),
+    }
+}
+
+fn persist_application_preference(state: &mut OpenPodium, key: &str, value: &str) {
+    let Some(workspaces) = state.workspaces.as_mut() else {
+        return;
+    };
+    if let Err(error) = workspaces.store_preference(key, value) {
+        state.notice = Some(error.to_string());
+    }
+}
+
 fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
+        Message::CycleTextScale => {
+            state.presentation.cycle_text_scale();
+            let value = state.presentation.text_scale().to_string();
+            persist_application_preference(state, TEXT_SCALE_KEY, &value);
+        }
+        Message::CycleLocale => {
+            state.localizer.cycle_user_locale();
+            let value = state.localizer.locale().tag();
+            persist_application_preference(state, LOCALE_KEY, value);
+        }
+        Message::ToggleHighContrast => {
+            state.presentation.toggle_high_contrast();
+            let value = state.presentation.high_contrast().to_string();
+            persist_application_preference(state, HIGH_CONTRAST_KEY, &value);
+        }
+        Message::ToggleReducedMotion => {
+            state.presentation.toggle_reduced_motion();
+            let value = state.presentation.reduced_motion().to_string();
+            persist_application_preference(state, REDUCED_MOTION_KEY, &value);
+        }
+        Message::ToggleInspector => state.inspector_open = !state.inspector_open,
+        Message::TrackpadMagnified(delta) => {
+            if let Some(factor) = trackpad::magnification_factor(delta) {
+                state.camera = state.camera.zoom_centered(factor);
+                state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            }
+        }
+        Message::ExecuteCommand(command) => return navigation::execute_command(state, command),
         Message::Floor(message) => return floors::update(state, message),
         Message::Portal(message) => return portals::update(state, message),
         Message::OrchestrationTick => {
@@ -493,7 +613,23 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::SaveNote(overwrite) => context_nodes::save_note(state, overwrite),
         Message::ReloadNote => context_nodes::reload_note(state),
         Message::SaveCanvasText => context_nodes::save_canvas_text(state),
-        Message::CreateDirectoryChanged(value) => state.create_directory = value,
+        Message::OpenProject => {
+            let title = state.localizer.text("open-project-dialog-title");
+            return Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .set_title(title)
+                        .pick_folder()
+                        .await
+                        .map(|directory| directory.path().to_path_buf())
+                },
+                Message::ProjectDirectorySelected,
+            );
+        }
+        Message::ProjectDirectorySelected(Some(directory)) => {
+            create_workspace(state, &directory);
+        }
+        Message::ProjectDirectorySelected(None) => {}
         Message::NameChanged(value) => state.name = value,
         Message::IconChanged(value) => state.icon = value,
         Message::WorkingDirectoryChanged(value) => state.working_directory = value,
@@ -515,29 +651,6 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::RoleColorChanged(value) => state.role_color = value,
         Message::RoleIconChanged(value) => state.role_icon = value,
         Message::RoleInstructionsChanged(value) => state.role_instructions = value,
-        Message::CreateWorkspace => {
-            let result = state
-                .workspaces
-                .as_mut()
-                .ok_or_else(|| "workspace storage is unavailable".to_owned())
-                .and_then(|workspaces| {
-                    workspaces
-                        .create_workspace(&state.create_directory, now())
-                        .map_err(|error| error.to_string())
-                });
-            match result {
-                Ok(workspace_id) => {
-                    state.create_directory.clear();
-                    state.notice = Some("Workspace created".to_owned());
-                    state.navigation_ui.mark_stale(workspace_id);
-                    floors::workspace_changed(state);
-                    state.reset_canvas_session();
-                    state.load_active_settings();
-                    state.sync_ipc_directory();
-                }
-                Err(error) => state.notice = Some(error),
-            }
-        }
         Message::SwitchWorkspace(workspace_id) => {
             let result = state
                 .workspaces
@@ -654,28 +767,79 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     Task::none()
 }
 
+fn create_workspace(state: &mut OpenPodium, directory: &Path) {
+    let result = state
+        .workspaces
+        .as_mut()
+        .ok_or_else(|| "workspace storage is unavailable".to_owned())
+        .and_then(|workspaces| {
+            workspaces
+                .create_workspace(directory, now())
+                .map_err(|error| error.to_string())
+        });
+    match result {
+        Ok(workspace_id) => {
+            state.notice = Some(state.localizer.text("workspace-created"));
+            state.navigation_ui.mark_stale(workspace_id);
+            floors::workspace_changed(state);
+            state.reset_canvas_session();
+            state.load_active_settings();
+            state.sync_ipc_directory();
+        }
+        Err(error) => state.notice = Some(error),
+    }
+}
+
 fn view(state: &OpenPodium) -> Element<'_, Message> {
-    let has_active_workspace = state
+    let active_workspace_id = state
         .workspaces
         .as_ref()
         .and_then(WorkspaceManager::active_workspace)
-        .is_some();
-    let mut workspace_list = column![
-        text(APP_NAME).size(24),
-        button(text(format!(
-            "Search / commands ({})",
-            state
-                .command_registry
-                .binding(openpodium::navigation::CommandId::OpenPalette)
-                .map_or_else(
-                    || "unbound".to_owned(),
-                    |shortcut| shortcut.display(openpodium::navigation::Platform::current())
-                )
-        )))
-        .on_press(Message::Navigation(navigation_panel::Message::Open)),
-        text("Workspaces").size(14)
+        .map(Workspace::id);
+    let has_active_workspace = active_workspace_id.is_some();
+    let palette_shortcut = state
+        .command_registry
+        .binding(openpodium::navigation::CommandId::OpenPalette)
+        .map_or_else(
+            || state.localizer.text("unbound"),
+            |shortcut| shortcut.display(openpodium::navigation::Platform::current()),
+        );
+    let brand = row![
+        container(text("O").size(20))
+            .width(42)
+            .height(42)
+            .align_x(IcedAlignment::Center)
+            .align_y(IcedAlignment::Center)
+            .style(shell::app_mark),
+        column![
+            text(state.localizer.text("app-name")).size(19),
+            text(state.localizer.text("app-tagline"))
+                .size(12)
+                .style(shell::muted_text),
+        ]
+        .spacing(1),
     ]
-    .spacing(12);
+    .spacing(10)
+    .align_y(IcedAlignment::Center);
+    let search = button(
+        row![
+            text(state.localizer.text("search-short")).size(13),
+            text(palette_shortcut).size(11).style(shell::subtle_text),
+        ]
+        .spacing(8)
+        .align_y(IcedAlignment::Center),
+    )
+    .style(shell::secondary_button)
+    .padding([10, 12])
+    .on_press(Message::Navigation(navigation_panel::Message::Open))
+    .width(Fill);
+    let mut workspace_list = column![
+        text(state.localizer.text("workspaces"))
+            .size(11)
+            .style(shell::muted_text)
+    ]
+    .spacing(6)
+    .width(Fill);
     if let Some(workspaces) = &state.workspaces {
         for workspace in workspaces.recent_workspaces() {
             let icon = workspace.settings().icon().map_or("", |icon| icon.as_str());
@@ -686,50 +850,108 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             };
             let attention = timeline::attention_counts(workspace).total();
             if attention > 0 {
-                label = if attention == 1 {
-                    format!("{label} · 1 needs attention")
-                } else {
-                    format!("{label} · {attention} need attention")
-                };
+                label = format!(
+                    "{label} · {}",
+                    state.localizer.count("attention-count", attention)
+                );
             }
+            let selected = active_workspace_id == Some(workspace.id());
             workspace_list = workspace_list.push(
-                button(text(label))
+                button(text(label).size(13))
+                    .style(shell::navigation_button(selected))
                     .on_press(Message::SwitchWorkspace(workspace.id()))
                     .width(Fill),
             );
         }
     }
 
-    let create_form = column![
-        text("Open a local directory").size(14),
-        text_input("/path/to/project", &state.create_directory)
-            .on_input(Message::CreateDirectoryChanged),
-        button("Create workspace").on_press(Message::CreateWorkspace),
+    let enabled = |enabled| {
+        state
+            .localizer
+            .text(if enabled { "state-on" } else { "state-off" })
+    };
+    let accessibility_controls = column![
+        text(state.localizer.text("display-settings"))
+            .size(11)
+            .style(shell::muted_text),
+        row![
+            button(text(state.localizer.text(match state.localizer.locale() {
+                Locale::EnUs | Locale::PseudoRtl => "locale-short-en",
+                Locale::PtBr => "locale-short-pt",
+            })))
+            .style(shell::utility_button)
+            .on_press(Message::CycleLocale)
+            .width(Fill),
+            button(text(format!(
+                "{}%",
+                state.presentation.text_scale_percent()
+            )))
+            .style(shell::utility_button)
+            .on_press(Message::CycleTextScale)
+            .width(Fill),
+        ]
+        .spacing(4),
+        row![
+            button(text(state.localizer.with_str(
+                "contrast-short",
+                "state",
+                enabled(state.presentation.high_contrast()),
+            )))
+            .style(shell::utility_button)
+            .on_press(Message::ToggleHighContrast)
+            .width(Fill),
+            button(text(state.localizer.with_str(
+                "motion-short",
+                "state",
+                enabled(state.presentation.reduced_motion()),
+            )))
+            .style(shell::utility_button)
+            .on_press(Message::ToggleReducedMotion)
+            .width(Fill),
+        ]
+        .spacing(4),
     ]
-    .spacing(8);
+    .spacing(6);
+    let add_workspace = if has_active_workspace {
+        column![
+            button(text(state.localizer.text("open-another-project")))
+                .style(shell::secondary_button)
+                .on_press(Message::OpenProject)
+                .width(Fill),
+        ]
+    } else {
+        column![]
+    };
     let sidebar = container(
         column![
+            brand,
+            search,
             scrollable(workspace_list).height(Fill),
-            supervisor_panel::panel(&state.supervisor_snapshot, &state.supervisor_ui)
-                .map(Message::Supervisor),
-            create_form
+            add_workspace,
+            accessibility_controls,
         ]
-        .spacing(16)
+        .spacing(14)
         .height(Fill),
     )
-    .width(280)
+    .style(shell::sidebar)
+    .width(shell::SIDEBAR_WIDTH)
     .height(Fill)
-    .padding(24);
+    .padding(16);
 
     let mut settings = column![
-        text("Workspace settings").size(28),
+        text(state.localizer.text("workspace-inspector")).size(24),
+        text(state.localizer.text("workspace-inspector-description"))
+            .size(13)
+            .style(shell::muted_text),
         text_input("Name", &state.name).on_input(Message::NameChanged),
         text_input("Icon", &state.icon).on_input(Message::IconChanged),
         text_input("Working directory", &state.working_directory)
             .on_input(Message::WorkingDirectoryChanged),
         text_input("Workspace instructions", &state.instructions)
             .on_input(Message::InstructionsChanged),
-        button("Save settings").on_press(Message::SaveSettings),
+        button(text(state.localizer.text("save-workspace")))
+            .style(shell::primary_button)
+            .on_press(Message::SaveSettings),
         floors::view(state),
         portals::creation_view(state),
         text("Add agent").size(18),
@@ -1160,8 +1382,8 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     }
     if !has_active_workspace {
         settings = column![
-            text("Create your first workspace").size(28),
-            text("Enter a local project directory in the sidebar to get started."),
+            text(state.localizer.text("create-first-workspace")).size(28),
+            text(state.localizer.text("create-first-workspace-detail")),
         ]
         .spacing(12)
         .max_width(720);
@@ -1204,6 +1426,14 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     if let Some(portal) = portals::selected_view(state) {
         settings = settings.push(portal);
     }
+    if has_active_workspace {
+        settings = settings
+            .push(text(state.localizer.text("workspace-health")).size(18))
+            .push(
+                supervisor_panel::panel(&state.supervisor_snapshot, &state.supervisor_ui)
+                    .map(Message::Supervisor),
+            );
+    }
 
     let stage: Element<'_, Message> = if has_active_workspace {
         let workspace = state
@@ -1216,43 +1446,138 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .clone()
             .unwrap_or_else(|| workspace.canvas_layout());
         let terminal_views = terminal_views(state, &layout);
-        let document = canvas::CanvasDocument::new(workspace, layout, terminal_views)
-            .with_git_severity(floors::node_severities(state))
-            .with_context_bodies(context_nodes::bodies(&state.context_ui))
-            .with_portal_frames(state.portal_frames.clone());
-        row![
-            canvas::view(
-                state.camera,
-                document,
-                state.canvas_selection.clone(),
-                state.focused_terminal,
-                state.focused_portal,
-                [
-                    openpodium::navigation::CommandId::OpenPalette,
-                    openpodium::navigation::CommandId::FocusCanvas,
+        let document =
+            canvas::CanvasDocument::new(workspace, layout, terminal_views, &state.localizer)
+                .with_git_severity(floors::node_severities(state))
+                .with_context_bodies(context_nodes::bodies(&state.context_ui))
+                .with_portal_frames(state.portal_frames.clone());
+        let canvas = canvas::view(
+            state.camera,
+            document,
+            state.canvas_selection.clone(),
+            state.focused_terminal,
+            state.focused_portal,
+            [
+                CommandId::OpenPalette,
+                CommandId::FocusCanvas,
+                CommandId::ZoomIn,
+                CommandId::ZoomOut,
+                CommandId::ResetZoom,
+            ]
+            .into_iter()
+            .filter_map(|command| state.command_registry.binding(command).cloned())
+            .collect(),
+            state.canvas_revision,
+        )
+        .map(Message::Canvas);
+        let workspace_title = workspace.name().to_owned();
+        let zoom_controls = container(
+            row![
+                button(text("−").size(18))
+                    .style(shell::utility_button)
+                    .padding([5, 10])
+                    .on_press(Message::ExecuteCommand(CommandId::ZoomOut)),
+                button(text(format!("{}%", state.camera.zoom_percent())).size(12))
+                    .style(shell::utility_button)
+                    .padding([7, 9])
+                    .on_press(Message::ExecuteCommand(CommandId::ResetZoom)),
+                button(text("+").size(17))
+                    .style(shell::utility_button)
+                    .padding([5, 10])
+                    .on_press(Message::ExecuteCommand(CommandId::ZoomIn)),
+            ]
+            .spacing(1)
+            .align_y(IcedAlignment::Center),
+        )
+        .style(shell::control_group)
+        .padding(2);
+        let toolbar = container(
+            row![
+                column![
+                    text(workspace_title).size(16),
+                    text(&state.working_directory)
+                        .size(11)
+                        .style(shell::subtle_text),
                 ]
-                .into_iter()
-                .filter_map(|command| state.command_registry.binding(command).cloned())
-                .collect(),
-                state.canvas_revision,
-            )
-            .map(Message::Canvas),
-            container(scrollable(settings))
-                .width(420)
+                .spacing(1)
+                .width(Fill),
+                zoom_controls,
+                button("+ Codex").on_press(Message::AddAgent(AgentProgram::Codex)),
+                button("+ Claude").on_press(Message::AddAgent(AgentProgram::Claude)),
+                button(text(state.localizer.text(if state.inspector_open {
+                    "hide-inspector"
+                } else {
+                    "inspector"
+                })))
+                .style(shell::navigation_button(state.inspector_open))
+                .on_press(Message::ToggleInspector),
+            ]
+            .spacing(8)
+            .align_y(IcedAlignment::Center),
+        )
+        .style(shell::toolbar)
+        .padding([9, 12]);
+        let canvas = container(canvas)
+            .width(Fill)
+            .height(Fill)
+            .style(shell::toolbar);
+        let workspace_body: Element<'_, Message> = if state.inspector_open {
+            let inspector = container(scrollable(settings))
+                .style(shell::inspector)
+                .width(shell::INSPECTOR_WIDTH)
                 .height(Fill)
-                .padding(24),
-        ]
-        .into()
+                .padding(20);
+            row![canvas, inspector].spacing(12).into()
+        } else {
+            canvas.into()
+        };
+        container(column![toolbar, workspace_body].spacing(12))
+            .style(shell::canvas)
+            .width(Fill)
+            .height(Fill)
+            .padding(12)
+            .into()
     } else {
-        container(settings)
+        let mut empty_content = column![
+            container(text("⌘").size(24))
+                .width(56)
+                .height(56)
+                .align_x(IcedAlignment::Center)
+                .align_y(IcedAlignment::Center)
+                .style(shell::app_mark),
+            text(state.localizer.text("empty-eyebrow"))
+                .size(11)
+                .style(shell::muted_text),
+            text(state.localizer.text("create-first-workspace")).size(32),
+            text(state.localizer.text("create-first-workspace-detail"))
+                .size(15)
+                .style(shell::muted_text),
+            button(text(state.localizer.text("open-project")))
+                .style(shell::primary_button)
+                .padding([12, 18])
+                .on_press(Message::OpenProject)
+                .width(Fill),
+        ]
+        .spacing(14)
+        .align_x(IcedAlignment::Center);
+        if let Some(notice) = &state.notice {
+            empty_content = empty_content.push(text(notice).size(12));
+        }
+        let empty_card = container(empty_content)
+            .style(shell::card)
+            .width(Fill)
+            .max_width(620)
+            .padding(44);
+        container(empty_card)
+            .style(shell::canvas)
             .width(Fill)
             .height(Fill)
             .center(Fill)
-            .padding(32)
+            .padding(40)
             .into()
     };
 
-    let application = row![sidebar, stage];
+    let application = row![sidebar, stage].height(Fill);
     if state.navigation_ui.open {
         column![
             navigation_panel::view(&state.navigation_ui, &state.command_registry)
@@ -4604,6 +4929,9 @@ mod tests {
             .create_workspace(&project, Timestamp::from_unix_millis(1))
             .unwrap();
         let mut state = OpenPodium {
+            localizer: Localizer::new(openpodium::localization::Locale::EnUs),
+            presentation: PresentationPreferences::default(),
+            inspector_open: false,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
             portal_ui: portals::UiState::default(),
@@ -4634,7 +4962,6 @@ mod tests {
             trigger_watcher: TriggerWatcher::default(),
             routines_ui: routines_panel::UiState::default(),
             workspaces: Some(workspaces),
-            create_directory: String::new(),
             name: String::new(),
             icon: String::new(),
             working_directory: String::new(),
@@ -4800,6 +5127,45 @@ mod tests {
         state.reset_canvas_session();
 
         assert!(state.terminals.contains_key(&key));
+    }
+
+    #[test]
+    fn toolbar_zoom_commands_update_and_reset_the_canvas_camera() {
+        let temp = TempDir::new().unwrap();
+        let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        let _ = update(&mut state, Message::ExecuteCommand(CommandId::ZoomOut));
+        assert_eq!(state.camera.zoom_percent(), 83);
+
+        let _ = update(&mut state, Message::ExecuteCommand(CommandId::ZoomIn));
+        assert_eq!(state.camera.zoom_percent(), 100);
+
+        let _ = update(&mut state, Message::ExecuteCommand(CommandId::ZoomOut));
+        let _ = update(&mut state, Message::ExecuteCommand(CommandId::ResetZoom));
+        assert_eq!(state.camera, Camera::default());
+
+        let zoom_out = state
+            .command_registry
+            .binding(CommandId::ZoomOut)
+            .cloned()
+            .unwrap();
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Other,
+            Some(zoom_out.clone()),
+            event::Status::Captured,
+        );
+        assert_eq!(state.camera.zoom_percent(), 100);
+
+        state.focused_terminal = Some(NodeId::new(1));
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Other,
+            Some(zoom_out),
+            event::Status::Captured,
+        );
+        assert_eq!(state.camera.zoom_percent(), 83);
     }
 
     #[test]
@@ -5283,11 +5649,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn changing_one_application_preference_does_not_freeze_system_defaults() {
+        let temp = TempDir::new().unwrap();
+        let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        let _ = update(&mut state, Message::CycleLocale);
+        assert_eq!(state.localizer.locale(), Locale::PtBr);
+        assert_eq!(
+            state.workspaces.as_ref().unwrap().preferences().unwrap(),
+            vec![(LOCALE_KEY.to_owned(), "pt-BR".to_owned())]
+        );
+
+        let previous_contrast = state.presentation.high_contrast();
+        let _ = update(&mut state, Message::ToggleHighContrast);
+        assert_eq!(state.presentation.high_contrast(), !previous_contrast);
+        assert_eq!(
+            state.workspaces.as_ref().unwrap().preferences().unwrap(),
+            vec![
+                (
+                    HIGH_CONTRAST_KEY.to_owned(),
+                    (!previous_contrast).to_string()
+                ),
+                (LOCALE_KEY.to_owned(), "pt-BR".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn selecting_a_project_directory_creates_and_activates_its_workspace() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("selected-project");
+        fs::create_dir(&project).unwrap();
+        let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        let _ = update(&mut state, Message::ProjectDirectorySelected(Some(project)));
+
+        let workspace = state
+            .workspaces
+            .as_ref()
+            .and_then(WorkspaceManager::active_workspace)
+            .expect("the selected directory should become the active workspace");
+        assert_eq!(workspace.name(), "selected-project");
+        assert_eq!(state.notice.as_deref(), Some("Workspace created"));
+    }
+
     fn test_state(
         workspaces: WorkspaceManager,
         terminals: BTreeMap<TerminalKey, Session>,
     ) -> OpenPodium {
         OpenPodium {
+            localizer: Localizer::new(openpodium::localization::Locale::EnUs),
+            presentation: PresentationPreferences::default(),
+            inspector_open: false,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
             portal_ui: portals::UiState::default(),
@@ -5318,7 +5734,6 @@ mod tests {
             trigger_watcher: TriggerWatcher::default(),
             routines_ui: routines_panel::UiState::default(),
             workspaces: Some(workspaces),
-            create_directory: String::new(),
             name: String::new(),
             icon: String::new(),
             working_directory: String::new(),

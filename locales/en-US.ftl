@@ -1,0 +1,74 @@
+app-name = OpenPodium
+app-tagline = Agent canvas
+unbound = unbound
+search-commands = Search / commands ({ $shortcut })
+search-short = Search and commands
+workspaces = Workspaces
+open-project = Open project…
+open-another-project = Open another project…
+open-project-dialog-title = Choose a project folder
+workspace-created = Workspace created
+empty-eyebrow = INFINITE AGENT CANVAS
+create-first-workspace = Put your agents on the same canvas.
+create-first-workspace-detail = Open a local project to start arranging agents, terminals, notes, and project context in one place.
+node-count = { $count ->
+    [one] { $count } node
+   *[other] { $count } nodes
+}
+attention-count = { $count ->
+    [one] 1 needs attention
+   *[other] { $count } need attention
+}
+accessibility-settings = Accessibility
+display-settings = Display
+text-scale = Interface scale: { $percent }%
+high-contrast = High contrast: { $state }
+reduced-motion = Reduced motion: { $state }
+state-on = on
+state-off = off
+locale = Language: { $locale }
+locale-en-us = English (United States)
+locale-pt-br = Portuguese (Brazil)
+locale-short-en = EN
+locale-short-pt = PT
+contrast-short = Contrast { $state }
+motion-short = Motion { $state }
+workspace-inspector = Workspace inspector
+workspace-inspector-description = Configure the active canvas and its agents.
+save-workspace = Save workspace
+workspace-health = Workspace health
+inspector = Inspector
+hide-inspector = Hide inspector
+canvas-unavailable = Unavailable
+canvas-missing-agent = Missing agent { $id }
+canvas-missing-task = Missing task { $id }
+canvas-handoff = Handoff { $id }
+canvas-handoff-recipient = To agent { $recipient }
+canvas-project-files = Project files
+canvas-diff = Diff · { $path }
+canvas-working-tree-against-head = Working tree against HEAD
+canvas-text = Text
+canvas-annotation = Canvas annotation
+canvas-portal = Portal
+canvas-portal-browser = Browser
+canvas-portal-android = Android
+canvas-portal-ios = iOS
+canvas-shape-rectangle = Rectangle
+canvas-shape-ellipse = Ellipse
+canvas-shape-description = Canvas shape
+canvas-arrow = Arrow
+canvas-drawing = Drawing
+canvas-freehand-annotation = Freehand annotation
+canvas-task-queued = queued
+canvas-task-delivered = delivered
+canvas-task-running = running
+canvas-task-blocked = blocked
+canvas-task-completed = completed
+canvas-task-failed = failed
+canvas-task-cancelled = cancelled
+terminal-offline = terminal offline
+terminal-starting = terminal starting
+terminal-running = terminal running
+terminal-exited = terminal exited ({ $detail })
+terminal-stopped = terminal stopped
+terminal-failed = terminal failed: { $detail }

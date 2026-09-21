@@ -14,7 +14,7 @@ use super::codec::{
     encode_event, encode_workspace,
 };
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MIGRATION_0_TO_1: &str = "
@@ -79,6 +79,13 @@ const MIGRATION_2_TO_3: &str = "
 CREATE TABLE application_shortcuts (
     command_id TEXT PRIMARY KEY,
     shortcut   TEXT
+) STRICT;
+";
+
+const MIGRATION_3_TO_4: &str = "
+CREATE TABLE application_preferences (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 ) STRICT;
 ";
 
@@ -329,6 +336,34 @@ impl Journal {
                 params![command_id, shortcut],
             )
             .map_err(|source| PersistenceError::database("store shortcut", source))?;
+        Ok(())
+    }
+
+    pub fn preferences(&self) -> Result<Vec<(String, String)>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT key, value
+                 FROM application_preferences
+                 ORDER BY key",
+            )
+            .map_err(|source| PersistenceError::database("prepare preferences", source))?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|source| PersistenceError::database("query preferences", source))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| PersistenceError::database("read preferences", source))
+    }
+
+    pub fn store_preference(&mut self, key: &str, value: &str) -> Result<(), PersistenceError> {
+        self.connection
+            .execute(
+                "INSERT INTO application_preferences (key, value)
+                 VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(|source| PersistenceError::database("store preference", source))?;
         Ok(())
     }
 
@@ -695,6 +730,11 @@ fn migrate(connection: &mut Connection, path: &Path, from: u32) -> Result<(), Pe
                     .execute_batch(MIGRATION_2_TO_3)
                     .map_err(|source| {
                         PersistenceError::database("apply schema version 3", source)
+                    })?,
+                3 => transaction
+                    .execute_batch(MIGRATION_3_TO_4)
+                    .map_err(|source| {
+                        PersistenceError::database("apply schema version 4", source)
                     })?,
                 _ => {
                     return Err(PersistenceError::Configuration {

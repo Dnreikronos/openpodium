@@ -369,7 +369,7 @@ impl canvas::Program<Message> for Surface {
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let anchor = cursor.position_in(bounds)?;
                 let (x, y, zoom_sensitivity) = scroll_delta(*delta);
-                if !(state.modifiers.command() || state.modifiers.control())
+                if state.modifiers.alt()
                     && let Some((node_id, observation_revision, point)) =
                         self.portal_point_at(anchor, bounds)
                 {
@@ -385,7 +385,7 @@ impl canvas::Program<Message> for Surface {
                         .and_capture(),
                     );
                 }
-                if !(state.modifiers.command() || state.modifiers.control())
+                if state.modifiers.alt()
                     && let Some((node_id, row, column, _)) = self.terminal_cell_at(anchor, bounds)
                 {
                     let lines = (y / f64::from(CELL_HEIGHT)).round() as i32;
@@ -405,14 +405,13 @@ impl canvas::Program<Message> for Surface {
                         );
                     }
                 }
-                let camera = if state.modifiers.command() || state.modifiers.control() {
-                    self.camera.zoom_at(
-                        (y * zoom_sensitivity).exp(),
-                        ScreenPoint::new(f64::from(anchor.x), f64::from(anchor.y)),
-                        viewport(bounds),
-                    )
-                } else {
-                    self.camera.pan_by_screen(x, y)
+                let camera = match (*delta, state.modifiers.alt()) {
+                    (_, true) | (mouse::ScrollDelta::Pixels { .. }, false) => {
+                        self.camera.pan_by_screen(x, y)
+                    }
+                    (mouse::ScrollDelta::Lines { .. }, false) => {
+                        zoom_camera(self.camera, y, zoom_sensitivity, anchor, bounds)
+                    }
                 };
                 self.publish_camera(state, camera)
             }
@@ -670,10 +669,7 @@ impl Surface {
         text: Option<&str>,
         modifiers: Modifiers,
     ) -> Option<Action<Message>> {
-        if crate::navigation_panel::shortcut_from_key(key, modifiers)
-            .as_ref()
-            .is_some_and(|shortcut| self.application_shortcuts.contains(shortcut))
-        {
+        if is_application_shortcut(&self.application_shortcuts, key, modifiers) {
             return Some(Action::capture());
         }
         if is_copy_shortcut(key, modifiers) {
@@ -695,10 +691,7 @@ impl Surface {
         text: Option<&str>,
         modifiers: Modifiers,
     ) -> Option<Action<Message>> {
-        if crate::navigation_panel::shortcut_from_key(key, modifiers)
-            .as_ref()
-            .is_some_and(|shortcut| self.application_shortcuts.contains(shortcut))
-        {
+        if is_application_shortcut(&self.application_shortcuts, key, modifiers) {
             return Some(Action::capture());
         }
         if modifiers.command() || modifiers.control() || modifiers.alt() {
@@ -905,6 +898,12 @@ fn viewport(bounds: Rectangle) -> ViewportSize {
     ViewportSize::new(f64::from(bounds.width), f64::from(bounds.height))
 }
 
+fn is_application_shortcut(shortcuts: &[Shortcut], key: &Key, modifiers: Modifiers) -> bool {
+    crate::navigation_panel::shortcut_from_key(key, modifiers)
+        .as_ref()
+        .is_some_and(|shortcut| shortcuts.contains(shortcut))
+}
+
 fn scroll_delta(delta: mouse::ScrollDelta) -> (f64, f64, f64) {
     match delta {
         mouse::ScrollDelta::Lines { x, y } => (
@@ -914,6 +913,20 @@ fn scroll_delta(delta: mouse::ScrollDelta) -> (f64, f64, f64) {
         ),
         mouse::ScrollDelta::Pixels { x, y } => (f64::from(x), f64::from(y), PIXEL_ZOOM_SENSITIVITY),
     }
+}
+
+fn zoom_camera(
+    camera: Camera,
+    vertical_delta: f64,
+    sensitivity: f64,
+    anchor: Point,
+    bounds: Rectangle,
+) -> Camera {
+    camera.zoom_at(
+        (vertical_delta * sensitivity).exp(),
+        ScreenPoint::new(f64::from(anchor.x), f64::from(anchor.y)),
+        viewport(bounds),
+    )
 }
 
 fn saturating_i32(value: f64) -> i32 {
@@ -948,6 +961,7 @@ mod tests {
     use openpodium::domain::{
         CanvasNodeContent, CanvasPoint, CanvasSize, Name, Node, Workspace, WorkspaceId,
     };
+    use openpodium::localization::{Locale, Localizer};
     use openpodium::portal::{PortalConfig, PortalFrame, PortalFrameEncoding, PortalViewport};
 
     use super::*;
@@ -964,6 +978,7 @@ mod tests {
             &workspace,
             CanvasLayout::new(vec![node], Vec::new(), Vec::new()),
             BTreeMap::new(),
+            &Localizer::new(Locale::EnUs),
         )
         .with_portal_frames(BTreeMap::from([(
             node_id,
@@ -1067,6 +1082,60 @@ mod tests {
             ),
             Some(release)
         );
+    }
+
+    #[test]
+    fn focused_embedded_content_releases_zoom_shortcuts_to_the_application() {
+        let shortcuts = [
+            Shortcut::parse("plus").unwrap(),
+            Shortcut::parse("minus").unwrap(),
+            Shortcut::parse("0").unwrap(),
+        ];
+
+        assert!(is_application_shortcut(
+            &shortcuts,
+            &Key::Character("+".into()),
+            Modifiers::empty(),
+        ));
+        assert!(is_application_shortcut(
+            &shortcuts,
+            &Key::Character("-".into()),
+            Modifiers::empty(),
+        ));
+        assert!(is_application_shortcut(
+            &shortcuts,
+            &Key::Character("0".into()),
+            Modifiers::empty(),
+        ));
+        assert!(!is_application_shortcut(
+            &shortcuts,
+            &Key::Character("z".into()),
+            Modifiers::empty(),
+        ));
+    }
+
+    #[test]
+    fn mouse_wheel_zooms_while_trackpad_scroll_pans_without_modifiers() {
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1_000.0, 800.0));
+        let anchor = Point::new(760.0, 240.0);
+        let camera = Camera::default();
+        let world_before = camera.screen_to_world(
+            ScreenPoint::new(f64::from(anchor.x), f64::from(anchor.y)),
+            viewport(bounds),
+        );
+
+        let (_, wheel_y, sensitivity) = scroll_delta(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 });
+        let zoomed = zoom_camera(camera, wheel_y, sensitivity, anchor, bounds);
+        let screen_after = zoomed.world_to_screen(world_before, viewport(bounds));
+        assert!(zoomed.zoom() > camera.zoom());
+        assert!((screen_after.x - f64::from(anchor.x)).abs() < 0.001);
+        assert!((screen_after.y - f64::from(anchor.y)).abs() < 0.001);
+
+        let (trackpad_x, trackpad_y, _) =
+            scroll_delta(mouse::ScrollDelta::Pixels { x: 18.0, y: 24.0 });
+        let panned = camera.pan_by_screen(trackpad_x, trackpad_y);
+        assert_eq!(panned.zoom(), camera.zoom());
+        assert_ne!(panned.position(), camera.position());
     }
 
     #[test]

@@ -226,7 +226,7 @@ fn draw_nodes(
         let accent = node_color(label.kind, palette);
         let is_selected = selected.contains(&node.id());
 
-        frame.fill(&shape, Color::from_rgb(0.055, 0.065, 0.08));
+        frame.fill(&shape, palette.background.weakest.color);
         frame.stroke(
             &shape,
             Stroke::default()
@@ -242,7 +242,7 @@ fn draw_nodes(
         frame.fill_rectangle(
             top_left,
             Size::new(size.width, header_height),
-            palette.background.strong.color,
+            palette.background.weak.color,
         );
         frame.fill_rectangle(
             top_left,
@@ -255,7 +255,7 @@ fn draw_nodes(
             frame.fill_text(canvas::Text {
                 content: label.title.clone(),
                 position: Point::new(top_left.x + padding, top_left.y + padding * 0.45),
-                color: palette.background.strong.text,
+                color: palette.background.weak.text,
                 size: Pixels((14.0 * zoom).clamp(9.0, 17.0)),
                 ..canvas::Text::default()
             });

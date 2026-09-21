@@ -358,6 +358,16 @@ impl WorkspaceManager {
             .map_err(WorkspaceError::from)
     }
 
+    pub fn preferences(&self) -> Result<Vec<(String, String)>, WorkspaceError> {
+        self.journal.preferences().map_err(WorkspaceError::from)
+    }
+
+    pub fn store_preference(&mut self, key: &str, value: &str) -> Result<(), WorkspaceError> {
+        self.journal
+            .store_preference(key, value)
+            .map_err(WorkspaceError::from)
+    }
+
     fn next_workspace_id(&self) -> Result<WorkspaceId, WorkspaceError> {
         let next = self
             .workspaces

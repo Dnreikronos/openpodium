@@ -1,12 +1,15 @@
+pub mod accessibility;
 pub mod context;
 pub mod domain;
 pub mod git;
 pub mod ipc;
+pub mod localization;
 pub mod navigation;
 pub mod orchestration;
 pub mod persistence;
 pub mod plugins;
 pub mod portal;
+pub mod presentation;
 pub mod remote;
 pub mod routines;
 pub mod runtime;

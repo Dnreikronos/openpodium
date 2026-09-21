@@ -29,7 +29,10 @@ The first release will provide:
 
 See the [product specification](docs/product-spec.md),
 [architecture](docs/architecture.md), and
-[third-party plugin SDK](docs/plugins.md) for the working contracts.
+[third-party plugin SDK](docs/plugins.md) for the working contracts. The
+[accessibility and localization contract](docs/accessibility.md) documents the
+semantic UI model, presentation preferences, international input behavior, and
+the remaining native screen-reader limitation.
 
 ## Development
 
@@ -52,8 +55,8 @@ cargo run
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
 ```
 
 CI runs all three commands on macOS, Linux, and Windows. The current source boundaries are documented in [the architecture](docs/architecture.md#initial-code-organization).

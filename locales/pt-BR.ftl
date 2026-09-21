@@ -1,0 +1,74 @@
+app-name = OpenPodium
+app-tagline = Canvas de agentes
+unbound = sem atalho
+search-commands = Buscar / comandos ({ $shortcut })
+search-short = Buscar e comandos
+workspaces = Espaços de trabalho
+open-project = Abrir projeto…
+open-another-project = Abrir outro projeto…
+open-project-dialog-title = Escolha a pasta do projeto
+workspace-created = Espaço de trabalho criado
+empty-eyebrow = CANVAS INFINITO DE AGENTES
+create-first-workspace = Coloque seus agentes no mesmo canvas.
+create-first-workspace-detail = Abra um projeto local para organizar agentes, terminais, notas e contexto em um só lugar.
+node-count = { $count ->
+    [one] { $count } nó
+   *[other] { $count } nós
+}
+attention-count = { $count ->
+    [one] 1 requer atenção
+   *[other] { $count } requerem atenção
+}
+accessibility-settings = Acessibilidade
+display-settings = Exibição
+text-scale = Escala da interface: { $percent }%
+high-contrast = Alto contraste: { $state }
+reduced-motion = Movimento reduzido: { $state }
+state-on = ativado
+state-off = desativado
+locale = Idioma: { $locale }
+locale-en-us = Inglês (Estados Unidos)
+locale-pt-br = Português (Brasil)
+locale-short-en = EN
+locale-short-pt = PT
+contrast-short = Contraste { $state }
+motion-short = Movimento { $state }
+workspace-inspector = Inspetor do espaço de trabalho
+workspace-inspector-description = Configure o canvas ativo e seus agentes.
+save-workspace = Salvar espaço de trabalho
+workspace-health = Saúde do espaço de trabalho
+inspector = Inspetor
+hide-inspector = Ocultar inspetor
+canvas-unavailable = Indisponível
+canvas-missing-agent = Agente { $id } ausente
+canvas-missing-task = Tarefa { $id } ausente
+canvas-handoff = Transferência { $id }
+canvas-handoff-recipient = Para o agente { $recipient }
+canvas-project-files = Arquivos do projeto
+canvas-diff = Alterações · { $path }
+canvas-working-tree-against-head = Árvore de trabalho comparada à HEAD
+canvas-text = Texto
+canvas-annotation = Anotação do canvas
+canvas-portal = Portal
+canvas-portal-browser = Navegador
+canvas-portal-android = Android
+canvas-portal-ios = iOS
+canvas-shape-rectangle = Retângulo
+canvas-shape-ellipse = Elipse
+canvas-shape-description = Forma do canvas
+canvas-arrow = Seta
+canvas-drawing = Desenho
+canvas-freehand-annotation = Anotação à mão livre
+canvas-task-queued = na fila
+canvas-task-delivered = entregue
+canvas-task-running = em execução
+canvas-task-blocked = bloqueada
+canvas-task-completed = concluída
+canvas-task-failed = falhou
+canvas-task-cancelled = cancelada
+terminal-offline = terminal desconectado
+terminal-starting = terminal iniciando
+terminal-running = terminal em execução
+terminal-exited = terminal encerrado ({ $detail })
+terminal-stopped = terminal parado
+terminal-failed = falha no terminal: { $detail }
