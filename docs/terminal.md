@@ -12,13 +12,27 @@ Switching workspaces detaches the terminal view while its workspace-keyed proces
 background. Removing a node, stopping a terminal, or closing the application cancels its process
 through the runtime boundary.
 
+Reopening replays a node's last screen. Each session keeps a bounded tail of
+the raw output it received, and that transcript is written to a side table on a
+slow cadence and again as the application closes. On load the bytes are fed to a
+fresh emulator, so a restored node shows the output it had, with its colours and
+layout, while reporting `offline`. The process is gone; nothing restarts until
+the user starts it.
+
+A transcript is a display cache, never domain truth. It is capped so only the
+tail survives, trimmed at a line boundary so a replay cannot begin partway
+through an escape sequence, dropped when its node no longer exists, and safe to
+delete at any time without losing anything the journal owns. Conversation
+history is unaffected by any of this: chat threads, messages, and drafts are
+journal-backed and restore on their own.
+
 Shell nodes launch the user's login shell on Unix and `COMSPEC` on Windows. Codex and Claude nodes
 launch the `codex` and `claude` executables. Every child receives `TERM=xterm-256color`,
 `COLORTERM=truecolor`, and `TERM_PROGRAM=OpenPodium`. Custom agent commands and OpenCode presets
 remain follow-up work; issue #9 custom environments are argv-based wrappers around these programs.
 
 The node header reports `offline`, `starting`, `running`, `exited`, `stopped`, or `failed`. Runtime
-handles and emulator state are never serialized.
+handles and live emulator state are never serialized; only the bounded output transcript above is.
 
 ## Emulation and rendering
 
