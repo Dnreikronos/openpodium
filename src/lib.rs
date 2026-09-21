@@ -9,6 +9,7 @@ pub mod plugins;
 pub mod portal;
 pub mod routines;
 pub mod runtime;
+pub mod security;
 pub mod supervisor;
 pub mod timeline;
 pub mod workspaces;

@@ -20,6 +20,19 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKING_DIRECTORY_MARKER: &str = ".openpodium-runtime-cwd";
 const WORKING_DIRECTORY_CONTENT: &str = "__OPENPODIUM_CWD__";
 
+#[test]
+fn process_debug_output_redacts_secret_arguments_and_environment() {
+    let spec = ProcessSpec::new("agent", "/workspace")
+        .arg("--authorization=Bearer abcdefghijklmnop")
+        .env("SERVICE_PASSWORD", "do-not-print-this")
+        .env("MESSAGE", "token=embedded-secret-value");
+
+    let debug = format!("{spec:?}");
+    assert!(!debug.contains("abcdefghijklmnop"));
+    assert!(!debug.contains("do-not-print-this"));
+    assert!(!debug.contains("embedded-secret-value"));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn interactive_shell_uses_working_directory_and_accepts_input() {
     let _test = TEST_LOCK.lock().await;

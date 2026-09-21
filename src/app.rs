@@ -3016,17 +3016,25 @@ fn format_process_preview(spec: &openpodium::runtime::ProcessSpec) -> String {
     let arguments = spec
         .arguments()
         .iter()
-        .map(|argument| format!("{argument:?}"))
+        .map(|argument| {
+            format!(
+                "{:?}",
+                openpodium::security::redact_secrets(&argument.to_string_lossy())
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let environment = spec
         .environment()
         .iter()
         .map(|(name, value)| {
-            if name.to_string_lossy() == TOKEN_ENV {
+            if openpodium::security::is_sensitive_name(&name.to_string_lossy()) {
                 format!("{name:?}=\"[redacted]\"")
             } else {
-                format!("{name:?}={value:?}")
+                format!(
+                    "{name:?}={:?}",
+                    openpodium::security::redact_secrets(&value.to_string_lossy())
+                )
             }
         })
         .collect::<Vec<_>>()

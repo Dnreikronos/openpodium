@@ -148,7 +148,9 @@ fn command_output(program: &str, arguments: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|error| format!("{program} could not be started: {error}"))?;
     if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let detail =
+            crate::security::redact_secrets(String::from_utf8_lossy(&output.stderr).trim())
+                .into_owned();
         return Err(if detail.is_empty() {
             format!("{program} exited with {}", output.status)
         } else {

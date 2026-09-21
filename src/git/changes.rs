@@ -324,7 +324,7 @@ fn fields(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 fn stderr(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).trim().to_owned()
+    crate::security::redact_secrets(String::from_utf8_lossy(bytes).trim()).into_owned()
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
