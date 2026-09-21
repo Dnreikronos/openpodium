@@ -1,3 +1,4 @@
+pub mod accessibility;
 pub mod context;
 pub mod domain;
 pub mod git;
