@@ -8,5 +8,6 @@ pub mod persistence;
 pub mod portal;
 pub mod routines;
 pub mod runtime;
+pub mod supervisor;
 pub mod timeline;
 pub mod workspaces;

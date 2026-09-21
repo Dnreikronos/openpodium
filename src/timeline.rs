@@ -3,9 +3,9 @@
 use std::collections::BTreeSet;
 
 use crate::domain::{
-    AgentId, DeliveryOutcome, DomainEvent, Handoff, HandoffPayload, HandoffResponseStatus,
-    HandoffTermination, NodeId, NodeTarget, Task, TaskId, TaskState, TimelineEvent,
-    TimelineEventId, Timestamp, Workspace, WorkspaceId,
+    AgentId, AgentState, DeliveryOutcome, DomainEvent, Handoff, HandoffPayload,
+    HandoffResponseStatus, HandoffTermination, NodeId, NodeTarget, Task, TaskId, TaskState,
+    TimelineEvent, TimelineEventId, Timestamp, Workspace, WorkspaceId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +411,14 @@ fn project_event(workspace: &Workspace, event: &TimelineEvent) -> TimelineItem {
         ),
     };
     let attention = match event.event() {
+        DomainEvent::AgentStateChanged {
+            to: AgentState::Failed,
+            ..
+        } => AttentionLevel::Urgent,
+        DomainEvent::AgentStateChanged {
+            to: AgentState::Completed,
+            ..
+        } => AttentionLevel::Informational,
         DomainEvent::TaskStateChanged {
             to: TaskState::Blocked | TaskState::Failed,
             ..
