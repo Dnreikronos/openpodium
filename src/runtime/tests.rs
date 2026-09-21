@@ -17,6 +17,12 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 // runners even after cmd.exe has accepted the terminal-size query.
 #[cfg(windows)]
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(windows))]
+const TERMINAL_SIZE_TIMEOUT: Duration = TEST_TIMEOUT;
+// Windows PowerShell is started inside cmd.exe for this assertion. On a busy
+// hosted runner, that second process can take longer than the normal PTY budget.
+#[cfg(windows)]
+const TERMINAL_SIZE_TIMEOUT: Duration = Duration::from_secs(60);
 const WORKING_DIRECTORY_MARKER: &str = ".openpodium-runtime-cwd";
 const WORKING_DIRECTORY_CONTENT: &str = "__OPENPODIUM_CWD__";
 
@@ -88,7 +94,8 @@ async fn resize_is_visible_inside_the_child_terminal() {
     controller
         .write_input(shell_input_for_terminal_size())
         .expect("terminal query reaches shell");
-    let mut output = collect_until_output(&mut process, b"41 111").await;
+    let mut output =
+        collect_until_output_with_timeout(&mut process, b"41 111", TERMINAL_SIZE_TIMEOUT).await;
     controller
         .write_input(shell_exit_input())
         .expect("exit reaches shell");
@@ -183,7 +190,15 @@ async fn collect_process(process: &mut super::RunningProcess) -> (Vec<u8>, Proce
 }
 
 async fn collect_until_output(process: &mut super::RunningProcess, expected: &[u8]) -> Vec<u8> {
-    let deadline = Instant::now() + TEST_TIMEOUT;
+    collect_until_output_with_timeout(process, expected, TEST_TIMEOUT).await
+}
+
+async fn collect_until_output_with_timeout(
+    process: &mut super::RunningProcess,
+    expected: &[u8],
+    timeout: Duration,
+) -> Vec<u8> {
+    let deadline = Instant::now() + timeout;
     let mut output = Vec::new();
     loop {
         match timeout_at(deadline, process.next_event()).await {
@@ -265,7 +280,7 @@ fn shell_input_for_terminal_size() -> &'static [u8] {
 
 #[cfg(windows)]
 fn shell_input_for_terminal_size() -> &'static [u8] {
-    b"powershell.exe -NoLogo -NoProfile -Command \"$s=$Host.UI.RawUI.WindowSize; Write-Output ('{0} {1}' -f $s.Height,$s.Width)\"\r"
+    b"powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"$s=$Host.UI.RawUI.WindowSize; Write-Output ('{0} {1}' -f $s.Height,$s.Width)\"\r"
 }
 
 fn exiting_process(directory: &Path, code: u8) -> ProcessSpec {
