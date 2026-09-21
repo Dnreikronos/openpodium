@@ -115,6 +115,7 @@ struct OpenPodium {
     timeline_items: BTreeMap<WorkspaceId, Vec<TimelineItem>>,
     timeline_high_watermarks: BTreeMap<WorkspaceId, TimelineEventId>,
     supervisor_ui: supervisor_panel::UiState,
+    supervisor_snapshot: supervisor::Snapshot,
     notification_limiter: NotificationRateLimiter,
     supervisor_collisions: BTreeMap<WorkspaceId, Vec<CollisionObservation>>,
     navigation_ui: navigation_panel::UiState,
@@ -239,6 +240,7 @@ impl Default for OpenPodium {
             timeline_items,
             timeline_high_watermarks,
             supervisor_ui: supervisor_panel::UiState::default(),
+            supervisor_snapshot: supervisor::Snapshot::default(),
             notification_limiter: NotificationRateLimiter::default(),
             supervisor_collisions: BTreeMap::new(),
             navigation_ui: navigation_panel::UiState::default(),
@@ -280,6 +282,7 @@ impl Default for OpenPodium {
         };
         state.load_active_settings();
         state.sync_ipc_directory();
+        refresh_supervisor_snapshot(&mut state);
         navigation::mark_all_stale(&mut state);
         state
     }
@@ -652,7 +655,6 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
 }
 
 fn view(state: &OpenPodium) -> Element<'_, Message> {
-    let supervisor = supervisor_snapshot(state);
     let has_active_workspace = state
         .workspaces
         .as_ref()
@@ -708,7 +710,8 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     let sidebar = container(
         column![
             scrollable(workspace_list).height(Fill),
-            supervisor_panel::panel(&supervisor, &state.supervisor_ui).map(Message::Supervisor),
+            supervisor_panel::panel(&state.supervisor_snapshot, &state.supervisor_ui)
+                .map(Message::Supervisor),
             create_form
         ]
         .spacing(16)
@@ -1366,11 +1369,12 @@ fn load_timeline_state(workspaces: &WorkspaceManager) -> Result<TimelineState, S
     Ok((items, high_watermarks))
 }
 
-fn supervisor_snapshot(state: &OpenPodium) -> supervisor::Snapshot {
+fn refresh_supervisor_snapshot(state: &mut OpenPodium) {
     let Some(workspaces) = state.workspaces.as_ref() else {
-        return supervisor::Snapshot::default();
+        state.supervisor_snapshot = supervisor::Snapshot::default();
+        return;
     };
-    supervisor::aggregate(
+    state.supervisor_snapshot = supervisor::aggregate(
         workspaces
             .recent_workspaces()
             .map(|workspace| WorkspaceActivity {
@@ -1396,6 +1400,7 @@ fn refresh_timelines(state: &mut OpenPodium) -> Task<Message> {
         })
         .unwrap_or_default();
     let mut notifications = Vec::new();
+    let mut supervisor_changed = false;
     for workspace_id in workspace_ids {
         let update = (|| -> Result<_, String> {
             let workspaces = state
@@ -1448,6 +1453,7 @@ fn refresh_timelines(state: &mut OpenPodium) -> Task<Message> {
             .entry(workspace_id)
             .or_default()
             .extend(items);
+        supervisor_changed |= high_watermark.is_some();
         notifications.extend(
             requests
                 .into_iter()
@@ -1463,6 +1469,9 @@ fn refresh_timelines(state: &mut OpenPodium) -> Task<Message> {
                         .then_some(request)
                 }),
         );
+    }
+    if supervisor_changed {
+        refresh_supervisor_snapshot(state);
     }
     Task::batch(notifications.into_iter().map(|request| {
         Task::perform(
@@ -4605,6 +4614,7 @@ mod tests {
             timeline_items: BTreeMap::new(),
             timeline_high_watermarks: BTreeMap::new(),
             supervisor_ui: supervisor_panel::UiState::default(),
+            supervisor_snapshot: supervisor::Snapshot::default(),
             notification_limiter: NotificationRateLimiter::default(),
             supervisor_collisions: BTreeMap::new(),
             navigation_ui: navigation_panel::UiState::default(),
@@ -5288,6 +5298,7 @@ mod tests {
             timeline_items: BTreeMap::new(),
             timeline_high_watermarks: BTreeMap::new(),
             supervisor_ui: supervisor_panel::UiState::default(),
+            supervisor_snapshot: supervisor::Snapshot::default(),
             notification_limiter: NotificationRateLimiter::default(),
             supervisor_collisions: BTreeMap::new(),
             navigation_ui: navigation_panel::UiState::default(),
