@@ -159,7 +159,6 @@ struct OpenPodium {
     trigger_watcher: TriggerWatcher,
     routines_ui: routines_panel::UiState,
     workspaces: Option<WorkspaceManager>,
-    create_directory: String,
     name: String,
     icon: String,
     working_directory: String,
@@ -287,7 +286,6 @@ impl Default for OpenPodium {
             trigger_watcher: TriggerWatcher::new(now()),
             routines_ui: routines_panel::UiState::default(),
             workspaces,
-            create_directory: String::new(),
             name: String::new(),
             icon: String::new(),
             working_directory: String::new(),
@@ -372,8 +370,8 @@ enum Message {
     SaveNote(bool),
     ReloadNote,
     SaveCanvasText,
-    CreateDirectoryChanged(String),
-    CreateWorkspace,
+    OpenProject,
+    ProjectDirectorySelected(Option<PathBuf>),
     SwitchWorkspace(WorkspaceId),
     NameChanged(String),
     IconChanged(String),
@@ -603,7 +601,23 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::SaveNote(overwrite) => context_nodes::save_note(state, overwrite),
         Message::ReloadNote => context_nodes::reload_note(state),
         Message::SaveCanvasText => context_nodes::save_canvas_text(state),
-        Message::CreateDirectoryChanged(value) => state.create_directory = value,
+        Message::OpenProject => {
+            let title = state.localizer.text("open-project-dialog-title");
+            return Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .set_title(title)
+                        .pick_folder()
+                        .await
+                        .map(|directory| directory.path().to_path_buf())
+                },
+                Message::ProjectDirectorySelected,
+            );
+        }
+        Message::ProjectDirectorySelected(Some(directory)) => {
+            create_workspace(state, &directory);
+        }
+        Message::ProjectDirectorySelected(None) => {}
         Message::NameChanged(value) => state.name = value,
         Message::IconChanged(value) => state.icon = value,
         Message::WorkingDirectoryChanged(value) => state.working_directory = value,
@@ -625,29 +639,6 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::RoleColorChanged(value) => state.role_color = value,
         Message::RoleIconChanged(value) => state.role_icon = value,
         Message::RoleInstructionsChanged(value) => state.role_instructions = value,
-        Message::CreateWorkspace => {
-            let result = state
-                .workspaces
-                .as_mut()
-                .ok_or_else(|| "workspace storage is unavailable".to_owned())
-                .and_then(|workspaces| {
-                    workspaces
-                        .create_workspace(&state.create_directory, now())
-                        .map_err(|error| error.to_string())
-                });
-            match result {
-                Ok(workspace_id) => {
-                    state.create_directory.clear();
-                    state.notice = Some(state.localizer.text("workspace-created"));
-                    state.navigation_ui.mark_stale(workspace_id);
-                    floors::workspace_changed(state);
-                    state.reset_canvas_session();
-                    state.load_active_settings();
-                    state.sync_ipc_directory();
-                }
-                Err(error) => state.notice = Some(error),
-            }
-        }
         Message::SwitchWorkspace(workspace_id) => {
             let result = state
                 .workspaces
@@ -764,6 +755,29 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     Task::none()
 }
 
+fn create_workspace(state: &mut OpenPodium, directory: &Path) {
+    let result = state
+        .workspaces
+        .as_mut()
+        .ok_or_else(|| "workspace storage is unavailable".to_owned())
+        .and_then(|workspaces| {
+            workspaces
+                .create_workspace(directory, now())
+                .map_err(|error| error.to_string())
+        });
+    match result {
+        Ok(workspace_id) => {
+            state.notice = Some(state.localizer.text("workspace-created"));
+            state.navigation_ui.mark_stale(workspace_id);
+            floors::workspace_changed(state);
+            state.reset_canvas_session();
+            state.load_active_settings();
+            state.sync_ipc_directory();
+        }
+        Err(error) => state.notice = Some(error),
+    }
+}
+
 fn view(state: &OpenPodium) -> Element<'_, Message> {
     let active_workspace_id = state
         .workspaces
@@ -840,7 +854,6 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         }
     }
 
-    let project_path_placeholder = state.localizer.text("project-path-placeholder");
     let enabled = |enabled| {
         state
             .localizer
@@ -890,17 +903,11 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     .spacing(6);
     let add_workspace = if has_active_workspace {
         column![
-            text(state.localizer.text("open-another-project"))
-                .size(11)
-                .style(shell::muted_text),
-            text_input(&project_path_placeholder, &state.create_directory)
-                .on_input(Message::CreateDirectoryChanged),
-            button(text(state.localizer.text("add-workspace")))
+            button(text(state.localizer.text("open-another-project")))
                 .style(shell::secondary_button)
-                .on_press(Message::CreateWorkspace)
+                .on_press(Message::OpenProject)
                 .width(Fill),
         ]
-        .spacing(6)
     } else {
         column![]
     };
@@ -1507,21 +1514,11 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             text(state.localizer.text("create-first-workspace-detail"))
                 .size(15)
                 .style(shell::muted_text),
-            column![
-                text_input(&project_path_placeholder, &state.create_directory)
-                    .on_input(Message::CreateDirectoryChanged)
-                    .width(Fill),
-                button(text(state.localizer.text("create-workspace")))
-                    .style(shell::primary_button)
-                    .padding([12, 18])
-                    .on_press(Message::CreateWorkspace)
-                    .width(Fill),
-                text(state.localizer.text("project-path-help"))
-                    .size(11)
-                    .style(shell::subtle_text),
-            ]
-            .spacing(8)
-            .width(Fill),
+            button(text(state.localizer.text("open-project")))
+                .style(shell::primary_button)
+                .padding([12, 18])
+                .on_press(Message::OpenProject)
+                .width(Fill),
         ]
         .spacing(14)
         .align_x(IcedAlignment::Center);
@@ -4927,7 +4924,6 @@ mod tests {
             trigger_watcher: TriggerWatcher::default(),
             routines_ui: routines_panel::UiState::default(),
             workspaces: Some(workspaces),
-            create_directory: String::new(),
             name: String::new(),
             icon: String::new(),
             working_directory: String::new(),
@@ -5604,6 +5600,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn selecting_a_project_directory_creates_and_activates_its_workspace() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("selected-project");
+        fs::create_dir(&project).unwrap();
+        let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        let _ = update(&mut state, Message::ProjectDirectorySelected(Some(project)));
+
+        let workspace = state
+            .workspaces
+            .as_ref()
+            .and_then(WorkspaceManager::active_workspace)
+            .expect("the selected directory should become the active workspace");
+        assert_eq!(workspace.name(), "selected-project");
+        assert_eq!(state.notice.as_deref(), Some("Workspace created"));
+    }
+
     fn test_state(
         workspaces: WorkspaceManager,
         terminals: BTreeMap<TerminalKey, Session>,
@@ -5642,7 +5657,6 @@ mod tests {
             trigger_watcher: TriggerWatcher::default(),
             routines_ui: routines_panel::UiState::default(),
             workspaces: Some(workspaces),
-            create_directory: String::new(),
             name: String::new(),
             icon: String::new(),
             working_directory: String::new(),

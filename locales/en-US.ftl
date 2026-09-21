@@ -4,16 +4,13 @@ unbound = unbound
 search-commands = Search / commands ({ $shortcut })
 search-short = Search and commands
 workspaces = Workspaces
-open-local-directory = Open a local directory
-project-path-placeholder = /path/to/project
-create-workspace = Create workspace
-add-workspace = + Add workspace
-open-another-project = Open another project
+open-project = Open project…
+open-another-project = Open another project…
+open-project-dialog-title = Choose a project folder
 workspace-created = Workspace created
 empty-eyebrow = INFINITE AGENT CANVAS
 create-first-workspace = Put your agents on the same canvas.
 create-first-workspace-detail = Open a local project to start arranging agents, terminals, notes, and project context in one place.
-project-path-help = Use an absolute path to a local project directory.
 node-count = { $count ->
     [one] { $count } node
    *[other] { $count } nodes

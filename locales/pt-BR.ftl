@@ -4,16 +4,13 @@ unbound = sem atalho
 search-commands = Buscar / comandos ({ $shortcut })
 search-short = Buscar e comandos
 workspaces = Espaços de trabalho
-open-local-directory = Abrir um diretório local
-project-path-placeholder = /caminho/do/projeto
-create-workspace = Criar espaço de trabalho
-add-workspace = + Adicionar espaço
-open-another-project = Abrir outro projeto
+open-project = Abrir projeto…
+open-another-project = Abrir outro projeto…
+open-project-dialog-title = Escolha a pasta do projeto
 workspace-created = Espaço de trabalho criado
 empty-eyebrow = CANVAS INFINITO DE AGENTES
 create-first-workspace = Coloque seus agentes no mesmo canvas.
 create-first-workspace-detail = Abra um projeto local para organizar agentes, terminais, notas e contexto em um só lugar.
-project-path-help = Use o caminho absoluto de um diretório de projeto local.
 node-count = { $count ->
     [one] { $count } nó
    *[other] { $count } nós
