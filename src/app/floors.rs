@@ -46,7 +46,6 @@ pub(super) fn tick(state: &mut OpenPodium) -> Task<AppMessage> {
 }
 
 pub(super) fn workspace_changed(state: &mut OpenPodium) {
-    state.floor_ui.status = status::UiState::default();
     state.floor_ui.integration = integration::UiState::default();
     state.floor_ui.discard = None;
     state.floor_ui.confirmation.clear();
@@ -70,22 +69,7 @@ pub(super) fn changed_paths(state: &OpenPodium) -> Vec<openpodium::git::ChangedP
         return Vec::new();
     };
     let directory = std::path::Path::new(directory.as_str());
-    state
-        .floor_ui
-        .status
-        .report
-        .inventories
-        .iter()
-        .find(|inventory| {
-            match (
-                dunce::canonicalize(&inventory.checkout),
-                dunce::canonicalize(directory),
-            ) {
-                (Ok(left), Ok(right)) => left == right,
-                _ => dunce::simplified(&inventory.checkout) == dunce::simplified(directory),
-            }
-        })
-        .map_or_else(Vec::new, |inventory| inventory.paths.clone())
+    status::changes_for(&state.floor_ui.status, workspace.id(), directory).to_vec()
 }
 
 pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessage> {
@@ -258,7 +242,7 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
         return content.into();
     };
     let selected = workspace.floors().active;
-    let main_severity = status::severity_for_main(&state.floor_ui.status);
+    let main_severity = status::severity_for_main(&state.floor_ui.status, workspace.id());
     content = content.push(
         button(text(format!(
             "Main floor{}{}",
@@ -271,7 +255,7 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
         )))
         .on_press(AppMessage::Floor(Message::Switch(None))),
     );
-    for change in status::changes_for_main(&state.floor_ui.status) {
+    for change in status::changes_for_main(&state.floor_ui.status, workspace.id()) {
         content = content.push(
             text(format!(
                 "{} · {}",
@@ -284,6 +268,7 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
     for (id, floor) in &workspace.floors().entries {
         let severity = status::severity_for_path(
             &state.floor_ui.status,
+            workspace.id(),
             std::path::Path::new(floor.directory.as_str()),
         );
         let label = format!(
@@ -315,6 +300,7 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
             );
         for change in status::changes_for(
             &state.floor_ui.status,
+            workspace.id(),
             std::path::Path::new(floor.directory.as_str()),
         ) {
             content = content.push(
