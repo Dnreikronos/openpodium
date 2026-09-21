@@ -26,9 +26,9 @@ for the primary view.
   workspace controls in a right inspector with section cards and scrolling.
 - Keep zoom out, current zoom/reset, and zoom in controls visible in the canvas
   toolbar. The same commands must work while a terminal or portal has focus.
-- Make unmodified mouse-wheel and two-finger trackpad scrolling zoom the canvas
-  around the pointer. Option/Alt + scroll passes movement to terminal/portal
-  content under the pointer, or pans the canvas when no embedded content is hit.
+- Make the mouse wheel zoom the canvas, two-finger trackpad scrolling pan the
+  board, and the native trackpad pinch gesture zoom. Option/Alt + scrolling
+  passes movement to terminal or portal content under the pointer.
 - Show status as compact text or badges rather than a large block of controls.
 
 ## Components
@@ -56,4 +56,5 @@ for the primary view.
   keep working.
 - Zoom controls remain usable over empty canvas space and focused agent,
   terminal, or portal nodes.
-- Mouse-wheel and trackpad scrolling zoom without requiring a modifier key.
+- Mouse-wheel zoom, trackpad pan, and trackpad pinch zoom work without a
+  modifier key.
