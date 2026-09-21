@@ -12,13 +12,15 @@ pub struct NotificationRequest {
 
 pub async fn show(request: NotificationRequest) -> Option<NavigationTarget> {
     tokio::task::spawn_blocking(move || {
-        let handle = Notification::new()
+        let mut notification = Notification::new();
+        notification
             .appname("OpenPodium")
             .summary(&request.title)
-            .body(&request.body)
-            .action("default", "Inspect")
-            .show()
-            .ok()?;
+            .body(&request.body);
+        if request.target.is_some() {
+            notification.action("default", "Inspect");
+        }
+        let handle = notification.show().ok()?;
         let activated = Cell::new(false);
         handle.wait_for_action(|action| activated.set(is_activation(action)));
         activated.get().then_some(request.target).flatten()
