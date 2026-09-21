@@ -24,6 +24,8 @@ for the primary view.
   system's native folder picker.
 - With a workspace open, let the canvas take most of the window. Put detailed
   workspace controls in a right inspector with section cards and scrolling.
+- Keep zoom out, current zoom/reset, and zoom in controls visible in the canvas
+  toolbar. The same commands must work while a terminal or portal has focus.
 - Show status as compact text or badges rather than a large block of controls.
 
 ## Components
@@ -49,3 +51,5 @@ for the primary view.
 - The app remains usable at 100%, 150%, and 200% interface scale.
 - Existing commands, persistence, canvas behavior, and accessibility settings
   keep working.
+- Zoom controls remain usable over empty canvas space and focused agent,
+  terminal, or portal nodes.
