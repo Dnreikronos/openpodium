@@ -17,12 +17,19 @@ pub(crate) enum Action {
     Bell,
 }
 
+/// How much recent output a node keeps so it can reopen showing its screen.
+/// Bounded because a transcript is a display cache, not a log: the tail is the
+/// only part that still tells you where you were.
+const TRANSCRIPT_LIMIT: usize = 128 * 1024;
+
 pub(crate) struct Session {
     model: Model,
     status: Status,
     controller: Option<ProcessController>,
     stream: Option<ProcessStream>,
     generation: u64,
+    transcript: Vec<u8>,
+    transcript_dirty: bool,
 }
 
 impl Session {
@@ -33,7 +40,49 @@ impl Session {
             controller: None,
             stream: None,
             generation,
+            transcript: Vec::new(),
+            transcript_dirty: false,
         }
+    }
+
+    /// Rebuilds a node's last screen from a stored transcript. The process is
+    /// gone, so the session stays offline and only replays what it showed.
+    pub(crate) fn restored(size: GridSize, generation: u64, transcript: Vec<u8>) -> Self {
+        let mut model = Model::new(size);
+        let _ = model.feed(&transcript);
+        Self {
+            model,
+            status: Status::Offline,
+            controller: None,
+            stream: None,
+            generation,
+            transcript,
+            transcript_dirty: false,
+        }
+    }
+
+    /// The bytes worth storing, or `None` when nothing has changed since the
+    /// last capture.
+    pub(crate) fn take_transcript(&mut self) -> Option<&[u8]> {
+        self.transcript_dirty.then(|| {
+            self.transcript_dirty = false;
+            self.transcript.as_slice()
+        })
+    }
+
+    fn record(&mut self, bytes: &[u8]) {
+        self.transcript.extend_from_slice(bytes);
+        if self.transcript.len() > TRANSCRIPT_LIMIT {
+            // Keep the tail, and start it at a line boundary so the replay does
+            // not begin partway through an escape sequence.
+            let excess = self.transcript.len() - TRANSCRIPT_LIMIT;
+            let start = self.transcript[excess..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(excess, |offset| excess + offset + 1);
+            self.transcript.drain(..start);
+        }
+        self.transcript_dirty = true;
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -120,25 +169,27 @@ impl Session {
 
     pub(crate) fn handle_event(&mut self, event: ProcessEvent) -> Vec<Action> {
         match event {
-            ProcessEvent::Output(bytes) => self
-                .model
-                .feed(&bytes)
-                .into_iter()
-                .filter_map(|update| match update {
-                    Update::PtyWrite(bytes) => {
-                        if let Err(error) = self.write(&bytes) {
-                            self.status = Status::Failed(error.to_string());
+            ProcessEvent::Output(bytes) => {
+                self.record(&bytes);
+                self.model
+                    .feed(&bytes)
+                    .into_iter()
+                    .filter_map(|update| match update {
+                        Update::PtyWrite(bytes) => {
+                            if let Err(error) = self.write(&bytes) {
+                                self.status = Status::Failed(error.to_string());
+                            }
+                            None
                         }
-                        None
-                    }
-                    Update::ClipboardStore(text) => Some(Action::ClipboardStore(text)),
-                    Update::Bell => Some(Action::Bell),
-                    Update::TitleChanged(title) => {
-                        let _ = title;
-                        None
-                    }
-                })
-                .collect(),
+                        Update::ClipboardStore(text) => Some(Action::ClipboardStore(text)),
+                        Update::Bell => Some(Action::Bell),
+                        Update::TitleChanged(title) => {
+                            let _ = title;
+                            None
+                        }
+                    })
+                    .collect()
+            }
             ProcessEvent::Terminated(termination) => {
                 self.controller = None;
                 self.stream = None;
@@ -190,4 +241,61 @@ pub(crate) fn process_spec(
         TerminalSize::new(size.rows, size.columns)
             .expect("terminal grid dimensions are always non-zero"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Session, TRANSCRIPT_LIMIT};
+    use crate::terminal::{GridSize, Status};
+    use openpodium::runtime::ProcessEvent;
+
+    fn size() -> GridSize {
+        GridSize::for_node(400.0, 300.0)
+    }
+
+    #[test]
+    fn a_restored_session_replays_its_transcript_without_running_anything() {
+        let session = Session::restored(size(), 1, b"hello".to_vec());
+        let view = session.view();
+
+        assert!(!session.is_active());
+        assert!(matches!(view.status, Status::Offline));
+        assert!(
+            view.cells.iter().any(|cell| cell.text == "h"),
+            "the stored output should be back on screen"
+        );
+    }
+
+    #[test]
+    fn a_transcript_is_captured_once_per_change() {
+        let mut session = Session::starting(size(), 1);
+        assert!(session.take_transcript().is_none());
+
+        session.handle_event(ProcessEvent::Output(b"first".to_vec()));
+        assert_eq!(session.take_transcript(), Some(b"first".as_slice()));
+        assert!(session.take_transcript().is_none());
+
+        session.handle_event(ProcessEvent::Output(b" second".to_vec()));
+        assert_eq!(session.take_transcript(), Some(b"first second".as_slice()));
+    }
+
+    /// The buffer is bounded, and trimming starts at a line boundary so the
+    /// replay never begins partway through an escape sequence.
+    #[test]
+    fn an_overlong_transcript_keeps_whole_lines_from_the_tail() {
+        let mut session = Session::starting(size(), 1);
+        let line = b"0123456789abcdef\n";
+        let repeats = TRANSCRIPT_LIMIT / line.len() + 8;
+        for _ in 0..repeats {
+            session.handle_event(ProcessEvent::Output(line.to_vec()));
+        }
+
+        let transcript = session.take_transcript().unwrap();
+        assert!(transcript.len() <= TRANSCRIPT_LIMIT);
+        assert!(
+            transcript.starts_with(b"0123456789abcdef"),
+            "a trimmed transcript should resume at the start of a line"
+        );
+        assert!(transcript.ends_with(b"\n"));
+    }
 }
