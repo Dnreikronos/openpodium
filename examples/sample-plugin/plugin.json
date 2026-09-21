@@ -1,0 +1,32 @@
+{
+  "id": "dev.openpodium.sample",
+  "name": "OpenPodium sample plugin",
+  "version": "1.0.0",
+  "sdk": {
+    "minimum": "1.0",
+    "maximum": "1.0"
+  },
+  "executable": "openpodium-sample-plugin",
+  "capabilities": [
+    "adapters",
+    "commands"
+  ],
+  "contributions": {
+    "providers": [
+      {
+        "id": "echo",
+        "label": "Echo provider",
+        "models": [
+          "echo-1"
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "id": "say-hello",
+        "label": "Say hello",
+        "description": "Return a greeting from an out-of-process plugin."
+      }
+    ]
+  }
+}
