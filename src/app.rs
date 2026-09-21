@@ -1755,10 +1755,10 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     ]
     .height(Fill);
     if state.navigation_ui.open {
-        column![
+        stack![
+            application,
             navigation_panel::view(&state.navigation_ui, &state.command_registry)
                 .map(Message::Navigation),
-            application,
         ]
         .into()
     } else {
