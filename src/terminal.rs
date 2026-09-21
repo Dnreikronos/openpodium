@@ -16,7 +16,7 @@ pub(crate) mod session;
 pub(crate) const CELL_WIDTH: f32 = 8.0;
 pub(crate) const CELL_HEIGHT: f32 = 16.0;
 pub(crate) const BODY_PADDING: f32 = 10.0;
-pub(crate) const HEADER_HEIGHT: f32 = 48.0;
+pub(crate) const HEADER_HEIGHT: f32 = 32.0;
 const SCROLLBACK_LINES: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,26 +400,26 @@ fn resolve_named(color: NamedColor) -> Rgb {
         NamedColor::BrightBlue => 12,
         NamedColor::BrightMagenta => 13,
         NamedColor::BrightCyan => 14,
-        NamedColor::BrightWhite | NamedColor::BrightForeground => 15,
+        NamedColor::BrightWhite => 15,
         NamedColor::Background => {
             return Rgb {
-                r: 14,
-                g: 17,
-                b: 22,
+                r: 255,
+                g: 255,
+                b: 255,
             };
         }
         NamedColor::Cursor => {
             return Rgb {
-                r: 230,
-                g: 235,
-                b: 241,
+                r: 39,
+                g: 42,
+                b: 47,
             };
         }
-        NamedColor::Foreground | NamedColor::DimForeground => {
+        NamedColor::Foreground | NamedColor::DimForeground | NamedColor::BrightForeground => {
             return Rgb {
-                r: 205,
-                g: 214,
-                b: 224,
+                r: 39,
+                g: 42,
+                b: 47,
             };
         }
     };
@@ -434,34 +434,34 @@ fn resolve_indexed(index: u8) -> Rgb {
             b: 42,
         },
         Rgb {
-            r: 224,
-            g: 108,
-            b: 117,
+            r: 181,
+            g: 44,
+            b: 55,
         },
         Rgb {
-            r: 152,
-            g: 195,
-            b: 121,
+            r: 43,
+            g: 117,
+            b: 56,
         },
         Rgb {
-            r: 229,
-            g: 192,
-            b: 123,
+            r: 143,
+            g: 100,
+            b: 0,
         },
         Rgb {
-            r: 97,
-            g: 175,
-            b: 239,
+            r: 35,
+            g: 96,
+            b: 184,
         },
         Rgb {
-            r: 198,
-            g: 120,
-            b: 221,
+            r: 142,
+            g: 63,
+            b: 164,
         },
         Rgb {
-            r: 86,
-            g: 182,
-            b: 194,
+            r: 0,
+            g: 112,
+            b: 126,
         },
         Rgb {
             r: 171,
@@ -474,34 +474,34 @@ fn resolve_indexed(index: u8) -> Rgb {
             b: 112,
         },
         Rgb {
-            r: 232,
-            g: 131,
-            b: 136,
+            r: 190,
+            g: 45,
+            b: 60,
         },
         Rgb {
-            r: 171,
-            g: 209,
-            b: 138,
+            r: 39,
+            g: 124,
+            b: 59,
         },
         Rgb {
-            r: 241,
-            g: 204,
-            b: 143,
+            r: 151,
+            g: 107,
+            b: 0,
         },
         Rgb {
-            r: 122,
-            g: 193,
-            b: 255,
+            r: 27,
+            g: 103,
+            b: 199,
         },
         Rgb {
-            r: 218,
-            g: 149,
-            b: 239,
+            r: 151,
+            g: 60,
+            b: 170,
         },
         Rgb {
-            r: 104,
-            g: 200,
-            b: 211,
+            r: 0,
+            g: 119,
+            b: 134,
         },
         Rgb {
             r: 230,
@@ -790,12 +790,56 @@ mod tests {
     }
 
     #[test]
+    fn light_defaults_preserve_explicit_colors_and_inverse_video() {
+        let mut model = model();
+        model.feed(b"A\x1b[38;2;12;34;56;48;2;78;90;123mB\x1b[0;7mC");
+        let view = model.view(Status::Running);
+        let plain = view.cells.iter().find(|cell| cell.text == "A").unwrap();
+        assert_eq!(
+            plain.background,
+            CellColor {
+                red: 255,
+                green: 255,
+                blue: 255
+            }
+        );
+        assert!(
+            plain.foreground.red < 50 && plain.foreground.green < 50 && plain.foreground.blue < 50
+        );
+        let explicit = view.cells.iter().find(|cell| cell.text == "B").unwrap();
+        assert_eq!(
+            explicit.foreground,
+            CellColor {
+                red: 12,
+                green: 34,
+                blue: 56
+            }
+        );
+        assert_eq!(
+            explicit.background,
+            CellColor {
+                red: 78,
+                green: 90,
+                blue: 123
+            }
+        );
+        let inverse = view.cells.iter().find(|cell| cell.text == "C").unwrap();
+        assert_eq!(inverse.foreground, plain.background);
+        assert_eq!(inverse.background, plain.foreground);
+
+        let updates = model.feed(b"\x1b]11;?\x07");
+        assert!(updates.iter().any(|update| matches!(update,
+            Update::PtyWrite(bytes) if String::from_utf8_lossy(bytes).contains("rgb:ffff/ffff/ffff")
+        )));
+    }
+
+    #[test]
     fn derives_grid_size_from_node_body() {
         assert_eq!(
             GridSize::for_node(360.0, 260.0),
             GridSize {
                 columns: 42,
-                rows: 12
+                rows: 13
             }
         );
     }

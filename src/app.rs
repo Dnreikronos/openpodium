@@ -538,6 +538,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         }
         Message::ToggleHighContrast => {
             state.presentation.toggle_high_contrast();
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
             let value = state.presentation.high_contrast().to_string();
             persist_application_preference(state, HIGH_CONTRAST_KEY, &value);
         }
@@ -6032,8 +6033,10 @@ mod tests {
         );
 
         let previous_contrast = state.presentation.high_contrast();
+        let previous_canvas_revision = state.canvas_revision;
         let _ = update(&mut state, Message::ToggleHighContrast);
         assert_eq!(state.presentation.high_contrast(), !previous_contrast);
+        assert_ne!(state.canvas_revision, previous_canvas_revision);
         assert_eq!(
             state.workspaces.as_ref().unwrap().preferences().unwrap(),
             vec![

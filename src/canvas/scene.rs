@@ -99,8 +99,10 @@ fn draw_grid(
     frame.stroke(
         &grid,
         Stroke::default()
-            .with_color(shell::sunken_color(palette))
-            .with_width(1.0),
+            .with_color(
+                shell::sunken_color(palette).scale_alpha(if palette.is_dark { 1.0 } else { 0.38 }),
+            )
+            .with_width(0.75),
     );
 
     let shows_vertical_axis = visible.x <= 0.0 && visible.x + visible.width >= 0.0;
@@ -124,8 +126,10 @@ fn draw_grid(
     frame.stroke(
         &axes,
         Stroke::default()
-            .with_color(shell::hairline_color(palette))
-            .with_width(1.5),
+            .with_color(
+                shell::sunken_color(palette).scale_alpha(if palette.is_dark { 1.0 } else { 0.38 }),
+            )
+            .with_width(0.75),
     );
 }
 
@@ -216,6 +220,7 @@ fn draw_connections(
         );
     }
 }
+
 
 /// Emits text only where a node is actually exposed.
 ///
@@ -401,30 +406,53 @@ fn draw_node(
         let label = document.label(node.id());
         let top_left = rect.position();
         let size = rect.size();
-        let radius = (10.0 * camera.zoom() as f32).clamp(4.0, 14.0);
+        let radius = (6.0 * camera.zoom() as f32).clamp(3.0, 10.0);
         let shape = Path::rounded_rectangle(top_left, size, radius.into());
         let accent = node_color(label.kind, palette);
 
-        // Unselected nodes wear a neutral hairline and carry their kind in the
-        // accent bar alone. Selection is a dashed accent outline, which reads
-        // as a marquee rather than as a heavier permanent border.
-        frame.fill(&shape, shell::surface_color(palette));
+        if !palette.is_dark {
+            for spread in [3.0, 2.0, 1.0] {
+                frame.fill(
+                    &Path::rounded_rectangle(
+                        Point::new(top_left.x - spread, top_left.y - spread + 2.0),
+                        Size::new(size.width + spread * 2.0, size.height + spread * 2.0),
+                        (radius + spread).into(),
+                    ),
+                    Color::BLACK.scale_alpha(0.018),
+                );
+            }
+        }
+        let is_note = matches!(node.content(), CanvasNodeContent::Note { .. });
+        let surface = if is_note && !palette.is_dark {
+            Color::from_rgb8(255, 253, 218)
+        } else {
+            shell::surface_color(palette)
+        };
+        frame.fill(&shape, surface);
         let zoom = camera.zoom() as f32;
         let header_height = (HEADER_HEIGHT * zoom).clamp(28.0, 60.0);
+        let header_color = if is_note && !palette.is_dark {
+            Color::from_rgb8(249, 245, 202)
+        } else {
+            shell::sunken_color(palette)
+        };
+        frame.fill(
+            &Path::rounded_rectangle(
+                top_left,
+                Size::new(size.width, header_height),
+                radius.into(),
+            ),
+            header_color,
+        );
         frame.fill_rectangle(
-            top_left,
-            Size::new(size.width, header_height),
-            shell::chrome_color(palette),
+            Point::new(top_left.x, top_left.y + header_height - radius),
+            Size::new(size.width, radius),
+            header_color,
         );
         frame.fill_rectangle(
             Point::new(top_left.x, top_left.y + header_height - 1.0),
             Size::new(size.width, 1.0),
             shell::hairline_color(palette),
-        );
-        frame.fill_rectangle(
-            top_left,
-            Size::new((4.0 * camera.zoom() as f32).clamp(2.0, 5.0), header_height),
-            accent,
         );
         frame.stroke(
             &shape,
@@ -445,36 +473,65 @@ fn draw_node(
             },
         );
 
-        // The title is what a node is. It stays legible at every zoom, clipped
-        // to its header so a small node truncates the name instead of spilling
-        // it across the board. Only the detail below it drops away.
-        let padding = (12.0 * zoom).clamp(7.0, 16.0);
-        let shows_detail = camera.zoom() >= BODY_MIN_ZOOM;
-        let title_size = (14.0 * zoom).clamp(9.0, 17.0);
-        let title_y = if shows_detail {
-            top_left.y + padding * 0.45
+        let padding = (10.0 * zoom).clamp(7.0, 16.0);
+        let marker_size = (7.0 * zoom).clamp(5.0, 10.0);
+        frame.stroke(
+            &Path::rounded_rectangle(
+                Point::new(
+                    top_left.x + padding,
+                    top_left.y + (header_height - marker_size) * 0.5,
+                ),
+                Size::new(marker_size, marker_size),
+                2.0.into(),
+            ),
+            Stroke::default().with_color(accent).with_width(1.4),
+        );
+        let shows_detail = camera.zoom() >= BODY_MIN_ZOOM && size.width >= 300.0;
+        let title_size = (12.0 * zoom).clamp(9.0, 16.0);
+        let title_x = top_left.x + padding + marker_size + 6.0;
+        let title_width = if shows_detail {
+            size.width * 0.45
         } else {
-            top_left.y + (header_height - title_size) * 0.5
+            size.width
         };
-        let header = Rectangle::new(top_left, Size::new(size.width, header_height));
-        clip_text(frame, regions, header, |frame| {
+        let title_bounds = Rectangle::new(
+            Point::new(title_x, top_left.y),
+            Size::new(
+                (title_width - (title_x - top_left.x) - padding).max(1.0),
+                header_height,
+            ),
+        );
+        clip_text(frame, regions, title_bounds, |frame| {
             frame.fill_text(canvas::Text {
                 content: label.title.clone(),
-                position: Point::new(top_left.x + padding, title_y),
+                position: Point::new(
+                    title_x,
+                    top_left.y + (header_height - title_size * 1.3) * 0.5,
+                ),
                 color: palette.background.base.text,
                 size: Pixels(title_size),
                 ..canvas::Text::default()
             });
-            if shows_detail {
+        });
+        if shows_detail {
+            let detail_bounds = Rectangle::new(
+                Point::new(top_left.x + title_width, top_left.y),
+                Size::new(size.width - title_width - padding, header_height),
+            );
+            clip_text(frame, regions, detail_bounds, |frame| {
+                let detail_size = (10.0 * zoom).clamp(8.0, 12.0);
                 frame.fill_text(canvas::Text {
                     content: label.subtitle.clone(),
-                    position: Point::new(top_left.x + padding, top_left.y + header_height * 0.56),
+                    position: Point::new(
+                        detail_bounds.x,
+                        top_left.y + (header_height - detail_size * 1.3) * 0.5,
+                    ),
                     color: shell::muted_color(palette),
-                    size: Pixels((10.0 * zoom).clamp(7.0, 12.0)),
+                    size: Pixels(detail_size),
                     ..canvas::Text::default()
                 });
-            }
-        });
+            });
+        }
 
         if let Some(terminal) = document.terminal(node.id()) {
             draw_terminal(
@@ -831,6 +888,12 @@ fn draw_terminal(
     }
 
     if let Some(cursor) = terminal.cursor {
+        let cursor_color = terminal
+            .cells
+            .iter()
+            .find(|cell| cell.row == cursor.row && cell.column == cursor.column)
+            .map(|cell| terminal_color(cell.foreground))
+            .unwrap_or(Color::from_rgb8(39, 42, 47));
         let position = Point::new(
             origin.x + cursor.column as f32 * cell_size.width,
             origin.y + cursor.row as f32 * cell_size.height,
@@ -848,18 +911,14 @@ fn draw_terminal(
                 (position, Size::new((2.0 * zoom).max(1.0), cell_size.height))
             }
         };
-        frame.fill_rectangle(
-            cursor_position,
-            cursor_size,
-            Color::from_rgba(0.9, 0.93, 0.98, 0.55),
-        );
+        frame.fill_rectangle(cursor_position, cursor_size, cursor_color.scale_alpha(0.45));
 
         if let Some(preedit) = preedit.filter(|preedit| !preedit.is_empty()) {
             clip_text(frame, regions, bounds, |frame| {
                 frame.fill_text(canvas::Text {
                     content: preedit.to_owned(),
                     position,
-                    color: Color::WHITE,
+                    color: cursor_color,
                     size: Pixels((13.0 * zoom).max(5.0)),
                     font: Font::MONOSPACE,
                     ..canvas::Text::default()
