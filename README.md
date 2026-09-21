@@ -29,7 +29,10 @@ The first release will provide:
 
 See the [product specification](docs/product-spec.md),
 [architecture](docs/architecture.md), and
-[third-party plugin SDK](docs/plugins.md) for the working contracts.
+[third-party plugin SDK](docs/plugins.md) for the working contracts. The
+[accessibility and localization contract](docs/accessibility.md) documents the
+semantic UI model, presentation preferences, international input behavior, and
+the remaining native screen-reader limitation.
 
 ## Development
 
