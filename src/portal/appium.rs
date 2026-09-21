@@ -17,6 +17,7 @@ use super::{
 const DEFAULT_ADDRESS: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 4723);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct AppiumBackend {
     address: SocketAddr,
@@ -55,6 +56,9 @@ impl AppiumBackend {
         platform: PortalTargetKind,
         address: SocketAddr,
     ) -> Result<Self, AppiumError> {
+        if !address.ip().is_loopback() {
+            return Err(AppiumError::NonLoopbackAddress(address));
+        }
         let mut backend = Self::new(platform)?;
         backend.address = address;
         Ok(backend)
@@ -87,9 +91,13 @@ impl AppiumBackend {
         )
         .map_err(AppiumError::Write)?;
         let mut response = Vec::new();
-        stream
+        (&mut stream)
+            .take((MAX_RESPONSE_BYTES + 1) as u64)
             .read_to_end(&mut response)
             .map_err(AppiumError::Read)?;
+        if response.len() > MAX_RESPONSE_BYTES {
+            return Err(AppiumError::ResponseTooLarge);
+        }
         parse_response(&response)
     }
 
@@ -674,7 +682,7 @@ fn parse_response(response: &[u8]) -> Result<Value, AppiumError> {
     if !(200..300).contains(&status) {
         return Err(AppiumError::Command {
             status,
-            detail: payload.to_string(),
+            detail: crate::security::redact_secrets(&payload.to_string()).into_owned(),
         });
     }
     Ok(payload)
@@ -683,6 +691,7 @@ fn parse_response(response: &[u8]) -> Result<Value, AppiumError> {
 #[derive(Debug)]
 pub enum AppiumError {
     UnsupportedPlatform(PortalTargetKind),
+    NonLoopbackAddress(SocketAddr),
     PlatformMismatch {
         expected: PortalTargetKind,
         found: PortalTargetKind,
@@ -692,6 +701,7 @@ pub enum AppiumError {
     Configure(std::io::Error),
     Write(std::io::Error),
     Read(std::io::Error),
+    ResponseTooLarge,
     Json(serde_json::Error),
     Base64(base64::DecodeError),
     Protocol(String),
@@ -717,6 +727,10 @@ impl Display for AppiumError {
             Self::UnsupportedPlatform(platform) => {
                 write!(formatter, "{platform:?} is not an Appium device platform")
             }
+            Self::NonLoopbackAddress(address) => write!(
+                formatter,
+                "Appium endpoint {address} is not loopback; device control must remain local"
+            ),
             Self::PlatformMismatch { expected, found } => write!(
                 formatter,
                 "Appium backend expects {expected:?}, found {found:?}"
@@ -728,6 +742,10 @@ impl Display for AppiumError {
             }
             Self::Write(error) => write!(formatter, "failed to write Appium request: {error}"),
             Self::Read(error) => write!(formatter, "failed to read Appium response: {error}"),
+            Self::ResponseTooLarge => write!(
+                formatter,
+                "Appium response exceeded the {MAX_RESPONSE_BYTES}-byte limit"
+            ),
             Self::Json(error) => write!(formatter, "invalid Appium JSON: {error}"),
             Self::Base64(error) => write!(formatter, "invalid Appium screenshot: {error}"),
             Self::Protocol(detail) => write!(formatter, "invalid Appium response: {detail}"),
@@ -764,6 +782,8 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    use proptest::prelude::*;
 
     use crate::portal::{PortalBackend, PortalElementRef, PortalPresentation, PortalTarget};
 
@@ -822,6 +842,13 @@ mod tests {
         assert_eq!(android_keycode(PortalKeyInput::Home).unwrap(), 122);
         assert_eq!(android_keycode(PortalKeyInput::End).unwrap(), 123);
         assert!(android_keycode(PortalKeyInput::PageUp).is_err());
+        assert!(matches!(
+            AppiumBackend::with_address(
+                PortalTargetKind::Android,
+                "192.0.2.1:4723".parse().unwrap()
+            ),
+            Err(AppiumError::NonLoopbackAddress(_))
+        ));
     }
 
     #[test]
@@ -1196,5 +1223,16 @@ mod tests {
             live["appium-6"].path,
             "/hierarchy[1]/android.widget.LinearLayout[2]/android.widget.Button[1]"
         );
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_appium_xml_and_http_responses_fail_safely(
+            source in any::<String>(),
+            response in prop::collection::vec(any::<u8>(), 0..16_384),
+        ) {
+            let _ = parse_source(&source);
+            let _ = parse_response(&response);
+        }
     }
 }

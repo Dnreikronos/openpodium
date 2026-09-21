@@ -47,6 +47,9 @@ impl PortalTarget {
     ) -> Result<Self, PortalValidationError> {
         let selector = selector.into();
         validate_text(&selector, MAX_SELECTOR_CHARS, "portal target selector")?;
+        if kind == PortalTargetKind::Browser && crate::security::url_has_userinfo(&selector) {
+            return Err(PortalValidationError::EmbeddedCredentials);
+        }
         Ok(Self { kind, selector })
     }
 
@@ -819,6 +822,7 @@ pub enum PortalValidationError {
     ControlCharacter {
         field: &'static str,
     },
+    EmbeddedCredentials,
     EmptyFrame,
     FrameTooLarge {
         max_bytes: usize,
@@ -840,6 +844,9 @@ impl Display for PortalValidationError {
                     formatter,
                     "{field} contains an unsupported control character"
                 )
+            }
+            Self::EmbeddedCredentials => {
+                formatter.write_str("browser portal URLs cannot contain user information")
             }
             Self::EmptyFrame => formatter.write_str("portal frame cannot be empty"),
             Self::FrameTooLarge { max_bytes } => {
@@ -888,6 +895,15 @@ mod tests {
             PortalCapabilities::browser_defaults().status(PortalOperation::Input),
             CapabilityStatus::PermissionRequired { .. }
         ));
+    }
+
+    #[test]
+    fn browser_targets_reject_embedded_url_credentials() {
+        assert_eq!(
+            PortalTarget::browser("https://alice:secret@example.test").unwrap_err(),
+            PortalValidationError::EmbeddedCredentials
+        );
+        assert!(PortalTarget::browser("https://example.test/users/alice@example.test").is_ok());
     }
 
     #[test]
