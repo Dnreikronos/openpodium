@@ -405,10 +405,13 @@ impl canvas::Program<Message> for Surface {
                         );
                     }
                 }
-                let camera = if state.modifiers.alt() {
-                    self.camera.pan_by_screen(x, y)
-                } else {
-                    zoom_camera(self.camera, y, zoom_sensitivity, anchor, bounds)
+                let camera = match (*delta, state.modifiers.alt()) {
+                    (_, true) | (mouse::ScrollDelta::Pixels { .. }, false) => {
+                        self.camera.pan_by_screen(x, y)
+                    }
+                    (mouse::ScrollDelta::Lines { .. }, false) => {
+                        zoom_camera(self.camera, y, zoom_sensitivity, anchor, bounds)
+                    }
                 };
                 self.publish_camera(state, camera)
             }
@@ -1110,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn wheel_and_trackpad_scroll_zoom_around_the_pointer_without_modifiers() {
+    fn mouse_wheel_zooms_while_trackpad_scroll_pans_without_modifiers() {
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1_000.0, 800.0));
         let anchor = Point::new(760.0, 240.0);
         let camera = Camera::default();
@@ -1119,18 +1122,18 @@ mod tests {
             viewport(bounds),
         );
 
-        for delta in [
-            mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
-            mouse::ScrollDelta::Pixels { x: 0.0, y: 24.0 },
-        ] {
-            let (_, y, sensitivity) = scroll_delta(delta);
-            let zoomed = zoom_camera(camera, y, sensitivity, anchor, bounds);
-            let screen_after = zoomed.world_to_screen(world_before, viewport(bounds));
+        let (_, wheel_y, sensitivity) = scroll_delta(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 });
+        let zoomed = zoom_camera(camera, wheel_y, sensitivity, anchor, bounds);
+        let screen_after = zoomed.world_to_screen(world_before, viewport(bounds));
+        assert!(zoomed.zoom() > camera.zoom());
+        assert!((screen_after.x - f64::from(anchor.x)).abs() < 0.001);
+        assert!((screen_after.y - f64::from(anchor.y)).abs() < 0.001);
 
-            assert!(zoomed.zoom() > camera.zoom());
-            assert!((screen_after.x - f64::from(anchor.x)).abs() < 0.001);
-            assert!((screen_after.y - f64::from(anchor.y)).abs() < 0.001);
-        }
+        let (trackpad_x, trackpad_y, _) =
+            scroll_delta(mouse::ScrollDelta::Pixels { x: 18.0, y: 24.0 });
+        let panned = camera.pan_by_screen(trackpad_x, trackpad_y);
+        assert_eq!(panned.zoom(), camera.zoom());
+        assert_ne!(panned.position(), camera.position());
     }
 
     #[test]

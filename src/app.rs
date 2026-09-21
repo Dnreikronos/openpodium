@@ -3,6 +3,7 @@ mod floors;
 mod navigation;
 mod portals;
 mod shell;
+mod trackpad;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -333,6 +334,7 @@ enum Message {
     ToggleHighContrast,
     ToggleReducedMotion,
     ToggleInspector,
+    TrackpadMagnified(f64),
     ExecuteCommand(CommandId),
     Chat(chat::Message),
     Timeline(timeline_panel::Message),
@@ -449,6 +451,7 @@ enum CanvasAction {
 }
 
 pub(crate) fn run() -> iced::Result {
+    trackpad::install();
     iced::application(OpenPodium::default, update, view)
         .title(APP_NAME)
         .theme(|state: &OpenPodium| application_theme(state.presentation))
@@ -462,6 +465,7 @@ pub(crate) fn run() -> iced::Result {
             Subscription::batch([
                 iced::time::every(Duration::from_millis(100)).map(|_| Message::OrchestrationTick),
                 navigation::subscription(),
+                trackpad::subscription().map(Message::TrackpadMagnified),
             ])
         })
         .centered()
@@ -533,6 +537,12 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             persist_application_preference(state, REDUCED_MOTION_KEY, &value);
         }
         Message::ToggleInspector => state.inspector_open = !state.inspector_open,
+        Message::TrackpadMagnified(delta) => {
+            if let Some(factor) = trackpad::magnification_factor(delta) {
+                state.camera = state.camera.zoom_centered(factor);
+                state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            }
+        }
         Message::ExecuteCommand(command) => return navigation::execute_command(state, command),
         Message::Floor(message) => return floors::update(state, message),
         Message::Portal(message) => return portals::update(state, message),
