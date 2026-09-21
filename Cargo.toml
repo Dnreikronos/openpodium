@@ -32,4 +32,5 @@ libc = "0.2.175"
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
+proptest = "1"
 tokio = { version = "1.47.1", features = ["macros", "rt", "sync", "time"] }
