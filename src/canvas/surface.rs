@@ -961,6 +961,7 @@ mod tests {
     use openpodium::domain::{
         CanvasNodeContent, CanvasPoint, CanvasSize, Name, Node, Workspace, WorkspaceId,
     };
+    use openpodium::localization::{Locale, Localizer};
     use openpodium::portal::{PortalConfig, PortalFrame, PortalFrameEncoding, PortalViewport};
 
     use super::*;
@@ -977,6 +978,7 @@ mod tests {
             &workspace,
             CanvasLayout::new(vec![node], Vec::new(), Vec::new()),
             BTreeMap::new(),
+            &Localizer::new(Locale::EnUs),
         )
         .with_portal_frames(BTreeMap::from([(
             node_id,

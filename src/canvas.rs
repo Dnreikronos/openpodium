@@ -15,6 +15,7 @@ use openpodium::domain::{
     AgentProgram, CanvasLayout, CanvasNodeContent, NodeId, NodeTarget, Workspace,
 };
 use openpodium::git::CollisionSeverity;
+use openpodium::localization::Localizer;
 use openpodium::portal::PortalFrame;
 
 use crate::terminal;
@@ -53,6 +54,7 @@ impl CanvasDocument {
         workspace: &Workspace,
         layout: CanvasLayout,
         terminals: BTreeMap<NodeId, terminal::View>,
+        localizer: &Localizer,
     ) -> Self {
         let agent_nodes = layout
             .nodes()
@@ -65,33 +67,34 @@ impl CanvasDocument {
             })
             .map(|node| node.id())
             .collect::<BTreeSet<_>>();
-        let semantics = CanvasSemanticSnapshot::build(workspace, &layout, &[], |node_id| {
-            terminals.get(&node_id).map_or_else(
-                || RuntimeNodeSemantics {
-                    status: agent_nodes
-                        .contains(&node_id)
-                        .then(|| terminal::Status::Offline.label()),
-                    can_start: agent_nodes.contains(&node_id),
-                    ..RuntimeNodeSemantics::default()
-                },
-                |terminal| RuntimeNodeSemantics {
-                    title: terminal.title.clone(),
-                    status: Some(terminal.status.label()),
-                    value: terminal_text(terminal),
-                    can_start: matches!(
-                        terminal.status,
-                        terminal::Status::Offline
-                            | terminal::Status::Exited(_)
-                            | terminal::Status::Stopped
-                            | terminal::Status::Failed(_)
-                    ),
-                    can_stop: matches!(
-                        terminal.status,
-                        terminal::Status::Starting | terminal::Status::Running
-                    ),
-                },
-            )
-        });
+        let semantics =
+            CanvasSemanticSnapshot::build(workspace, &layout, &[], localizer, |node_id| {
+                terminals.get(&node_id).map_or_else(
+                    || RuntimeNodeSemantics {
+                        status: agent_nodes
+                            .contains(&node_id)
+                            .then(|| terminal::Status::Offline.label(localizer)),
+                        can_start: agent_nodes.contains(&node_id),
+                        ..RuntimeNodeSemantics::default()
+                    },
+                    |terminal| RuntimeNodeSemantics {
+                        title: terminal.title.clone(),
+                        status: Some(terminal.status.label(localizer)),
+                        value: terminal_text(terminal),
+                        can_start: matches!(
+                            terminal.status,
+                            terminal::Status::Offline
+                                | terminal::Status::Exited(_)
+                                | terminal::Status::Stopped
+                                | terminal::Status::Failed(_)
+                        ),
+                        can_stop: matches!(
+                            terminal.status,
+                            terminal::Status::Starting | terminal::Status::Running
+                        ),
+                    },
+                )
+            });
         let labels = semantics
             .nodes
             .into_iter()
@@ -255,11 +258,16 @@ mod tests {
         );
         workspace.execute(DomainCommand::AddNode(node)).unwrap();
 
-        let document = CanvasDocument::new(&workspace, workspace.canvas_layout(), BTreeMap::new())
-            .with_git_severity(BTreeMap::from([(
-                NodeId::new(1),
-                CollisionSeverity::Critical,
-            )]));
+        let document = CanvasDocument::new(
+            &workspace,
+            workspace.canvas_layout(),
+            BTreeMap::new(),
+            &Localizer::new(openpodium::localization::Locale::EnUs),
+        )
+        .with_git_severity(BTreeMap::from([(
+            NodeId::new(1),
+            CollisionSeverity::Critical,
+        )]));
         let label = document.label(NodeId::new(1));
 
         assert_eq!(label.title, "review Ada");

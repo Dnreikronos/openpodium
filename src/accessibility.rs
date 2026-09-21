@@ -6,7 +6,11 @@
 
 use std::collections::BTreeSet;
 
-use crate::domain::{CanvasLayout, CanvasNodeContent, Node, NodeId, NodeTarget, Workspace};
+use crate::domain::{
+    CanvasLayout, CanvasNodeContent, Node, NodeId, NodeTarget, ShapeKind, TaskState, Workspace,
+};
+use crate::localization::Localizer;
+use crate::portal::PortalTargetKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanvasNodeKind {
@@ -66,6 +70,7 @@ impl CanvasSemanticSnapshot {
         workspace: &Workspace,
         layout: &CanvasLayout,
         selected: &[NodeId],
+        localizer: &Localizer,
         runtime: impl Fn(NodeId) -> RuntimeNodeSemantics,
     ) -> Self {
         let selected = selected.iter().copied().collect::<BTreeSet<_>>();
@@ -85,6 +90,7 @@ impl CanvasSemanticSnapshot {
                 describe_node(
                     workspace,
                     node,
+                    localizer,
                     selected.contains(&node.id()),
                     index + 1,
                     set_size,
@@ -115,6 +121,7 @@ impl CanvasSemanticSnapshot {
 fn describe_node(
     workspace: &Workspace,
     node: &Node,
+    localizer: &Localizer,
     selected: bool,
     position_in_set: usize,
     set_size: usize,
@@ -126,8 +133,8 @@ fn describe_node(
                 || {
                     (
                         CanvasNodeKind::Agent,
-                        format!("Missing agent {agent_id}"),
-                        "Unavailable".to_owned(),
+                        localizer.with_str("canvas-missing-agent", "id", agent_id.to_string()),
+                        localizer.text("canvas-unavailable"),
                         vec![CanvasAction::Select],
                     )
                 },
@@ -159,8 +166,8 @@ fn describe_node(
                 || {
                     (
                         CanvasNodeKind::Task,
-                        format!("Missing task {task_id}"),
-                        "Unavailable".to_owned(),
+                        localizer.with_str("canvas-missing-task", "id", task_id.to_string()),
+                        localizer.text("canvas-unavailable"),
                         vec![CanvasAction::Select],
                     )
                 },
@@ -168,21 +175,36 @@ fn describe_node(
                     (
                         CanvasNodeKind::Task,
                         task.title().as_str().to_owned(),
-                        task.state().to_string(),
+                        localizer.text(task_state_message(task.state())),
                         vec![CanvasAction::Select, CanvasAction::Activate],
                     )
                 },
             )
         }
-        CanvasNodeContent::Reference(NodeTarget::Handoff(handoff_id)) => (
-            CanvasNodeKind::Handoff,
-            format!("Handoff {handoff_id}"),
+        CanvasNodeContent::Reference(NodeTarget::Handoff(handoff_id)) => {
             workspace.handoff(*handoff_id).map_or_else(
-                || "Unavailable".to_owned(),
-                |handoff| format!("To agent {}", handoff.recipient()),
-            ),
-            vec![CanvasAction::Select, CanvasAction::Activate],
-        ),
+                || {
+                    (
+                        CanvasNodeKind::Handoff,
+                        localizer.with_str("canvas-handoff", "id", handoff_id.to_string()),
+                        localizer.text("canvas-unavailable"),
+                        vec![CanvasAction::Select],
+                    )
+                },
+                |handoff| {
+                    (
+                        CanvasNodeKind::Handoff,
+                        localizer.with_str("canvas-handoff", "id", handoff_id.to_string()),
+                        localizer.with_str(
+                            "canvas-handoff-recipient",
+                            "recipient",
+                            handoff.recipient().to_string(),
+                        ),
+                        vec![CanvasAction::Select, CanvasAction::Activate],
+                    )
+                },
+            )
+        }
         CanvasNodeContent::Note { path, title } => (
             CanvasNodeKind::Note,
             title.as_str().to_owned(),
@@ -195,7 +217,7 @@ fn describe_node(
         ),
         CanvasNodeContent::FileTree { root } => (
             CanvasNodeKind::FileTree,
-            "Project files".to_owned(),
+            localizer.text("canvas-project-files"),
             root.as_str().to_owned(),
             vec![CanvasAction::Select, CanvasAction::Activate],
         ),
@@ -211,14 +233,14 @@ fn describe_node(
         ),
         CanvasNodeContent::Diff { path, .. } => (
             CanvasNodeKind::Diff,
-            format!("Diff · {path}"),
-            "Working tree against HEAD".to_owned(),
+            localizer.with_str("canvas-diff", "path", path.as_str()),
+            localizer.text("canvas-working-tree-against-head"),
             vec![CanvasAction::Select, CanvasAction::Activate],
         ),
         CanvasNodeContent::Text { .. } => (
             CanvasNodeKind::Text,
-            "Text".to_owned(),
-            "Canvas annotation".to_owned(),
+            localizer.text("canvas-text"),
+            localizer.text("canvas-annotation"),
             vec![
                 CanvasAction::Select,
                 CanvasAction::Activate,
@@ -227,30 +249,30 @@ fn describe_node(
         ),
         CanvasNodeContent::Portal(config) => (
             CanvasNodeKind::Portal,
-            "Portal".to_owned(),
+            localizer.text("canvas-portal"),
             format!(
-                "{:?} · {}",
-                config.target().kind(),
+                "{} · {}",
+                localizer.text(portal_kind_message(config.target().kind())),
                 config.target().selector()
             ),
             vec![CanvasAction::Select, CanvasAction::Activate],
         ),
         CanvasNodeContent::Shape(shape) => (
             CanvasNodeKind::Shape,
-            format!("{:?}", shape.kind()),
-            "Canvas shape".to_owned(),
+            localizer.text(shape_kind_message(shape.kind())),
+            localizer.text("canvas-shape-description"),
             vec![CanvasAction::Select],
         ),
         CanvasNodeContent::Arrow(_) => (
             CanvasNodeKind::Arrow,
-            "Arrow".to_owned(),
-            "Canvas annotation".to_owned(),
+            localizer.text("canvas-arrow"),
+            localizer.text("canvas-annotation"),
             vec![CanvasAction::Select],
         ),
         CanvasNodeContent::Freehand(_) => (
             CanvasNodeKind::Drawing,
-            "Drawing".to_owned(),
-            "Freehand annotation".to_owned(),
+            localizer.text("canvas-drawing"),
+            localizer.text("canvas-freehand-annotation"),
             vec![CanvasAction::Select],
         ),
     };
@@ -278,6 +300,33 @@ fn describe_node(
     }
 }
 
+const fn task_state_message(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Queued => "canvas-task-queued",
+        TaskState::Delivered => "canvas-task-delivered",
+        TaskState::Running => "canvas-task-running",
+        TaskState::Blocked => "canvas-task-blocked",
+        TaskState::Completed => "canvas-task-completed",
+        TaskState::Failed => "canvas-task-failed",
+        TaskState::Cancelled => "canvas-task-cancelled",
+    }
+}
+
+const fn portal_kind_message(kind: PortalTargetKind) -> &'static str {
+    match kind {
+        PortalTargetKind::Browser => "canvas-portal-browser",
+        PortalTargetKind::Android => "canvas-portal-android",
+        PortalTargetKind::Ios => "canvas-portal-ios",
+    }
+}
+
+const fn shape_kind_message(kind: ShapeKind) -> &'static str {
+    match kind {
+        ShapeKind::Rectangle => "canvas-shape-rectangle",
+        ShapeKind::Ellipse => "canvas-shape-ellipse",
+    }
+}
+
 fn ordered_coordinate(value: f32) -> i64 {
     (f64::from(value) * 1_000.0).round() as i64
 }
@@ -290,6 +339,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::localization::Locale;
 
     #[test]
     fn nodes_follow_reading_order_and_expose_runtime_actions() {
@@ -317,6 +367,7 @@ mod tests {
             &workspace,
             &workspace.canvas_layout(),
             &[NodeId::new(2)],
+            &Localizer::new(Locale::EnUs),
             |_| RuntimeNodeSemantics {
                 status: Some("terminal running".to_owned()),
                 can_stop: true,
@@ -349,6 +400,39 @@ mod tests {
         assert!(
             snapshot
                 .resolve_action(NodeId::new(99), CanvasAction::Select)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_handoffs_are_localized_and_cannot_be_activated() {
+        let workspace = Workspace::new(WorkspaceId::new(1), Name::new("Exemplo").unwrap());
+        let layout = CanvasLayout::new(
+            vec![Node::new(
+                NodeId::new(1),
+                NodeTarget::Handoff(crate::domain::HandoffId::new(9)),
+                CanvasPoint::new(0.0, 0.0).unwrap(),
+                CanvasSize::new(320.0, 240.0).unwrap(),
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let snapshot = CanvasSemanticSnapshot::build(
+            &workspace,
+            &layout,
+            &[],
+            &Localizer::new(Locale::PtBr),
+            |_| RuntimeNodeSemantics::default(),
+        );
+        let node = snapshot.node(NodeId::new(1)).unwrap();
+
+        assert_eq!(node.name, "Transferência 9");
+        assert_eq!(node.description, "Indisponível");
+        assert_eq!(node.actions, [CanvasAction::Select]);
+        assert!(
+            snapshot
+                .resolve_action(NodeId::new(1), CanvasAction::Activate)
                 .is_none()
         );
     }

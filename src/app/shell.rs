@@ -217,13 +217,13 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
 pub fn muted_text(theme: &Theme) -> text::Style {
     let palette = theme.extended_palette();
     text::Style {
-        color: Some(palette.background.base.text.scale_alpha(0.58)),
+        color: Some(palette.background.base.text.scale_alpha(0.72)),
     }
 }
 
 pub fn subtle_text(theme: &Theme) -> text::Style {
     let palette = theme.extended_palette();
     text::Style {
-        color: Some(palette.background.base.text.scale_alpha(0.42)),
+        color: Some(palette.background.base.text.scale_alpha(0.68)),
     }
 }

@@ -244,15 +244,15 @@ pub(super) fn handle_key(
     let Some(command) = state.command_registry.command_for(&shortcut) else {
         return Task::none();
     };
+    let embedded_content_focused =
+        state.focused_terminal.is_some() || state.focused_portal.is_some();
     if status == Status::Captured
-        && !matches!(
-            command,
-            CommandId::OpenPalette
-                | CommandId::FocusCanvas
-                | CommandId::ZoomIn
-                | CommandId::ZoomOut
-                | CommandId::ResetZoom
-        )
+        && !matches!(command, CommandId::OpenPalette | CommandId::FocusCanvas)
+        && !(embedded_content_focused
+            && matches!(
+                command,
+                CommandId::ZoomIn | CommandId::ZoomOut | CommandId::ResetZoom
+            ))
     {
         return Task::none();
     }

@@ -823,7 +823,6 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     .align_y(IcedAlignment::Center);
     let search = button(
         row![
-            text("⌘").size(13),
             text(state.localizer.text("search-short")).size(13),
             text(palette_shortcut).size(11).style(shell::subtle_text),
         ]
@@ -940,8 +939,8 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     .padding(16);
 
     let mut settings = column![
-        text("Workspace inspector").size(24),
-        text("Configure the active canvas and its agents.")
+        text(state.localizer.text("workspace-inspector")).size(24),
+        text(state.localizer.text("workspace-inspector-description"))
             .size(13)
             .style(shell::muted_text),
         text_input("Name", &state.name).on_input(Message::NameChanged),
@@ -950,7 +949,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .on_input(Message::WorkingDirectoryChanged),
         text_input("Workspace instructions", &state.instructions)
             .on_input(Message::InstructionsChanged),
-        button("Save workspace")
+        button(text(state.localizer.text("save-workspace")))
             .style(shell::primary_button)
             .on_press(Message::SaveSettings),
         floors::view(state),
@@ -1428,10 +1427,12 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         settings = settings.push(portal);
     }
     if has_active_workspace {
-        settings = settings.push(text("Workspace health").size(18)).push(
-            supervisor_panel::panel(&state.supervisor_snapshot, &state.supervisor_ui)
-                .map(Message::Supervisor),
-        );
+        settings = settings
+            .push(text(state.localizer.text("workspace-health")).size(18))
+            .push(
+                supervisor_panel::panel(&state.supervisor_snapshot, &state.supervisor_ui)
+                    .map(Message::Supervisor),
+            );
     }
 
     let stage: Element<'_, Message> = if has_active_workspace {
@@ -1445,10 +1446,11 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .clone()
             .unwrap_or_else(|| workspace.canvas_layout());
         let terminal_views = terminal_views(state, &layout);
-        let document = canvas::CanvasDocument::new(workspace, layout, terminal_views)
-            .with_git_severity(floors::node_severities(state))
-            .with_context_bodies(context_nodes::bodies(&state.context_ui))
-            .with_portal_frames(state.portal_frames.clone());
+        let document =
+            canvas::CanvasDocument::new(workspace, layout, terminal_views, &state.localizer)
+                .with_git_severity(floors::node_severities(state))
+                .with_context_bodies(context_nodes::bodies(&state.context_ui))
+                .with_portal_frames(state.portal_frames.clone());
         let canvas = canvas::view(
             state.camera,
             document,
@@ -1502,11 +1504,11 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                 zoom_controls,
                 button("+ Codex").on_press(Message::AddAgent(AgentProgram::Codex)),
                 button("+ Claude").on_press(Message::AddAgent(AgentProgram::Claude)),
-                button(if state.inspector_open {
-                    "Hide inspector"
+                button(text(state.localizer.text(if state.inspector_open {
+                    "hide-inspector"
                 } else {
-                    "Inspector"
-                })
+                    "inspector"
+                })))
                 .style(shell::navigation_button(state.inspector_open))
                 .on_press(Message::ToggleInspector),
             ]
@@ -5148,6 +5150,15 @@ mod tests {
             .binding(CommandId::ZoomOut)
             .cloned()
             .unwrap();
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Other,
+            Some(zoom_out.clone()),
+            event::Status::Captured,
+        );
+        assert_eq!(state.camera.zoom_percent(), 100);
+
+        state.focused_terminal = Some(NodeId::new(1));
         let _ = navigation::handle_key(
             &mut state,
             navigation::NavigationKey::Other,

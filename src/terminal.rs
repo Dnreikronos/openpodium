@@ -9,6 +9,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, Color, CursorShape, NamedColor, Rgb};
 use iced::keyboard::{Key, Modifiers, key::Named};
+use openpodium::localization::Localizer;
 
 pub(crate) mod session;
 
@@ -29,14 +30,14 @@ pub(crate) enum Status {
 }
 
 impl Status {
-    pub(crate) fn label(&self) -> String {
+    pub(crate) fn label(&self, localizer: &Localizer) -> String {
         match self {
-            Self::Offline => "terminal offline".to_owned(),
-            Self::Starting => "terminal starting".to_owned(),
-            Self::Running => "terminal running".to_owned(),
-            Self::Exited(detail) => format!("terminal exited ({detail})"),
-            Self::Stopped => "terminal stopped".to_owned(),
-            Self::Failed(detail) => format!("terminal failed: {detail}"),
+            Self::Offline => localizer.text("terminal-offline"),
+            Self::Starting => localizer.text("terminal-starting"),
+            Self::Running => localizer.text("terminal-running"),
+            Self::Exited(detail) => localizer.with_str("terminal-exited", "detail", detail),
+            Self::Stopped => localizer.text("terminal-stopped"),
+            Self::Failed(detail) => localizer.with_str("terminal-failed", "detail", detail),
         }
     }
 }

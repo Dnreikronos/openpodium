@@ -55,8 +55,8 @@ cargo run
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
 ```
 
 CI runs all three commands on macOS, Linux, and Windows. The current source boundaries are documented in [the architecture](docs/architecture.md#initial-code-organization).
