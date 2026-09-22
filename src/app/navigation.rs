@@ -1,13 +1,14 @@
 use iced::event::Status;
 use iced::keyboard::{self, Key, key::Named};
 use iced::{Event, Subscription, Task, event};
-use openpodium::domain::{CanvasNodeContent, NodeId, NodeTarget};
+use openpodium::domain::{CanvasNodeContent, CanvasPoint, CanvasSize, NodeId, NodeTarget};
 use openpodium::navigation::{
     CommandId, ContentTarget, SearchTarget, Shortcut, index_workspace, traverse_connections,
     traverse_nodes,
 };
 use openpodium::timeline;
 
+use crate::canvas;
 use crate::navigation_panel::{self, Item};
 
 use super::{CanvasAction, Message, OpenPodium, active_workspace_id, now};
@@ -362,6 +363,7 @@ pub(super) fn execute_command(state: &mut OpenPodium, command: CommandId) -> Tas
     match command {
         CommandId::OpenPalette => return update(state, navigation_panel::Message::Open),
         CommandId::ToggleSidebar => return super::toggle_sidebar(state),
+        CommandId::FocusSelection => return toggle_maximised(state),
         CommandId::NextWorkspace => return cycle_workspace(state, true),
         CommandId::PreviousWorkspace => return cycle_workspace(state, false),
         CommandId::NextAttention => navigate_attention(state, true),
@@ -486,6 +488,61 @@ fn navigate_connection(state: &mut OpenPodium, forward: bool) {
     if let Some(node) = traverse_connections(&layout, current, None, forward) {
         select_and_center(state, node);
     }
+}
+
+/// Maximises the selected node, or gives it back its previous geometry if it
+/// is already maximised.
+///
+/// This resizes the node itself rather than zooming the camera at it. A
+/// maximised terminal gets more rows and columns at the same text size, which
+/// is the point: you maximise a window to see more of it, not to magnify it.
+fn toggle_maximised(state: &mut OpenPodium) -> Task<Message> {
+    let Some(node_id) = (state.canvas_selection.len() == 1).then(|| state.canvas_selection[0])
+    else {
+        return Task::none();
+    };
+    let Some(before) = super::current_canvas(state) else {
+        return Task::none();
+    };
+
+    let after = match state.maximised_node {
+        Some((maximised, position, size)) if maximised == node_id => {
+            state.maximised_node = None;
+            canvas::editor::place_node(&before, node_id, position, size)
+        }
+        _ => {
+            let Some(node) = before.nodes().iter().find(|node| node.id() == node_id) else {
+                return Task::none();
+            };
+            let (viewport_width, viewport_height) = super::canvas_viewport(state);
+            let zoom = state.camera.zoom();
+            // World units, so the node covers the canvas at the current zoom
+            // without the camera having to move.
+            let width = (viewport_width / zoom) as f32 * super::MAXIMISED_FILL;
+            let height = (viewport_height / zoom) as f32 * super::MAXIMISED_FILL;
+            let (Ok(size), Ok(position)) = (
+                CanvasSize::new(width, height),
+                CanvasPoint::new(
+                    state.camera.position().x as f32 - width / 2.0,
+                    state.camera.position().y as f32 - height / 2.0,
+                ),
+            ) else {
+                return Task::none();
+            };
+
+            state.maximised_node = Some((node_id, node.position(), node.size()));
+            canvas::editor::place_node(&before, node_id, position, size)
+        }
+    };
+
+    if before == after {
+        return Task::none();
+    }
+    if super::persist_canvas(state, before.clone(), after).is_ok() {
+        state.canvas_history.record(before);
+        state.notice = None;
+    }
+    focus_content(state)
 }
 
 fn focus_content(state: &mut OpenPodium) -> Task<Message> {

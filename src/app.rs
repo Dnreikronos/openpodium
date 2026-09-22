@@ -92,6 +92,9 @@ const SIDEBAR_OPEN_KEY: &str = "sidebar_open";
 /// The window the application opens at, and the size assumed until the first
 /// resize event arrives.
 const DEFAULT_WINDOW_SIZE: Size = Size::new(1_280.0, 820.0);
+/// Fraction of the canvas a maximised node fills. Short of the edges, so the
+/// floating controls stay clear of it and the board is still visible behind.
+const MAXIMISED_FILL: f32 = 0.88;
 
 type TimelineState = (
     BTreeMap<WorkspaceId, Vec<TimelineItem>>,
@@ -135,6 +138,8 @@ struct OpenPodium {
     controls: Option<Controls>,
     sidebar_open: bool,
     window_size: Size,
+    /// The node currently maximised, with the geometry to give back to it.
+    maximised_node: Option<(NodeId, CanvasPoint, CanvasSize)>,
     floor_ui: floors::UiState,
     context_ui: context_nodes::UiState,
     rename_ui: renaming::State,
@@ -268,6 +273,7 @@ impl Default for OpenPodium {
             controls: None,
             sidebar_open: true,
             window_size: DEFAULT_WINDOW_SIZE,
+            maximised_node: None,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
             rename_ui: renaming::State::default(),
@@ -5707,6 +5713,7 @@ mod tests {
             transcript_ticks: 0,
             sidebar_open: true,
             window_size: DEFAULT_WINDOW_SIZE,
+            maximised_node: None,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
             controls: None,
@@ -6734,6 +6741,7 @@ mod tests {
             transcript_ticks: 0,
             sidebar_open: true,
             window_size: DEFAULT_WINDOW_SIZE,
+            maximised_node: None,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
             controls: None,
@@ -6797,6 +6805,121 @@ mod tests {
             portable_import: None,
             notice: None,
         }
+    }
+
+    /// Maximising resizes the node itself, so a terminal gains rows and columns
+    /// instead of being magnified.
+    #[test]
+    fn maximising_fills_the_canvas_and_restores_on_a_second_press() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let (mut state, _, _) = state_with_chat(&temp, &database);
+        state.canvas_selection = vec![NodeId::new(1)];
+
+        let original = current_canvas(&state)
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == NodeId::new(1))
+            .map(|node| (node.position(), node.size()))
+            .unwrap();
+
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+
+        let (viewport_width, viewport_height) = canvas_viewport(&state);
+        let maximised = current_canvas(&state)
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == NodeId::new(1))
+            .map(|node| (node.position(), node.size()))
+            .unwrap();
+        assert!(maximised.1.width() > original.1.width());
+        assert!(f64::from(maximised.1.width()) < viewport_width);
+        assert!(f64::from(maximised.1.height()) < viewport_height);
+        assert_eq!(state.focused_terminal, Some(NodeId::new(1)));
+
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+
+        let restored = current_canvas(&state)
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == NodeId::new(1))
+            .map(|node| (node.position(), node.size()))
+            .unwrap();
+        assert_eq!(restored.1.width(), original.1.width());
+        assert_eq!(restored.1.height(), original.1.height());
+        assert_eq!(restored.0.x(), original.0.x());
+        assert_eq!(restored.0.y(), original.0.y());
+        assert!(state.maximised_node.is_none());
+    }
+
+    /// The workspace rail reduces the space available to a maximised node.
+    #[test]
+    fn maximising_accounts_for_the_panels_beside_the_canvas() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let (mut state, _, _) = state_with_chat(&temp, &database);
+        state.canvas_selection = vec![NodeId::new(1)];
+
+        state.sidebar_open = false;
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+        let unobstructed = current_canvas(&state)
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == NodeId::new(1))
+            .map(|node| node.size().width())
+            .unwrap();
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+
+        state.sidebar_open = true;
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+        let crowded = current_canvas(&state)
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == NodeId::new(1))
+            .map(|node| node.size().width())
+            .unwrap();
+
+        assert!(
+            crowded < unobstructed,
+            "panels should leave the node less room"
+        );
+    }
+
+    #[test]
+    fn maximising_nothing_leaves_the_canvas_alone() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let (mut state, _, _) = state_with_chat(&temp, &database);
+        state.canvas_selection.clear();
+
+        let before = current_canvas(&state).unwrap();
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+
+        assert_eq!(current_canvas(&state).unwrap(), before);
+        assert!(state.maximised_node.is_none());
     }
 
     fn state_with_chat(temp: &TempDir, database: &Path) -> (OpenPodium, WorkspaceId, ChatThreadId) {

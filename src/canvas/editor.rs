@@ -148,6 +148,45 @@ pub(crate) fn resize_node(
     })
 }
 
+/// Moves and resizes one node in a single edit, used to maximise a node and to
+/// put it back where it was.
+pub(crate) fn place_node(
+    layout: &CanvasLayout,
+    node_id: NodeId,
+    position: CanvasPoint,
+    size: CanvasSize,
+) -> CanvasLayout {
+    let top = layout
+        .nodes()
+        .iter()
+        .map(Node::z_index)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    CanvasLayout::new(
+        layout
+            .nodes()
+            .iter()
+            .map(|node| {
+                if node.id() == node_id {
+                    // A maximised node belongs in front of whatever it covers.
+                    Node::with_content_and_z_index(
+                        node.id(),
+                        node.content().clone(),
+                        position,
+                        size,
+                        top,
+                    )
+                } else {
+                    node.clone()
+                }
+            })
+            .collect(),
+        layout.groups().to_vec(),
+        layout.connections().to_vec(),
+    )
+}
+
 pub(crate) fn duplicate(
     layout: &CanvasLayout,
     selection: &[NodeId],
