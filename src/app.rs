@@ -6,6 +6,8 @@ mod portals;
 mod renaming;
 pub(crate) mod shell;
 mod trackpad;
+#[cfg(test)]
+mod transcript_tests;
 pub(crate) mod ui;
 
 use std::collections::BTreeMap;
@@ -2156,7 +2158,7 @@ impl OpenPodium {
         };
         let workspace_id = workspace.id();
         let sizes = workspace
-            .canvas_layout()
+            .all_canvas_layout()
             .nodes()
             .iter()
             .filter(|node| matches!(node.reference(), Some(NodeTarget::Agent(_))))
