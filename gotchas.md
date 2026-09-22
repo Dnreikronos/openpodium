@@ -1,5 +1,15 @@
 # Gotchas
 
+- A connection tool must expose a source-to-target gesture with visible preview and cancellation. Silently disabling it until two cards are selected makes it look broken; verify interactions against the reference video, not just the final connected appearance.
+
+- Close temporary QA app instances after verification and confirm only the user's existing instance remains. Do not leave duplicate OpenPodium windows running after a UI test.
+
+- A modal's entire visible surface must capture pointer events, including labels, status messages, padding, and empty space. Only the backdrop outside the card may dismiss it. Scope editor feedback to the editing operation and fit dialog height to its contents.
+
+- Removing a panel must preserve obvious entry points into the controls it contained. Notes need a body-click/Enter editing path, keyboard focus on the visible editor, and initialized content immediately after creation; a distant generic edit button is not enough.
+
+- A canvas UI should not surface internal orchestration logs, agent registries, and configuration forms as a default inspector. When the user asks to remove that panel, remove the entry point and its dashboard; expose any retained essential action only where it is relevant.
+
 - When the user asks to work on a well-scoped issue, proceed with implementation after inspection. Make reasonable assumptions and document them instead of stopping at a clarification question when the issue already supplies acceptance criteria.
 - Windows filesystem canonicalization adds verbatim path prefixes that Git worktree commands may reject. Normalize paths consistently at the Git boundary for both arguments and identity comparisons, and test discovery, creation, ownership, and cleanup with canonicalized input paths on Windows CI.
 - When CI failures depend on random fixtures or platform startup time, make invalid values differ deterministically and give heavyweight Windows subprocesses a Windows-specific timing budget.
