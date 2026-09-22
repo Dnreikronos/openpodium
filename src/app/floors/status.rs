@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use iced::widget::{column, text};
 use iced::{Element, Task};
 use openpodium::domain::{NodeId, WorkspaceId};
-use openpodium::git::{ChangeKind, ChangedPath, CollisionReport, CollisionSeverity, Repository};
+use openpodium::git::{ChangeKind, ChangedPath, CollisionSeverity, Repository};
 use openpodium::supervisor::{CollisionObservation, SignalClass};
 
 use crate::notifications::NotificationRequest;
@@ -13,6 +13,9 @@ use crate::notifications::NotificationRequest;
 use super::super::{
     Message as AppMessage, OpenPodium, WorkspaceManager, now, refresh_supervisor_snapshot,
 };
+
+mod index;
+use index::IndexedReport;
 
 #[derive(Default)]
 pub(super) struct UiState {
@@ -26,7 +29,7 @@ struct ScanState {
     last_poll: Option<Instant>,
     signature: Option<String>,
     main: Option<PathBuf>,
-    report: CollisionReport,
+    report: IndexedReport,
 }
 
 #[derive(Clone)]
@@ -42,7 +45,7 @@ pub(crate) enum Message {
 pub(crate) struct ScanResult {
     signature: String,
     main: PathBuf,
-    report: Option<CollisionReport>,
+    report: Option<IndexedReport>,
 }
 
 pub(super) fn scan(state: &mut OpenPodium, force: bool) -> Task<AppMessage> {
@@ -79,10 +82,24 @@ pub(super) fn scan(state: &mut OpenPodium, force: bool) -> Task<AppMessage> {
         scan.busy = true;
         scan.last_poll = Some(Instant::now());
         let inspect_directory = directory.clone();
+        let mut aliases = vec![directory.clone()];
+        if let Some(workspace) = state
+            .workspaces
+            .as_ref()
+            .and_then(|manager| manager.workspace(id))
+        {
+            aliases.extend(
+                workspace
+                    .floors()
+                    .entries
+                    .values()
+                    .map(|floor| PathBuf::from(floor.directory.as_str())),
+            );
+        }
         tasks.push(Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    inspect(&inspect_directory, previous.as_deref())
+                    inspect(&inspect_directory, previous.as_deref(), &aliases)
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -127,6 +144,7 @@ pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessag
             scan.main = Some(result.main);
             if let Some(report) = result.report {
                 let observations = report
+                    .report
                     .collisions
                     .iter()
                     .map(|collision| CollisionObservation {
@@ -280,11 +298,7 @@ pub(super) fn changes_for<'a>(
     let Some(scan) = state.workspaces.get(&workspace_id) else {
         return &[];
     };
-    scan.report
-        .inventories
-        .iter()
-        .find(|inventory| same_path(&inventory.checkout, path))
-        .map_or(&[], |inventory| inventory.paths.as_slice())
+    scan.report.changes_for(path)
 }
 
 pub(super) fn changes_for_main(state: &UiState, workspace_id: WorkspaceId) -> &[ChangedPath] {
@@ -346,10 +360,10 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
     if scan.is_some_and(|scan| scan.busy) {
         content = content.push(text("Checking changed paths…").size(12));
     }
-    if scan.is_none_or(|scan| scan.report.collisions.is_empty()) {
+    if scan.is_none_or(|scan| scan.report.report.collisions.is_empty()) {
         content = content.push(text("No overlapping changed paths").size(12));
     } else if let Some(scan) = scan {
-        for collision in &scan.report.collisions {
+        for collision in &scan.report.report.collisions {
             content = content.push(
                 text(format!(
                     "{} · {} · {} ↔ {}",
@@ -365,18 +379,26 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
     content.into()
 }
 
-fn inspect(directory: &Path, previous: Option<&str>) -> Result<ScanResult, String> {
+fn inspect(
+    directory: &Path,
+    previous: Option<&str>,
+    aliases: &[PathBuf],
+) -> Result<ScanResult, String> {
     let repo = Repository::discover(directory)?;
     let checkouts = repo
         .checkouts()?
         .into_iter()
         .filter(|checkout| checkout.path.is_dir())
         .collect::<Vec<_>>();
-    let signature = repo.change_signature(&checkouts)?;
+    // A new floor alias needs indexing even if Git's contents have not changed.
+    let signature = format!("{}:{aliases:?}", repo.change_signature(&checkouts)?);
     let report = if previous == Some(signature.as_str()) {
         None
     } else {
-        Some(repo.collision_report(&checkouts)?)
+        Some(IndexedReport::new(
+            repo.collision_report(&checkouts)?,
+            aliases,
+        ))
     };
     Ok(ScanResult {
         signature,
@@ -389,13 +411,6 @@ fn checkout_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
-}
-
-fn same_path(left: &Path, right: &Path) -> bool {
-    match (dunce::canonicalize(left), dunce::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => dunce::simplified(left) == dunce::simplified(right),
-    }
 }
 
 #[cfg(test)]

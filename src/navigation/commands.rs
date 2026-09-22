@@ -179,10 +179,11 @@ pub enum CommandId {
     Copy,
     Paste,
     ToggleSidebar,
+    FocusSelection,
 }
 
 impl CommandId {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::OpenPalette,
         Self::NextWorkspace,
         Self::PreviousWorkspace,
@@ -208,6 +209,7 @@ impl CommandId {
         Self::Copy,
         Self::Paste,
         Self::ToggleSidebar,
+        Self::FocusSelection,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -237,6 +239,7 @@ impl CommandId {
             Self::Copy => "copy",
             Self::Paste => "paste",
             Self::ToggleSidebar => "toggle_sidebar",
+            Self::FocusSelection => "focus_selection",
         }
     }
 
@@ -273,6 +276,7 @@ impl CommandId {
             Self::Copy => "Copy selection",
             Self::Paste => "Paste selection",
             Self::ToggleSidebar => "Show or hide the workspace rail",
+            Self::FocusSelection => "Maximise or restore the selected node",
         }
     }
 
@@ -303,6 +307,7 @@ impl CommandId {
             Self::Copy => "Primary+c",
             Self::Paste => "Primary+v",
             Self::ToggleSidebar => "Primary+b",
+            Self::FocusSelection => "Primary+Enter",
         };
         Shortcut::parse(value).ok()
     }

@@ -12,12 +12,60 @@ const TEXT_SCALES: [f32; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
 pub const TEXT_SCALE_KEY: &str = "text_scale";
 pub const HIGH_CONTRAST_KEY: &str = "high_contrast";
 pub const REDUCED_MOTION_KEY: &str = "reduced_motion";
+pub const THEME_KEY: &str = "theme";
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub fn from_stored(value: &str) -> Self {
+        match value {
+            "light" => Self::Light,
+            "dark" => Self::Dark,
+            _ => Self::System,
+        }
+    }
+
+    pub const fn is_dark(self, desktop_is_dark: bool) -> bool {
+        match self {
+            Self::System => desktop_is_dark,
+            Self::Light => false,
+            Self::Dark => true,
+        }
+    }
+}
+
+impl std::fmt::Display for ThemePreference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PresentationPreferences {
     scale_index: usize,
     high_contrast: bool,
     reduced_motion: bool,
+    theme: ThemePreference,
 }
 
 impl Default for PresentationPreferences {
@@ -37,6 +85,7 @@ impl PresentationPreferences {
             scale_index: closest_scale_index(requested_scale),
             high_contrast: env_flag(HIGH_CONTRAST_ENV).unwrap_or(system.high_contrast),
             reduced_motion: env_flag(REDUCED_MOTION_ENV).unwrap_or(system.reduced_motion),
+            theme: ThemePreference::System,
         }
     }
 
@@ -56,6 +105,14 @@ impl PresentationPreferences {
         self.reduced_motion
     }
 
+    pub const fn theme(self) -> ThemePreference {
+        self.theme
+    }
+
+    pub fn set_theme(&mut self, theme: ThemePreference) {
+        self.theme = theme;
+    }
+
     pub fn cycle_text_scale(&mut self) {
         self.scale_index = (self.scale_index + 1) % TEXT_SCALES.len();
     }
@@ -71,6 +128,7 @@ impl PresentationPreferences {
     pub fn apply_stored(&mut self, values: impl IntoIterator<Item = (String, String)>) {
         for (key, value) in values {
             match key.as_str() {
+                THEME_KEY => self.theme = ThemePreference::from_stored(&value),
                 TEXT_SCALE_KEY => {
                     if let Ok(requested) = value.parse::<f32>() {
                         self.scale_index = closest_scale_index(requested);
@@ -173,6 +231,7 @@ mod tests {
             scale_index: 0,
             high_contrast: false,
             reduced_motion: false,
+            theme: ThemePreference::System,
         };
         for expected in [125, 150, 175, 200, 100] {
             preferences.cycle_text_scale();
@@ -193,6 +252,7 @@ mod tests {
             scale_index: 0,
             high_contrast: false,
             reduced_motion: false,
+            theme: ThemePreference::System,
         };
         preferences.apply_stored([
             (TEXT_SCALE_KEY.to_owned(), "1.8".to_owned()),
@@ -214,5 +274,24 @@ mod tests {
             assert_eq!(parse_flag(value), Some(false));
         }
         assert_eq!(parse_flag("sometimes"), None);
+    }
+
+    #[test]
+    fn theme_preferences_round_trip_and_follow_system_only_when_selected() {
+        for theme in ThemePreference::ALL {
+            assert_eq!(ThemePreference::from_stored(theme.as_str()), theme);
+        }
+        assert_eq!(
+            ThemePreference::from_stored("invalid"),
+            ThemePreference::System
+        );
+        for desktop in [false, true] {
+            assert_eq!(ThemePreference::System.is_dark(desktop), desktop);
+            assert!(!ThemePreference::Light.is_dark(desktop));
+            assert!(ThemePreference::Dark.is_dark(desktop));
+        }
+        let mut preferences = PresentationPreferences::default();
+        preferences.apply_stored([(THEME_KEY.to_owned(), "dark".to_owned())]);
+        assert_eq!(preferences.theme(), ThemePreference::Dark);
     }
 }

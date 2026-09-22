@@ -80,7 +80,8 @@ impl CanvasDocument {
                     |terminal| RuntimeNodeSemantics {
                         title: terminal.title.clone(),
                         status: Some(terminal.status.label(localizer)),
-                        value: terminal_text(terminal),
+                        // This snapshot supplies labels only; its value is discarded.
+                        value: None,
                         can_start: matches!(
                             terminal.status,
                             terminal::Status::Offline
@@ -203,23 +204,6 @@ fn role_color(value: &str) -> Color {
     let green = u8::from_str_radix(&value[3..5], 16).expect("role colors are validated");
     let blue = u8::from_str_radix(&value[5..7], 16).expect("role colors are validated");
     Color::from_rgb8(red, green, blue)
-}
-
-fn terminal_text(terminal: &terminal::View) -> Option<String> {
-    let mut rows = BTreeMap::<usize, String>::new();
-    for cell in &terminal.cells {
-        let row = rows.entry(cell.row).or_default();
-        if row.len() < cell.column {
-            row.push_str(&" ".repeat(cell.column - row.len()));
-        }
-        row.push_str(&cell.text);
-    }
-    let text = rows
-        .into_values()
-        .map(|row| row.trim_end().to_owned())
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!text.is_empty()).then_some(text)
 }
 
 #[cfg(test)]

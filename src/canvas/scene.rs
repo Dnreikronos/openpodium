@@ -713,6 +713,7 @@ fn draw_node(
                 (focused_terminal == Some(node.id())).then_some(preedit),
                 regions,
                 rect,
+                palette,
             );
         } else {
             let body_padding = (12.0 * zoom).clamp(7.0, 16.0);
@@ -981,50 +982,56 @@ fn draw_terminal(
     preedit: Option<&str>,
     regions: &[Rectangle],
     bounds: Rectangle,
+    palette: &palette::Extended,
 ) {
     let origin = Point::new(
         top_left.x + BODY_PADDING * zoom,
         top_left.y + header_height + BODY_PADDING * zoom,
     );
     let cell_size = Size::new(CELL_WIDTH * zoom, CELL_HEIGHT * zoom);
-    for cell in &terminal.cells {
+    terminal_background_runs(&terminal.cells, palette, |row, column, columns, color| {
+        frame.fill_rectangle(
+            Point::new(
+                origin.x + column as f32 * cell_size.width,
+                origin.y + row as f32 * cell_size.height,
+            ),
+            Size::new(columns as f32 * cell_size.width, cell_size.height),
+            color,
+        );
+    });
+    for cell in terminal.cells.iter() {
         let position = Point::new(
             origin.x + cell.column as f32 * cell_size.width,
             origin.y + cell.row as f32 * cell_size.height,
         );
-        let mut background = terminal_color(cell.background);
-        if cell.selected {
-            background.a = 1.0;
-        }
-        frame.fill_rectangle(position, cell_size, background);
         if cell.text != " " && zoom < GLYPH_MIN_ZOOM {
             // Too small to read. An ink bar keeps the shape of the output,
             // which is the only thing a glyph could convey at this size.
             frame.fill_rectangle(
                 Point::new(position.x, position.y + cell_size.height * 0.25),
                 Size::new(cell_size.width, (cell_size.height * 0.5).max(1.0)),
-                terminal_color(cell.foreground).scale_alpha(0.85),
+                terminal_color(cell.foreground, palette).scale_alpha(0.85),
             );
         }
         if cell.underline || cell.hyperlink.is_some() {
             frame.fill_rectangle(
                 Point::new(position.x, position.y + cell_size.height - zoom.max(1.0)),
                 Size::new(cell_size.width, zoom.max(1.0)),
-                terminal_color(cell.foreground),
+                terminal_color(cell.foreground, palette),
             );
         }
         if cell.strikeout {
             frame.fill_rectangle(
                 Point::new(position.x, position.y + cell_size.height * 0.52),
                 Size::new(cell_size.width, zoom.max(1.0)),
-                terminal_color(cell.foreground),
+                terminal_color(cell.foreground, palette),
             );
         }
     }
 
     if zoom >= GLYPH_MIN_ZOOM {
         clip_text(frame, regions, bounds, |frame| {
-            for cell in &terminal.cells {
+            for cell in terminal.cells.iter() {
                 if cell.text == " " {
                     continue;
                 }
@@ -1035,7 +1042,7 @@ fn draw_terminal(
                 frame.fill_text(canvas::Text {
                     content: cell.text.clone(),
                     position: Point::new(position.x, position.y - cell_size.height * 0.04),
-                    color: terminal_color(cell.foreground),
+                    color: terminal_color(cell.foreground, palette),
                     size: Pixels((13.0 * zoom).max(5.0)),
                     font: Font {
                         family: font::Family::Monospace,
@@ -1062,8 +1069,8 @@ fn draw_terminal(
             .cells
             .iter()
             .find(|cell| cell.row == cursor.row && cell.column == cursor.column)
-            .map(|cell| terminal_color(cell.foreground))
-            .unwrap_or(Color::from_rgb8(39, 42, 47));
+            .map(|cell| terminal_color(cell.foreground, palette))
+            .unwrap_or(palette.background.base.text);
         let position = Point::new(
             origin.x + cursor.column as f32 * cell_size.width,
             origin.y + cursor.row as f32 * cell_size.height,
@@ -1098,8 +1105,52 @@ fn draw_terminal(
     }
 }
 
-fn terminal_color(color: terminal::CellColor) -> Color {
-    Color::from_rgb8(color.red, color.green, color.blue)
+fn terminal_background_runs(
+    cells: &[terminal::CellView],
+    palette: &palette::Extended,
+    mut paint: impl FnMut(usize, usize, usize, Color),
+) {
+    let surface = shell::surface_color(palette);
+    let mut cells = cells.iter().peekable();
+    while let Some(cell) = cells.next() {
+        let color = terminal_color(cell.background, palette);
+        // The card already paints this surface, including empty terminal cells.
+        if color == surface {
+            continue;
+        }
+        let mut columns = 1;
+        while cells.peek().is_some_and(|next| {
+            next.row == cell.row
+                && next.column == cell.column + columns
+                && terminal_color(next.background, palette) == color
+        }) {
+            cells.next();
+            columns += 1;
+        }
+        paint(cell.row, cell.column, columns, color);
+    }
+}
+
+fn terminal_color(color: terminal::CellColor, palette: &palette::Extended) -> Color {
+    use terminal::DefaultColor;
+    let mut resolved = match color.default_role {
+        Some(DefaultColor::Foreground | DefaultColor::DimForeground) => {
+            palette.background.base.text
+        }
+        Some(DefaultColor::Background | DefaultColor::DimBackground) => {
+            shell::surface_color(palette)
+        }
+        None => return Color::from_rgb8(color.red, color.green, color.blue),
+    };
+    if matches!(
+        color.default_role,
+        Some(DefaultColor::DimForeground | DefaultColor::DimBackground)
+    ) {
+        resolved.r *= 2.0 / 3.0;
+        resolved.g *= 2.0 / 3.0;
+        resolved.b *= 2.0 / 3.0;
+    }
+    resolved
 }
 
 fn group_bounds(group: &NodeGroup, document: &CanvasDocument) -> Option<WorldRect> {
@@ -1185,6 +1236,102 @@ fn connection_color(kind: ConnectionKind, palette: &palette::Extended) -> Color 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_backgrounds_skip_default_cells_and_batch_solid_rows() {
+        let mut model = crate::terminal::Model::new(crate::terminal::GridSize {
+            columns: 80,
+            rows: 30,
+        });
+        for theme in [super::shell::theme(), iced::Theme::Dark] {
+            let mut rectangles = 0;
+            super::terminal_background_runs(
+                &model.view(crate::terminal::Status::Running).cells,
+                theme.extended_palette(),
+                |_, _, _, _| rectangles += 1,
+            );
+            assert_eq!(rectangles, 0);
+        }
+        model.feed(b"\x1b[41m\x1b[2J");
+        let mut runs = Vec::new();
+        super::terminal_background_runs(
+            &model.view(crate::terminal::Status::Running).cells,
+            iced::Theme::Dark.extended_palette(),
+            |row, column, columns, _| runs.push((row, column, columns)),
+        );
+        assert_eq!(runs, (0..30).map(|row| (row, 0, 80)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn terminal_background_runs_preserve_colors_selection_and_gaps() {
+        let mut model = crate::terminal::Model::new(crate::terminal::GridSize {
+            columns: 20,
+            rows: 4,
+        });
+        model.feed(
+            "plain\x1b[41mred界red\x1b[0;7minverse\r\n\x1b[48;2;255;255;255mwhite".as_bytes(),
+        );
+        model.begin_selection(1, 1, false);
+        model.update_selection(1, 3, true);
+        let view = model.view(crate::terminal::Status::Running);
+        for theme in [super::shell::theme(), iced::Theme::Dark] {
+            let palette = theme.extended_palette();
+            let mut painted = std::collections::BTreeMap::new();
+            super::terminal_background_runs(&view.cells, palette, |row, column, columns, color| {
+                for column in column..column + columns {
+                    assert!(painted.insert((row, column), color).is_none());
+                }
+            });
+            let expected = view
+                .cells
+                .iter()
+                .filter_map(|cell| {
+                    let color = super::terminal_color(cell.background, palette);
+                    (color != super::shell::surface_color(palette))
+                        .then_some(((cell.row, cell.column), color))
+                })
+                .collect();
+            assert_eq!(painted, expected);
+        }
+    }
+
+    #[test]
+    fn terminal_theme_changes_defaults_but_not_explicit_colors() {
+        let mut model = crate::terminal::Model::new(crate::terminal::GridSize {
+            columns: 20,
+            rows: 4,
+        });
+        model.feed(b"A\x1b[38;2;39;42;47;48;2;255;255;255mB\x1b[0;7mC");
+        let view = model.view(crate::terminal::Status::Running);
+        let cell = |text| view.cells.iter().find(|cell| cell.text == text).unwrap();
+        for theme in [super::shell::theme(), iced::Theme::Dark] {
+            let palette = theme.extended_palette();
+            assert_eq!(
+                super::terminal_color(cell("A").foreground, palette),
+                palette.background.base.text
+            );
+            assert_eq!(
+                super::terminal_color(cell("A").background, palette),
+                super::shell::surface_color(palette)
+            );
+            assert_eq!(
+                super::terminal_color(cell("B").foreground, palette),
+                iced::Color::from_rgb8(39, 42, 47)
+            );
+            assert_eq!(
+                super::terminal_color(cell("B").background, palette),
+                iced::Color::WHITE
+            );
+            assert_eq!(
+                super::terminal_color(cell("C").foreground, palette),
+                super::shell::surface_color(palette)
+            );
+            assert_eq!(
+                super::terminal_color(cell("C").background, palette),
+                palette.background.base.text
+            );
+        }
+    }
+
     use super::{MAX_VISIBLE_REGIONS, grid_step, visible_regions};
     use iced::{Point, Rectangle, Size};
 

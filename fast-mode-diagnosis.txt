@@ -1,0 +1,21 @@
+Validated.
+
+- Updated Claude Code from `2.1.259` to `2.1.278`.
+- Relaunched a fresh interactive session.
+- `/fast` exact message:
+
+```text
+Fast mode is currently unavailable
+```
+
+Root cause: Enterprise-managed settings contain:
+
+```text
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+```
+
+This disables Claude’s Fast Mode availability check. `/status` also showed the managed policy refresh timing out against `api.anthropic.com`, leaving Claude on its cached policy.
+
+Your shell’s `env | grep CLAUDE_CODE` is empty because this variable is injected by Claude’s remote settings at session startup.
+
+Ask the Mother.Tech Claude admin to remove that setting and ensure Fast Mode plus usage credits are enabled. Fast Mode requires those checks and Team/Enterprise owner enablement. Official requirements: https://code.claude.com/docs/en/fast-mode#requirements

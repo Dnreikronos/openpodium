@@ -1,3 +1,4 @@
+mod appearance;
 mod context_nodes;
 mod floors;
 mod icons;
@@ -5,6 +6,7 @@ mod navigation;
 mod portals;
 mod renaming;
 pub(crate) mod shell;
+mod terminal_recovery;
 mod trackpad;
 #[cfg(test)]
 mod transcript_tests;
@@ -23,8 +25,7 @@ use iced::widget::{
     button as iced_button, column, container, row, scrollable, stack, text, text_editor,
 };
 use iced::{
-    Alignment as IcedAlignment, Color, Element, Fill, Size, Subscription, Task, Theme, clipboard,
-    event, theme,
+    Alignment as IcedAlignment, Element, Fill, Size, Subscription, Task, clipboard, event, theme,
 };
 use openpodium::domain::{
     Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, ChatAttachmentId,
@@ -48,9 +49,7 @@ use openpodium::persistence::{
     import_role,
 };
 use openpodium::portal::{PortalAction, PortalFrame};
-use openpodium::presentation::{
-    HIGH_CONTRAST_KEY, PresentationPreferences, REDUCED_MOTION_KEY, TEXT_SCALE_KEY,
-};
+use openpodium::presentation::{PresentationPreferences, THEME_KEY, ThemePreference};
 use openpodium::routines::{
     MissedOccurrences, RoutineDispatch, RoutineScheduler, RunRequest, TriggerEvent, TriggerWatcher,
 };
@@ -92,6 +91,9 @@ const SIDEBAR_OPEN_KEY: &str = "sidebar_open";
 /// The window the application opens at, and the size assumed until the first
 /// resize event arrives.
 const DEFAULT_WINDOW_SIZE: Size = Size::new(1_280.0, 820.0);
+/// Fraction of the canvas a maximised node fills. Short of the edges, so the
+/// floating controls stay clear of it and the board is still visible behind.
+const MAXIMISED_FILL: f32 = 0.88;
 
 type TimelineState = (
     BTreeMap<WorkspaceId, Vec<TimelineItem>>,
@@ -132,9 +134,12 @@ struct PortableImportDraft {
 struct OpenPodium {
     localizer: Localizer,
     presentation: PresentationPreferences,
+    system_theme: theme::Mode,
     controls: Option<Controls>,
     sidebar_open: bool,
     window_size: Size,
+    /// The node currently maximised, with the geometry to give back to it.
+    maximised_node: Option<(NodeId, CanvasPoint, CanvasSize)>,
     floor_ui: floors::UiState,
     context_ui: context_nodes::UiState,
     rename_ui: renaming::State,
@@ -265,9 +270,11 @@ impl Default for OpenPodium {
         let mut state = Self {
             localizer: Localizer::default(),
             presentation: PresentationPreferences::default(),
+            system_theme: theme::Mode::None,
             controls: None,
             sidebar_open: true,
             window_size: DEFAULT_WINDOW_SIZE,
+            maximised_node: None,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
             rename_ui: renaming::State::default(),
@@ -352,10 +359,8 @@ enum Message {
     RemoveWorkspace(WorkspaceId),
     OrchestrationTick,
     Canvas(canvas::Message),
-    CycleTextScale,
-    CycleLocale,
-    ToggleHighContrast,
-    ToggleReducedMotion,
+    ThemeSelected(ThemePreference),
+    SystemThemeChanged(theme::Mode),
     OpenControls(Controls),
     CloseControls,
     TrackpadMagnified(f64),
@@ -442,6 +447,11 @@ enum Message {
     RoleImportRead(Option<String>),
     CanvasFragmentRead(Option<String>),
     StartTerminal(NodeId),
+    RecoverTerminal(NodeId),
+    ResumeTerminal {
+        node_id: NodeId,
+        program: AgentProgram,
+    },
     StopTerminal(NodeId),
     TerminalStarted {
         workspace_id: WorkspaceId,
@@ -491,6 +501,7 @@ enum Controls {
     Node,
     Rename,
     RemoveWorkspace(WorkspaceId),
+    TerminalRecovery(NodeId),
 }
 
 impl Controls {
@@ -510,49 +521,42 @@ impl Controls {
             Self::Node => "Selected node",
             Self::Rename => "Rename window",
             Self::RemoveWorkspace(_) => "Remove workspace?",
+            Self::TerminalRecovery(_) => "Restart or resume",
         }
     }
 }
 
 pub(crate) fn run() -> iced::Result {
     trackpad::install();
-    iced::application(OpenPodium::default, update, view)
-        .title(APP_NAME)
-        .theme(|state: &OpenPodium| application_theme(state.presentation))
-        .scale_factor(|state: &OpenPodium| state.presentation.text_scale())
-        .window(iced::window::Settings {
-            size: DEFAULT_WINDOW_SIZE,
-            min_size: Some(Size::new(900.0, 620.0)),
-            ..iced::window::Settings::default()
-        })
-        .subscription(|_| {
-            Subscription::batch([
-                iced::time::every(Duration::from_millis(100)).map(|_| Message::OrchestrationTick),
-                navigation::subscription(),
-                iced::window::resize_events().map(|(_, size)| Message::WindowResized(size)),
-                trackpad::subscription().map(Message::TrackpadMagnified),
-            ])
-        })
-        .centered()
-        .run()
-}
-
-fn application_theme(preferences: PresentationPreferences) -> Theme {
-    if preferences.high_contrast() {
-        Theme::custom(
-            "OpenPodium high contrast",
-            theme::Palette {
-                background: Color::BLACK,
-                text: Color::WHITE,
-                primary: Color::from_rgb8(0, 255, 255),
-                success: Color::from_rgb8(0, 255, 0),
-                warning: Color::from_rgb8(255, 255, 0),
-                danger: Color::from_rgb8(255, 96, 96),
-            },
-        )
-    } else {
-        shell::theme()
-    }
+    iced::application(
+        || {
+            (
+                OpenPodium::default(),
+                iced::system::theme().map(Message::SystemThemeChanged),
+            )
+        },
+        update,
+        view,
+    )
+    .title(APP_NAME)
+    .theme(|state: &OpenPodium| appearance::theme(state.presentation, state.system_theme))
+    .scale_factor(|state: &OpenPodium| state.presentation.text_scale())
+    .window(iced::window::Settings {
+        size: DEFAULT_WINDOW_SIZE,
+        min_size: Some(Size::new(900.0, 620.0)),
+        ..iced::window::Settings::default()
+    })
+    .subscription(|_| {
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(100)).map(|_| Message::OrchestrationTick),
+            navigation::subscription(),
+            iced::window::resize_events().map(|(_, size)| Message::WindowResized(size)),
+            trackpad::subscription().map(Message::TrackpadMagnified),
+            iced::system::theme_changes().map(Message::SystemThemeChanged),
+        ])
+    })
+    .centered()
+    .run()
 }
 
 fn load_application_preferences(state: &mut OpenPodium) {
@@ -605,32 +609,16 @@ fn persist_application_preference(state: &mut OpenPodium, key: &str, value: &str
 
 fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
-        Message::CycleTextScale => {
-            let previous_scale = state.presentation.text_scale();
-            state.presentation.cycle_text_scale();
-            let ratio = previous_scale / state.presentation.text_scale();
-            state.window_size = Size::new(
-                state.window_size.width * ratio,
-                state.window_size.height * ratio,
-            );
-            let value = state.presentation.text_scale().to_string();
-            persist_application_preference(state, TEXT_SCALE_KEY, &value);
-        }
-        Message::CycleLocale => {
-            state.localizer.cycle_user_locale();
-            let value = state.localizer.locale().tag();
-            persist_application_preference(state, LOCALE_KEY, value);
-        }
-        Message::ToggleHighContrast => {
-            state.presentation.toggle_high_contrast();
+        Message::ThemeSelected(theme) => {
+            state.presentation.set_theme(theme);
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
-            let value = state.presentation.high_contrast().to_string();
-            persist_application_preference(state, HIGH_CONTRAST_KEY, &value);
+            persist_application_preference(state, THEME_KEY, theme.as_str());
         }
-        Message::ToggleReducedMotion => {
-            state.presentation.toggle_reduced_motion();
-            let value = state.presentation.reduced_motion().to_string();
-            persist_application_preference(state, REDUCED_MOTION_KEY, &value);
+        Message::SystemThemeChanged(theme) => {
+            state.system_theme = theme;
+            if state.presentation.theme() == ThemePreference::System {
+                state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            }
         }
         Message::OpenControls(controls) => {
             state.cancel_connection();
@@ -854,6 +842,10 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             paste_canvas_fragment(state, payload.as_deref());
         }
         Message::StartTerminal(node_id) => return start_terminal(state, node_id),
+        Message::RecoverTerminal(node_id) => return terminal_recovery::open(state, node_id),
+        Message::ResumeTerminal { node_id, program } => {
+            return start_terminal_with_resume(state, node_id, Some(program));
+        }
         Message::StopTerminal(node_id) => stop_terminal(state, node_id),
         Message::TerminalStarted {
             workspace_id,
@@ -874,6 +866,11 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             node_id,
             contents,
         } => {
+            if active_workspace_id(state) == Some(workspace_id)
+                && terminal_recovery::needs_recovery(state, node_id)
+            {
+                return terminal_recovery::open(state, node_id);
+            }
             let key = TerminalKey {
                 workspace_id,
                 node_id,
@@ -1059,73 +1056,12 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         }
     }
 
-    let enabled = |enabled| {
-        state
-            .localizer
-            .text(if enabled { "state-on" } else { "state-off" })
-    };
-    // Display preferences stay reachable but sit at footnote weight, so the
-    // rail never competes with the canvas for attention.
-    let preference = |label: String, message: Message| {
-        button(text(label).size(12))
-            .style(shell::utility_button)
-            .padding([5, 8])
-            .on_press(message)
-            .width(Fill)
-    };
-    let accessibility_controls = column![
-        rule(),
-        section_label(state.localizer.text("display-settings")),
-        row![
-            preference(
-                state
-                    .localizer
-                    .text(match state.localizer.locale() {
-                        Locale::EnUs | Locale::PseudoRtl => "locale-short-en",
-                        Locale::PtBr => "locale-short-pt",
-                    })
-                    .to_string(),
-                Message::CycleLocale,
-            ),
-            preference(
-                format!("{}%", state.presentation.text_scale_percent()),
-                Message::CycleTextScale,
-            ),
-        ]
-        .spacing(4),
-        row![
-            preference(
-                state
-                    .localizer
-                    .with_str(
-                        "contrast-short",
-                        "state",
-                        enabled(state.presentation.high_contrast()),
-                    )
-                    .to_string(),
-                Message::ToggleHighContrast,
-            ),
-            preference(
-                state
-                    .localizer
-                    .with_str(
-                        "motion-short",
-                        "state",
-                        enabled(state.presentation.reduced_motion()),
-                    )
-                    .to_string(),
-                Message::ToggleReducedMotion,
-            ),
-        ]
-        .spacing(4),
-    ]
-    .spacing(6);
     let sidebar = container(
         column![
             brand,
             search,
             scrollable(workspace_list).height(Fill),
-            accessibility_controls,
+            appearance::controls(state.presentation),
         ]
         .spacing(10)
         .height(Fill),
@@ -1734,8 +1670,8 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                 primary_button(text("Stop terminal").size(13))
                     .on_press(Message::StopTerminal(node_id))
             } else if session.is_some() {
-                primary_button(text("Reconnect terminal").size(13))
-                    .on_press(Message::StartTerminal(node_id))
+                primary_button(text("Restart / Resume").size(13))
+                    .on_press(Message::RecoverTerminal(node_id))
             } else {
                 primary_button(text("Start terminal").size(13))
                     .on_press(Message::StartTerminal(node_id))
@@ -1901,14 +1837,14 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                         text(if running {
                             "Stop terminal"
                         } else {
-                            "Start terminal"
+                            "Restart / Resume"
                         })
                         .size(12),
                     )
                     .on_press(if running {
                         Message::StopTerminal(node_id)
                     } else {
-                        Message::StartTerminal(node_id)
+                        Message::RecoverTerminal(node_id)
                     }),
                 )
                 .push(button(text("Chat").size(12)).on_press(Message::OpenControls(Controls::Node)))
@@ -2059,6 +1995,9 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         stage
     };
     let application = if let Some(controls) = state.controls {
+        if let Controls::TerminalRecovery(node) = controls {
+            settings = terminal_recovery::view(state, node);
+        }
         if matches!(controls, Controls::Menu | Controls::Advanced) {
             let choices: &[Controls] = if controls == Controls::Menu {
                 &[Controls::Workspace, Controls::Advanced]
@@ -2123,6 +2062,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .max_width(match controls {
             Controls::Menu | Controls::Advanced => 340.0,
             Controls::Rename | Controls::RemoveWorkspace(_) => 420.0,
+            Controls::TerminalRecovery(_) => 440.0,
             _ => 620.0,
         });
         stack![
@@ -3275,6 +3215,9 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
         }
         canvas::Message::TerminalInput { node_id, bytes } => {
+            if terminal_recovery::needs_recovery(state, node_id) {
+                return terminal_recovery::open(state, node_id);
+            }
             if let Some(session) =
                 active_terminal_key(state, node_id).and_then(|key| state.terminals.get(&key))
                 && let Err(error) = session.write(&bytes)
@@ -3283,6 +3226,9 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
             }
         }
         canvas::Message::TerminalPasteRequested(node_id) => {
+            if terminal_recovery::needs_recovery(state, node_id) {
+                return terminal_recovery::open(state, node_id);
+            }
             let Some(workspace_id) = active_workspace_id(state) else {
                 return Task::none();
             };
@@ -4646,6 +4592,14 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
 }
 
 fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
+    start_terminal_with_resume(state, node_id, None)
+}
+
+fn start_terminal_with_resume(
+    state: &mut OpenPodium,
+    node_id: NodeId,
+    resume: Option<AgentProgram>,
+) -> Task<Message> {
     if floors::is_busy(state) {
         state.notice =
             Some("Wait for the Git operation to finish before starting a terminal".to_owned());
@@ -4713,8 +4667,13 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
         return Task::none();
     }
 
+    if resume.is_some_and(|resumed| !terminal_recovery::can_resume(program, resumed)) {
+        state.notice = Some("This agent does not support that resume action".to_owned());
+        return Task::none();
+    }
+    let launch_program = resume.unwrap_or(program);
     if profile.is_none() {
-        match check_agent_capability(program, preset.as_ref()) {
+        match check_agent_capability(launch_program, preset.as_ref()) {
             Ok(capability) if !capability.installed() => {
                 state.notice = capability.setup_guidance().map(str::to_owned);
                 return Task::none();
@@ -4728,7 +4687,7 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
     }
 
     let spec = match session::process_spec(
-        program,
+        launch_program,
         preset.as_ref(),
         role.as_ref(),
         &working_directory,
@@ -4736,6 +4695,11 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
     )
     .map_err(|error| error.to_string())
     .and_then(|spec| {
+        let spec = if let Some(program) = resume {
+            terminal_recovery::resume_spec(spec, program)
+        } else {
+            spec
+        };
         let spec = apply_ipc_environment(
             spec,
             state.ipc.as_ref(),
@@ -4766,9 +4730,13 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
 
     state.terminal_generation = state.terminal_generation.wrapping_add(1);
     let generation = state.terminal_generation;
-    state
-        .terminals
-        .insert(key, Session::starting(size, generation));
+    if let Some(session) = state.terminals.get_mut(&key) {
+        session.prepare_restart(size, generation);
+    } else {
+        state
+            .terminals
+            .insert(key, Session::starting(size, generation));
+    }
     state.focused_terminal = Some(node_id);
     state.canvas_revision = state.canvas_revision.wrapping_add(1);
     state.notice = Some("Terminal starting".to_owned());
@@ -4859,6 +4827,10 @@ fn handle_terminal_started(
             }
             if is_active_workspace {
                 state.notice = None;
+                if state.controls == Some(Controls::TerminalRecovery(node_id)) {
+                    state.controls = None;
+                    state.focused_terminal = Some(node_id);
+                }
             }
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
             wait_for_terminal_event(
@@ -4903,6 +4875,7 @@ fn handle_terminal_event(
     generation: u64,
     event: Option<ProcessEvent>,
 ) -> Task<Message> {
+    let colors = appearance::terminal_colors(state.presentation, state.system_theme);
     let key = TerminalKey {
         workspace_id,
         node_id,
@@ -4916,7 +4889,7 @@ fn handle_terminal_event(
     };
     let continues = matches!(event, Some(ProcessEvent::Output(_)));
     let actions = match event {
-        Some(event) => session.handle_event(event),
+        Some(event) => session.handle_event(event, colors),
         None => {
             session.fail("the terminal event stream closed unexpectedly");
             Vec::new()
@@ -5707,8 +5680,10 @@ mod tests {
             transcript_ticks: 0,
             sidebar_open: true,
             window_size: DEFAULT_WINDOW_SIZE,
+            maximised_node: None,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
+            system_theme: theme::Mode::None,
             controls: None,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
@@ -5946,7 +5921,42 @@ mod tests {
             Some(zoom_out),
             event::Status::Captured,
         );
-        assert_eq!(state.camera.zoom_percent(), 83);
+        assert_eq!(state.camera.zoom_percent(), 100);
+    }
+
+    #[test]
+    fn zero_and_other_printable_shortcuts_do_not_move_the_board_while_typing() {
+        let temp = TempDir::new().unwrap();
+        let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+        let camera = Camera::default()
+            .zoom_centered(0.75)
+            .pan_by_screen(150.0, 80.0);
+        for portal in [false, true] {
+            state.focused_terminal = (!portal).then_some(NodeId::new(1));
+            state.focused_portal = portal.then_some(NodeId::new(1));
+            for status in [event::Status::Captured, event::Status::Ignored] {
+                for binding in ["0", "plus", "minus"] {
+                    state.camera = camera;
+                    let _ = navigation::handle_key(
+                        &mut state,
+                        navigation::NavigationKey::Other,
+                        Some(Shortcut::parse(binding).unwrap()),
+                        status,
+                    );
+                    assert_eq!(state.camera, camera);
+                }
+            }
+        }
+        state.focused_terminal = None;
+        state.focused_portal = None;
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Other,
+            Some(Shortcut::parse("0").unwrap()),
+            event::Status::Ignored,
+        );
+        assert_eq!(state.camera, Camera::default());
     }
 
     #[test]
@@ -6652,52 +6662,57 @@ mod tests {
     }
 
     #[test]
-    fn changing_one_application_preference_does_not_freeze_system_defaults() {
+    fn theme_selection_persists_without_freezing_system_defaults() {
         let temp = TempDir::new().unwrap();
         let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
         let mut state = test_state(workspaces, BTreeMap::new());
 
-        let _ = update(&mut state, Message::CycleLocale);
-        assert_eq!(state.localizer.locale(), Locale::PtBr);
+        let previous_revision = state.canvas_revision;
+        let _ = update(&mut state, Message::ThemeSelected(ThemePreference::Dark));
+        assert_ne!(state.canvas_revision, previous_revision);
         assert_eq!(
             state.workspaces.as_ref().unwrap().preferences().unwrap(),
-            vec![(LOCALE_KEY.to_owned(), "pt-BR".to_owned())]
+            vec![(THEME_KEY.to_owned(), "dark".to_owned())]
         );
 
-        let previous_contrast = state.presentation.high_contrast();
-        let previous_canvas_revision = state.canvas_revision;
-        let _ = update(&mut state, Message::ToggleHighContrast);
-        assert_eq!(state.presentation.high_contrast(), !previous_contrast);
-        assert_ne!(state.canvas_revision, previous_canvas_revision);
-        assert_eq!(
-            state.workspaces.as_ref().unwrap().preferences().unwrap(),
-            vec![
-                (
-                    HIGH_CONTRAST_KEY.to_owned(),
-                    (!previous_contrast).to_string()
-                ),
-                (LOCALE_KEY.to_owned(), "pt-BR".to_owned()),
-            ]
+        let _ = update(&mut state, Message::SystemThemeChanged(theme::Mode::Light));
+        assert!(
+            appearance::theme(state.presentation, state.system_theme)
+                .extended_palette()
+                .is_dark
         );
+        let _ = update(&mut state, Message::ThemeSelected(ThemePreference::System));
+        assert!(
+            !appearance::theme(state.presentation, state.system_theme)
+                .extended_palette()
+                .is_dark
+        );
+        let previous_revision = state.canvas_revision;
+        let _ = update(&mut state, Message::SystemThemeChanged(theme::Mode::Dark));
+        assert_ne!(state.canvas_revision, previous_revision);
+        assert!(
+            appearance::theme(state.presentation, state.system_theme)
+                .extended_palette()
+                .is_dark
+        );
+        state.presentation.set_theme(ThemePreference::Light);
+        load_application_preferences(&mut state);
+        assert_eq!(state.presentation.theme(), ThemePreference::System);
     }
 
     #[test]
-    fn interface_scale_and_workspace_controls_preserve_canvas_geometry() {
+    fn theme_and_workspace_controls_preserve_canvas_geometry() {
         let temp = TempDir::new().unwrap();
         let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
         let mut state = test_state(workspaces, BTreeMap::new());
-        state
-            .presentation
-            .apply_stored([(TEXT_SCALE_KEY.to_owned(), "1".to_owned())]);
         let initial_viewport = canvas_viewport(&state);
         let _ = update(&mut state, Message::OpenControls(Controls::Workspace));
         assert_eq!(canvas_viewport(&state), initial_viewport);
 
-        for _ in 0..4 {
-            let _ = update(&mut state, Message::CycleTextScale);
+        for theme in ThemePreference::ALL {
+            let _ = update(&mut state, Message::ThemeSelected(theme));
+            assert_eq!(canvas_viewport(&state), initial_viewport);
         }
-        assert_eq!(state.presentation.text_scale_percent(), 200);
-        assert!((state.window_size.width - 640.0).abs() < 0.01);
         let with_controls = canvas_viewport(&state);
         assert!(with_controls.0 > 400.0);
         let _ = update(&mut state, Message::CloseControls);
@@ -6734,8 +6749,10 @@ mod tests {
             transcript_ticks: 0,
             sidebar_open: true,
             window_size: DEFAULT_WINDOW_SIZE,
+            maximised_node: None,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
+            system_theme: theme::Mode::None,
             controls: None,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
@@ -6797,6 +6814,121 @@ mod tests {
             portable_import: None,
             notice: None,
         }
+    }
+
+    /// Maximising resizes the node itself, so a terminal gains rows and columns
+    /// instead of being magnified.
+    #[test]
+    fn maximising_fills_the_canvas_and_restores_on_a_second_press() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let (mut state, _, _) = state_with_chat(&temp, &database);
+        state.canvas_selection = vec![NodeId::new(1)];
+
+        let original = current_canvas(&state)
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == NodeId::new(1))
+            .map(|node| (node.position(), node.size()))
+            .unwrap();
+
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+
+        let (viewport_width, viewport_height) = canvas_viewport(&state);
+        let maximised = current_canvas(&state)
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == NodeId::new(1))
+            .map(|node| (node.position(), node.size()))
+            .unwrap();
+        assert!(maximised.1.width() > original.1.width());
+        assert!(f64::from(maximised.1.width()) < viewport_width);
+        assert!(f64::from(maximised.1.height()) < viewport_height);
+        assert_eq!(state.focused_terminal, Some(NodeId::new(1)));
+
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+
+        let restored = current_canvas(&state)
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == NodeId::new(1))
+            .map(|node| (node.position(), node.size()))
+            .unwrap();
+        assert_eq!(restored.1.width(), original.1.width());
+        assert_eq!(restored.1.height(), original.1.height());
+        assert_eq!(restored.0.x(), original.0.x());
+        assert_eq!(restored.0.y(), original.0.y());
+        assert!(state.maximised_node.is_none());
+    }
+
+    /// The workspace rail reduces the space available to a maximised node.
+    #[test]
+    fn maximising_accounts_for_the_panels_beside_the_canvas() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let (mut state, _, _) = state_with_chat(&temp, &database);
+        state.canvas_selection = vec![NodeId::new(1)];
+
+        state.sidebar_open = false;
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+        let unobstructed = current_canvas(&state)
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == NodeId::new(1))
+            .map(|node| node.size().width())
+            .unwrap();
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+
+        state.sidebar_open = true;
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+        let crowded = current_canvas(&state)
+            .unwrap()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == NodeId::new(1))
+            .map(|node| node.size().width())
+            .unwrap();
+
+        assert!(
+            crowded < unobstructed,
+            "panels should leave the node less room"
+        );
+    }
+
+    #[test]
+    fn maximising_nothing_leaves_the_canvas_alone() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let (mut state, _, _) = state_with_chat(&temp, &database);
+        state.canvas_selection.clear();
+
+        let before = current_canvas(&state).unwrap();
+        let _ = update(
+            &mut state,
+            Message::ExecuteCommand(CommandId::FocusSelection),
+        );
+
+        assert_eq!(current_canvas(&state).unwrap(), before);
+        assert!(state.maximised_node.is_none());
     }
 
     fn state_with_chat(temp: &TempDir, database: &Path) -> (OpenPodium, WorkspaceId, ChatThreadId) {

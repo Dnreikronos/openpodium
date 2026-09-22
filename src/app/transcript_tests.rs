@@ -11,7 +11,10 @@ fn transcript_flush_retries_unchanged_output_after_a_storage_failure() {
         node_id: NodeId::new(1),
     };
     let mut session = Session::starting(terminal::GridSize::for_node(360.0, 260.0), 1);
-    session.handle_event(ProcessEvent::Output(b"Retain this output".to_vec()));
+    session.handle_event(
+        ProcessEvent::Output(b"Retain this output".to_vec()),
+        Default::default(),
+    );
     let mut state = tests::test_state(manager, BTreeMap::from([(key, session)]));
     let connection = rusqlite::Connection::open(&database).unwrap();
     connection.execute_batch("CREATE TRIGGER reject_transcript BEFORE INSERT ON terminal_transcripts BEGIN SELECT RAISE(FAIL, 'test storage failure'); END;").unwrap();

@@ -75,10 +75,34 @@ impl Dimensions for GridSize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultColor {
+    Foreground,
+    Background,
+    DimForeground,
+    DimBackground,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CellColor {
     pub(crate) red: u8,
     pub(crate) green: u8,
     pub(crate) blue: u8,
+    pub(crate) default_role: Option<DefaultColor>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DefaultColors {
+    pub(crate) foreground: Rgb,
+    pub(crate) background: Rgb,
+}
+
+impl Default for DefaultColors {
+    fn default() -> Self {
+        Self {
+            foreground: resolve_named(NamedColor::Foreground),
+            background: resolve_named(NamedColor::Background),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +145,7 @@ pub(crate) struct InputMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct View {
     pub(crate) size: GridSize,
-    pub(crate) cells: Vec<CellView>,
+    pub(crate) cells: Arc<[CellView]>,
     pub(crate) cursor: Option<CursorView>,
     pub(crate) mode: InputMode,
     pub(crate) title: Option<String>,
@@ -132,7 +156,7 @@ impl View {
     pub(crate) fn offline(size: GridSize) -> Self {
         Self {
             size,
-            cells: Vec::new(),
+            cells: Arc::from([]),
             cursor: None,
             mode: InputMode::default(),
             title: None,
@@ -193,6 +217,10 @@ impl Model {
     }
 
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<Update> {
+        self.feed_with_colors(bytes, DefaultColors::default())
+    }
+
+    pub(crate) fn feed_with_colors(&mut self, bytes: &[u8], colors: DefaultColors) -> Vec<Update> {
         self.parser.advance(&mut self.term, bytes);
         let mut updates = Vec::new();
         for event in self.events.drain() {
@@ -208,7 +236,8 @@ impl Model {
                     updates.push(Update::TitleChanged(None));
                 }
                 Event::ColorRequest(index, formatter) => {
-                    let color = resolve_color_request(index);
+                    let color = self.term.colors()[index]
+                        .unwrap_or_else(|| resolve_color_request(index, colors));
                     updates.push(Update::PtyWrite(formatter(color).into_bytes()));
                 }
                 Event::TextAreaSizeRequest(formatter) => {
@@ -330,7 +359,7 @@ impl Model {
         }
         View {
             size: self.size,
-            cells,
+            cells: cells.into(),
             cursor,
             mode,
             title: self.title.clone(),
@@ -365,6 +394,14 @@ impl CellColor {
             red: ((u16::from(self.red) * 2) / 3) as u8,
             green: ((u16::from(self.green) * 2) / 3) as u8,
             blue: ((u16::from(self.blue) * 2) / 3) as u8,
+            default_role: self.default_role.map(|role| match role {
+                DefaultColor::Foreground | DefaultColor::DimForeground => {
+                    DefaultColor::DimForeground
+                }
+                DefaultColor::Background | DefaultColor::DimBackground => {
+                    DefaultColor::DimBackground
+                }
+            }),
         }
     }
 }
@@ -381,6 +418,16 @@ fn resolve_color(color: Color, overrides: &alacritty_terminal::term::color::Colo
         red: rgb.r,
         green: rgb.g,
         blue: rgb.b,
+        default_role: match color {
+            Color::Named(name) if overrides[name].is_none() => match name {
+                NamedColor::Foreground
+                | NamedColor::BrightForeground
+                | NamedColor::DimForeground => Some(DefaultColor::Foreground),
+                NamedColor::Background => Some(DefaultColor::Background),
+                _ => None,
+            },
+            _ => None,
+        },
     }
 }
 
@@ -532,12 +579,11 @@ fn resolve_indexed(index: u8) -> Rgb {
     }
 }
 
-fn resolve_color_request(index: usize) -> Rgb {
+fn resolve_color_request(index: usize, colors: DefaultColors) -> Rgb {
     match index {
         0..=255 => resolve_indexed(index as u8),
-        256 => resolve_named(NamedColor::Foreground),
-        257 => resolve_named(NamedColor::Background),
-        258 => resolve_named(NamedColor::Cursor),
+        256 | 258 | 267 => colors.foreground,
+        257 => colors.background,
         259 => resolve_named(NamedColor::DimBlack),
         260 => resolve_named(NamedColor::DimRed),
         261 => resolve_named(NamedColor::DimGreen),
@@ -546,8 +592,7 @@ fn resolve_color_request(index: usize) -> Rgb {
         264 => resolve_named(NamedColor::DimMagenta),
         265 => resolve_named(NamedColor::DimCyan),
         266 => resolve_named(NamedColor::DimWhite),
-        267 => resolve_named(NamedColor::BrightForeground),
-        _ => resolve_named(NamedColor::Background),
+        _ => colors.background,
     }
 }
 
@@ -557,6 +602,13 @@ pub(crate) fn encode_key(
     modifiers: Modifiers,
     mode: InputMode,
 ) -> Option<Vec<u8>> {
+    if matches!(key, Key::Named(Named::Enter)) && modifiers == Modifiers::SHIFT {
+        return Some(if mode.bracketed_paste {
+            encode_paste("\n", mode)
+        } else {
+            b"\x1b[13;2u".to_vec()
+        });
+    }
     let mut bytes = if modifiers.control() {
         control_bytes(key).or_else(|| named_key_bytes(key, modifiers, mode))?
     } else if let Some(bytes) = named_key_bytes(key, modifiers, mode) {
@@ -764,6 +816,44 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_inserts_a_newline_without_submitting() {
+        let mut model = model();
+        let key = Key::Named(Named::Enter);
+        let encode =
+            |model: &Model| encode_key(&key, Some("\r"), Modifiers::SHIFT, model.input_mode());
+
+        assert_eq!(encode(&model), Some(b"\x1b[13;2u".to_vec()));
+        model.feed(b"\x1b[?2004h");
+        assert_eq!(encode(&model), Some(b"\x1b[200~\n\x1b[201~".to_vec()));
+        model.feed(b"\x1b[?2004l");
+        assert_eq!(encode(&model), Some(b"\x1b[13;2u".to_vec()));
+    }
+
+    #[test]
+    fn newline_shortcut_preserves_other_enter_combinations() {
+        for bracketed_paste in [false, true] {
+            let mode = InputMode {
+                bracketed_paste,
+                ..InputMode::default()
+            };
+            for (modifiers, expected) in [
+                (Modifiers::empty(), b"\r".as_slice()),
+                (Modifiers::CTRL, b"\r"),
+                (Modifiers::ALT, b"\x1b\r"),
+                (Modifiers::CTRL | Modifiers::SHIFT, b"\r"),
+                (Modifiers::ALT | Modifiers::SHIFT, b"\x1b\r"),
+                (Modifiers::LOGO | Modifiers::SHIFT, b"\r"),
+            ] {
+                assert_eq!(
+                    encode_key(&Key::Named(Named::Enter), Some("\r"), modifiers, mode),
+                    Some(expected.to_vec()),
+                    "modifiers: {modifiers:?}, bracketed paste: {bracketed_paste}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn accessibility_preserves_dead_key_ime_and_right_to_left_commits() {
         let mode = InputMode::default();
         for committed in ["é", "かな", "مَرْحَبًا", "👩🏽‍💻"] {
@@ -783,8 +873,8 @@ mod tests {
         let rendered = model
             .view(Status::Running)
             .cells
-            .into_iter()
-            .map(|cell| cell.text)
+            .iter()
+            .map(|cell| cell.text.as_str())
             .collect::<String>();
         assert!(rendered.contains("עברית"));
         assert!(rendered.contains("العربية"));
@@ -801,7 +891,8 @@ mod tests {
             CellColor {
                 red: 255,
                 green: 255,
-                blue: 255
+                blue: 255,
+                default_role: Some(DefaultColor::Background),
             }
         );
         assert!(
@@ -813,7 +904,8 @@ mod tests {
             CellColor {
                 red: 12,
                 green: 34,
-                blue: 56
+                blue: 56,
+                default_role: None,
             }
         );
         assert_eq!(
@@ -821,7 +913,8 @@ mod tests {
             CellColor {
                 red: 78,
                 green: 90,
-                blue: 123
+                blue: 123,
+                default_role: None,
             }
         );
         let inverse = view.cells.iter().find(|cell| cell.text == "C").unwrap();
@@ -843,6 +936,53 @@ mod tests {
                 rows: 13
             }
         );
+    }
+
+    #[test]
+    fn color_queries_preserve_overrides_and_reset_to_current_defaults() {
+        let mut model = model();
+        let colors = DefaultColors {
+            foreground: Rgb {
+                r: 229,
+                g: 232,
+                b: 237,
+            },
+            background: Rgb {
+                r: 24,
+                g: 26,
+                b: 30,
+            },
+        };
+        let replies = |updates: Vec<Update>| {
+            updates
+                .into_iter()
+                .filter_map(|update| match update {
+                    Update::PtyWrite(bytes) => Some(String::from_utf8(bytes).unwrap()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        };
+        model.feed_with_colors(
+            b"\x1b]10;#123456\x07\x1b]11;#654321\x07\x1b]12;#abcdef\x07",
+            colors,
+        );
+        let overridden =
+            replies(model.feed_with_colors(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07", colors));
+        for expected in [
+            "rgb:1212/3434/5656",
+            "rgb:6565/4343/2121",
+            "rgb:abab/cdcd/efef",
+        ] {
+            assert!(overridden.contains(expected), "{overridden:?}");
+        }
+        model.feed_with_colors(b"\x1b]110\x07\x1b]111\x07\x1b]112\x07", colors);
+        let reset =
+            replies(model.feed_with_colors(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07", colors));
+        assert!(reset.contains("rgb:1818/1a1a/1e1e"), "{reset:?}");
+        assert_eq!(reset.matches("rgb:e5e5/e8e8/eded").count(), 2);
+        let indexed = replies(model.feed_with_colors(b"\x1b]4;1;?\x07", colors));
+        assert_eq!(indexed, replies(model.feed(b"\x1b]4;1;?\x07")));
     }
 
     proptest! {
