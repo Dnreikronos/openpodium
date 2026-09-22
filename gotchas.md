@@ -1,5 +1,17 @@
 # Gotchas
 
+- Test performance against the affected workspace, including its Git worktrees and collisions. Path canonicalization inside a render-time collision scan can saturate the main thread even when terminal rendering is fast; build checkout indexes in the background and keep UI lookups filesystem-free.
+
+- Responsiveness fixes need a populated-terminal profile, not just passing input-routing tests. Reuse unchanged terminal cells, avoid per-cell work for uniform surfaces, and validate the packaged release build before claiming the user's running app is faster.
+
+- Never reserve bare printable canvas shortcuts inside embedded content. `0`, `+`, and `-` belong to the focused terminal/editor; both canvas interception and the global navigation listener must respect that boundary.
+
+- Restored terminal output is not a live session. Keep close/quit semantics explicit and give stopped cards discoverable restart/resume controls; typing must never silently disappear. Agent resume must use a picker rather than guessing the last conversation in a shared directory.
+
+- A dark terminal canvas is not sufficient: OSC foreground/background/cursor replies must match the rendered palette. Verify a live full-screen program such as Codex, whose input surface may be derived from queried colors, not just a shell prompt or restored snapshot.
+
+- Theme verification must include restored/offline terminal cards, not just fresh shells. Older snapshots flattened default colors into RGB; migrate those cached defaults and preserve semantic color roles in new snapshots so the whole terminal follows appearance changes.
+
 - Scroll routing tests are not enough: verify visible history before and after a restart. A restored screen-only cache has no older lines to scroll, and offline terminals must not forward wheel events to a dead process.
 
 - Trackpad scrolling over agent windows must go to the terminal without a modifier. Capture fractional and horizontal-only deltas too, accumulate small vertical movements, and test event routing so they never fall through to board panning.
