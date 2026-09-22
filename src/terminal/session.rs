@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use openpodium::domain::{AgentProgram, CommandPreset, Role};
 use openpodium::runtime::{
@@ -24,6 +24,7 @@ pub(crate) struct Session {
     stream: Option<ProcessStream>,
     generation: u64,
     transcript_dirty: bool,
+    view_cache: OnceLock<View>,
 }
 
 impl Session {
@@ -35,6 +36,7 @@ impl Session {
             stream: None,
             generation,
             transcript_dirty: false,
+            view_cache: OnceLock::new(),
         }
     }
 
@@ -49,6 +51,7 @@ impl Session {
             stream: None,
             generation,
             transcript_dirty: false,
+            view_cache: OnceLock::new(),
         }
     }
 
@@ -68,6 +71,7 @@ impl Session {
     }
 
     pub(crate) fn prepare_restart(&mut self, size: GridSize, generation: u64) {
+        self.view_cache.take();
         self.model.resize(size);
         self.generation = generation;
         self.status = Status::Starting;
@@ -79,6 +83,7 @@ impl Session {
             .map_err(|_| "the process stream was busy before event polling started")?
             .controller();
         self.model = Model::new(self.model.size);
+        self.view_cache.take();
         self.controller = Some(controller);
         self.stream = Some(stream);
         self.status = Status::Running;
@@ -86,6 +91,7 @@ impl Session {
     }
 
     pub(crate) fn fail(&mut self, error: impl ToString) {
+        self.view_cache.take();
         self.controller = None;
         self.stream = None;
         self.status = Status::Failed(error.to_string());
@@ -100,9 +106,13 @@ impl Session {
     }
 
     pub(crate) fn view(&self) -> View {
-        let mut view = self.model.view(self.status.clone());
-        view.mode.mouse_reporting &= matches!(self.status, Status::Running);
-        view
+        self.view_cache
+            .get_or_init(|| {
+                let mut view = self.model.view(self.status.clone());
+                view.mode.mouse_reporting &= matches!(self.status, Status::Running);
+                view
+            })
+            .clone()
     }
 
     pub(crate) fn input_mode(&self) -> InputMode {
@@ -122,6 +132,9 @@ impl Session {
     }
 
     pub(crate) fn resize(&mut self, size: GridSize) -> Result<(), String> {
+        if self.model.size != size {
+            self.view_cache.take();
+        }
         self.transcript_dirty |= self.model.size != size;
         self.model.resize(size);
         let Some(controller) = &self.controller else {
@@ -136,18 +149,22 @@ impl Session {
     }
 
     pub(crate) fn scroll(&mut self, lines: i32) {
+        self.view_cache.take();
         self.model.scroll(lines);
     }
 
     pub(crate) fn begin_selection(&mut self, row: usize, column: usize, right_side: bool) {
+        self.view_cache.take();
         self.model.begin_selection(row, column, right_side);
     }
 
     pub(crate) fn update_selection(&mut self, row: usize, column: usize, right_side: bool) {
+        self.view_cache.take();
         self.model.update_selection(row, column, right_side);
     }
 
     pub(crate) fn clear_selection(&mut self) {
+        self.view_cache.take();
         self.model.clear_selection();
     }
 
@@ -160,6 +177,7 @@ impl Session {
         event: ProcessEvent,
         colors: DefaultColors,
     ) -> Vec<Action> {
+        self.view_cache.take();
         match event {
             ProcessEvent::Output(bytes) => {
                 self.transcript_dirty = true;
@@ -201,6 +219,7 @@ impl Session {
     }
 
     pub(crate) fn stop(&mut self) -> Result<(), String> {
+        self.view_cache.take();
         if let Some(controller) = self.controller.take() {
             controller.cancel().map_err(|error| error.to_string())?;
         }
@@ -243,6 +262,57 @@ mod tests {
 
     fn size() -> GridSize {
         GridSize::for_node(400.0, 300.0)
+    }
+
+    #[test]
+    fn unchanged_views_share_cells_without_rebuilding_the_grid() {
+        let mut session = Session::starting(size(), 1);
+        session.handle_event(ProcessEvent::Output(b"hello".to_vec()), Default::default());
+        let before = session.view();
+        for _ in 0..100 {
+            assert!(std::sync::Arc::ptr_eq(&before.cells, &session.view().cells));
+        }
+        session.resize(size()).unwrap();
+        session.take_transcript();
+        assert!(std::sync::Arc::ptr_eq(&before.cells, &session.view().cells));
+    }
+
+    #[test]
+    fn cached_views_follow_every_screen_and_status_change() {
+        fn verify(session: &Session) {
+            let mut expected = session.model.view(session.status.clone());
+            expected.mode.mouse_reporting &= matches!(session.status, Status::Running);
+            assert_eq!(session.view(), expected);
+        }
+
+        let mut session = Session::starting(size(), 1);
+        verify(&session);
+        session.handle_event(
+            ProcessEvent::Output(b"first\r\nsecond\r\n".repeat(40)),
+            Default::default(),
+        );
+        verify(&session);
+        session.scroll(5);
+        verify(&session);
+        session.begin_selection(0, 0, false);
+        verify(&session);
+        session.update_selection(1, 3, true);
+        verify(&session);
+        session.clear_selection();
+        verify(&session);
+        session
+            .resize(GridSize {
+                columns: 30,
+                rows: 8,
+            })
+            .unwrap();
+        verify(&session);
+        session.stop().unwrap();
+        verify(&session);
+        session.prepare_restart(size(), 2);
+        verify(&session);
+        session.fail("test failure");
+        verify(&session);
     }
 
     #[test]

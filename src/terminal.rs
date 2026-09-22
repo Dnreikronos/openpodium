@@ -145,7 +145,7 @@ pub(crate) struct InputMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct View {
     pub(crate) size: GridSize,
-    pub(crate) cells: Vec<CellView>,
+    pub(crate) cells: Arc<[CellView]>,
     pub(crate) cursor: Option<CursorView>,
     pub(crate) mode: InputMode,
     pub(crate) title: Option<String>,
@@ -156,7 +156,7 @@ impl View {
     pub(crate) fn offline(size: GridSize) -> Self {
         Self {
             size,
-            cells: Vec::new(),
+            cells: Arc::from([]),
             cursor: None,
             mode: InputMode::default(),
             title: None,
@@ -359,7 +359,7 @@ impl Model {
         }
         View {
             size: self.size,
-            cells,
+            cells: cells.into(),
             cursor,
             mode,
             title: self.title.clone(),
@@ -873,8 +873,8 @@ mod tests {
         let rendered = model
             .view(Status::Running)
             .cells
-            .into_iter()
-            .map(|cell| cell.text)
+            .iter()
+            .map(|cell| cell.text.as_str())
             .collect::<String>();
         assert!(rendered.contains("עברית"));
         assert!(rendered.contains("العربية"));
