@@ -5123,6 +5123,7 @@ fn persist_canvas(
                 .expect("workspace was just updated")
                 .all_canvas_layout();
             synchronize_terminals(state, &runtime_layout);
+            state.sync_ipc_directory();
             portals::sync_connections(state);
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
             Ok(())
@@ -5245,7 +5246,7 @@ fn next_agent_id(workspace: &Workspace) -> Option<AgentId> {
     let mut value = 1_u64;
     loop {
         let id = AgentId::new(value);
-        if workspace.agent(id).is_none() {
+        if workspace.recorded_agent(id).is_none() {
             return Some(id);
         }
         value = value.checked_add(1)?;
@@ -5450,6 +5451,57 @@ mod tests {
                 .environment()
                 .iter()
                 .all(|(name, _)| name != TOKEN_ENV && name != ENDPOINT_ENV && name != CLI_ENV)
+        );
+    }
+
+    #[test]
+    fn deleting_agent_window_updates_registry_ipc_and_undo_without_reusing_ids() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let (mut state, workspace_id, thread_id) = state_with_chat(&temp, &database);
+        state.ipc = Some(IpcService::start(temp.path()).unwrap());
+        state.sync_ipc_directory();
+        let connected = |state: &OpenPodium| {
+            state
+                .ipc
+                .as_ref()
+                .unwrap()
+                .connection_info(workspace_id.get(), 1)
+                .is_some()
+        };
+        assert!(connected(&state));
+        apply_canvas_action(&mut state, CanvasAction::Remove);
+        let workspace = state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .workspace(workspace_id)
+            .unwrap();
+        assert_eq!(workspace.agent_count(), 0);
+        assert_eq!(next_agent_id(workspace), Some(AgentId::new(2)));
+        assert!(workspace.chat_thread(thread_id).is_some());
+        assert!(!connected(&state));
+        undo_canvas(&mut state);
+        assert!(connected(&state));
+        assert_eq!(
+            state
+                .workspaces
+                .as_ref()
+                .unwrap()
+                .workspace(workspace_id)
+                .unwrap()
+                .agent_count(),
+            1
+        );
+        redo_canvas(&mut state);
+        assert!(!connected(&state));
+        assert_eq!(
+            WorkspaceManager::open(&database)
+                .unwrap()
+                .workspace(workspace_id)
+                .unwrap()
+                .agent_count(),
+            0
         );
     }
 

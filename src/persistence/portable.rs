@@ -443,7 +443,10 @@ pub fn export_workspace_archive(workspace: &Workspace) -> Result<String, Portabl
     let layout = without_handoff_nodes(&workspace.all_canvas_layout(), &handoffs);
     let references = ReferencedEntities {
         roles: workspace.roles().map(|role| role.id()).collect(),
-        agents: workspace.agents().map(|agent| agent.id()).collect(),
+        agents: workspace
+            .recorded_agents()
+            .map(|agent| agent.id())
+            .collect(),
         tasks: workspace.tasks().map(|task| task.id()).collect(),
         handoffs,
     };
@@ -713,7 +716,7 @@ fn referenced_entities(
             NodeTarget::Agent(id) => {
                 if references.agents.insert(id) {
                     let agent = workspace
-                        .agent(id)
+                        .recorded_agent(id)
                         .ok_or_else(|| PortableError::MissingReference(format!("agent {id}")))?;
                     if let Some(role_id) = agent.role_id() {
                         workspace.role(role_id).ok_or_else(|| {
@@ -806,7 +809,7 @@ fn build_body(
             .map(role_record)
             .collect(),
         agents: workspace
-            .agents()
+            .recorded_agents()
             .filter(|agent| references.agents.contains(&agent.id()))
             .map(agent_record)
             .collect(),
@@ -1030,7 +1033,7 @@ fn build_commands(
 ) -> Result<(Vec<DomainCommand>, BTreeMap<String, AgentId>), PortableError> {
     let mut commands = Vec::new();
     let mut role_ids = IdAllocator::new(workspace.roles().map(|role| role.id().get()));
-    let mut agent_ids = IdAllocator::new(workspace.agents().map(|agent| agent.id().get()));
+    let mut agent_ids = IdAllocator::new(workspace.recorded_agents().map(|agent| agent.id().get()));
     let mut task_ids = IdAllocator::new(workspace.tasks().map(|task| task.id().get()));
     let mut handoff_ids = IdAllocator::new(workspace.handoffs().map(|handoff| handoff.id().get()));
     let mut node_ids = IdAllocator::new(

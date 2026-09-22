@@ -26,7 +26,7 @@ use crate::domain::{
 use super::PersistenceError;
 
 pub(crate) const EVENT_FORMAT_VERSION: u32 = 12;
-pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 11;
+pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 12;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
     serde_json::to_vec(&StoredEvent::from(event)).map_err(|source| {
@@ -947,6 +947,8 @@ struct StoredWorkspace {
     roles: Vec<RoleV1>,
     agents: Vec<AgentV1>,
     #[serde(default)]
+    archived_agents: Vec<u64>,
+    #[serde(default)]
     chat_threads: Vec<ChatThreadV1>,
     #[serde(default)]
     chat_attachments: Vec<ChatAttachmentV1>,
@@ -990,7 +992,11 @@ impl From<&Workspace> for StoredWorkspace {
                 .map(CommandPresetV1::from)
                 .collect(),
             roles: workspace.roles().map(RoleV1::from).collect(),
-            agents: workspace.agents().map(AgentV1::from).collect(),
+            agents: workspace.recorded_agents().map(AgentV1::from).collect(),
+            archived_agents: workspace
+                .archived_agents()
+                .map(|agent| agent.id().get())
+                .collect(),
             chat_threads: workspace.chat_threads().map(ChatThreadV1::from).collect(),
             chat_attachments: workspace
                 .chat_attachments()
@@ -1009,6 +1015,9 @@ impl From<&Workspace> for StoredWorkspace {
 
 impl StoredWorkspace {
     fn into_domain(self, format_version: u32) -> Result<Workspace, String> {
+        if format_version < 12 && !self.archived_agents.is_empty() {
+            return Err("archived agent identities require snapshot format version 12".to_owned());
+        }
         if format_version == 1
             && (self.icon.is_some()
                 || self.working_directory.is_some()
@@ -1255,6 +1264,16 @@ impl StoredWorkspace {
                 },
             )?;
         }
+        for id in &self.archived_agents {
+            if workspace.agent(AgentId::new(*id)).is_none()
+                || workspace
+                    .nodes()
+                    .any(|node| node.reference() == Some(NodeTarget::Agent(AgentId::new(*id))))
+            {
+                return Err("archived agent must exist and have no canvas window".to_owned());
+            }
+        }
+        workspace.archive_unplaced_agents(self.archived_agents.into_iter().map(AgentId::new));
         Ok(workspace)
     }
 }

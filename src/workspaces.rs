@@ -1,12 +1,13 @@
 //! Local workspace creation, settings, switching, and restoration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::domain::{
-    Content, DomainCommand, Name, NodeId, TimelineEvent, TimelineEventId, Timestamp,
-    ValidationError, Workspace, WorkspaceDirectory, WorkspaceIcon, WorkspaceId, WorkspaceSettings,
+    Content, DomainCommand, DomainEvent, Name, NodeId, NodeTarget, TimelineEvent, TimelineEventId,
+    Timestamp, ValidationError, Workspace, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
+    WorkspaceSettings,
 };
 use crate::persistence::{
     ImportPreview, Journal, PointV1, PortableError, PortableImport, decode_template,
@@ -34,11 +35,50 @@ impl WorkspaceManager {
         let mut workspaces = BTreeMap::new();
 
         for workspace_id in &recent {
-            let workspace = journal.recover(*workspace_id)?.ok_or(
+            let mut workspace = journal.recover(*workspace_id)?.ok_or(
                 WorkspaceError::MissingPersistedWorkspace {
                     workspace_id: *workspace_id,
                 },
             )?;
+            let placed: BTreeSet<_> = workspace
+                .nodes()
+                .filter_map(|node| match node.reference() {
+                    Some(NodeTarget::Agent(id)) => Some(id),
+                    _ => None,
+                })
+                .collect();
+            if workspace
+                .agents()
+                .any(|agent| !placed.contains(&agent.id()))
+            {
+                // Old snapshots kept agents after removing their last card. Only
+                // migrate identities with evidence of a previous canvas window.
+                // Unreadable old events must not invalidate a recovered snapshot.
+                if let Ok(events) = journal.timeline(*workspace_id) {
+                    let mut previously_placed = BTreeSet::new();
+                    for event in events {
+                        match event.event() {
+                            DomainEvent::AgentNodeAdded { agent, .. } => {
+                                previously_placed.insert(agent.id());
+                            }
+                            DomainEvent::NodeAdded(node) => {
+                                if let Some(NodeTarget::Agent(id)) = node.reference() {
+                                    previously_placed.insert(id);
+                                }
+                            }
+                            DomainEvent::CanvasReplaced { before, after } => {
+                                for node in before.nodes().iter().chain(after.nodes()) {
+                                    if let Some(NodeTarget::Agent(id)) = node.reference() {
+                                        previously_placed.insert(id);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    workspace.archive_unplaced_agents(previously_placed);
+                }
+            }
             workspaces.insert(*workspace_id, workspace);
         }
 
