@@ -449,15 +449,12 @@ fn visible_regions(rect: Rectangle, within: Rectangle, occluders: &[Rectangle]) 
         if regions.is_empty() {
             break;
         }
-        let split = regions
+        let mut split = regions
             .iter()
             .flat_map(|region| subtract(*region, *occluder))
             .collect::<Vec<_>>();
-        // A pathological stack could fragment without bound. Past this point
-        // the clipping costs more than the bleeding it prevents.
-        if split.len() > MAX_VISIBLE_REGIONS {
-            return vec![rect];
-        }
+        // Bound the clipping cost without exposing text under higher cards.
+        split.truncate(MAX_VISIBLE_REGIONS);
         regions = split;
     }
     regions
@@ -1272,9 +1269,8 @@ mod tests {
         assert!(visible_regions(rect(-400.0, 0.0, 100.0, 100.0), canvas, &[]).is_empty());
     }
 
-    /// Fragmenting without bound would cost more than the bleeding it avoids.
     #[test]
-    fn a_heavily_fragmented_node_falls_back_to_one_region() {
+    fn fragmented_regions_remain_occluded_after_the_limit_is_reached() {
         let node = rect(0.0, 0.0, 100.0, 100.0);
         let occluders = [
             rect(20.0, 20.0, 10.0, 10.0),
@@ -1284,8 +1280,16 @@ mod tests {
         ];
 
         let regions = visible_regions(node, canvas(), &occluders);
-        assert!(regions.len() <= MAX_VISIBLE_REGIONS.max(1));
-        assert_eq!(regions, vec![node]);
+        assert!(!regions.is_empty());
+        assert!(regions.len() <= MAX_VISIBLE_REGIONS);
+        assert!(regions.iter().all(|region| occluders.iter().all(|cover| {
+            region
+                .intersection(cover)
+                .is_none_or(|overlap| overlap.width * overlap.height == 0.0)
+        })));
+        let mut fully_covered = occluders.to_vec();
+        fully_covered.push(node);
+        assert!(visible_regions(node, canvas(), &fully_covered).is_empty());
     }
 }
 #[test]
