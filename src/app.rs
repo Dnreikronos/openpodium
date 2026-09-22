@@ -2224,12 +2224,18 @@ impl OpenPodium {
         };
         let captured_at = now();
         for (key, payload) in pending {
-            let _ = workspaces.store_terminal_transcript(
-                key.workspace_id,
-                key.node_id.get(),
-                captured_at,
-                &payload,
-            );
+            if workspaces
+                .store_terminal_transcript(
+                    key.workspace_id,
+                    key.node_id.get(),
+                    captured_at,
+                    &payload,
+                )
+                .is_ok()
+                && let Some(session) = self.terminals.get_mut(&key)
+            {
+                session.mark_transcript_persisted();
+            }
         }
     }
 

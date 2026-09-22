@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn transcript_flush_retries_unchanged_output_after_a_storage_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("state.sqlite");
+    let mut manager = WorkspaceManager::open(&database).unwrap();
+    let workspace_id = manager.create_workspace(temp.path(), now()).unwrap();
+    let key = TerminalKey {
+        workspace_id,
+        node_id: NodeId::new(1),
+    };
+    let mut session = Session::starting(terminal::GridSize::for_node(360.0, 260.0), 1);
+    session.handle_event(ProcessEvent::Output(b"Retain this output".to_vec()));
+    let mut state = tests::test_state(manager, BTreeMap::from([(key, session)]));
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection.execute_batch("CREATE TRIGGER reject_transcript BEFORE INSERT ON terminal_transcripts BEGIN SELECT RAISE(FAIL, 'test storage failure'); END;").unwrap();
+    state.flush_terminal_transcripts();
+    assert!(state.terminals[&key].take_transcript().is_some());
+    assert!(
+        state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .terminal_transcripts(workspace_id)
+            .unwrap()
+            .is_empty()
+    );
+    connection
+        .execute_batch("DROP TRIGGER reject_transcript;")
+        .unwrap();
+    state.flush_terminal_transcripts();
+    assert!(state.terminals[&key].take_transcript().is_none());
+    assert_eq!(
+        state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .terminal_transcripts(workspace_id)
+            .unwrap(),
+        vec![(1, b"Retain this output".to_vec())]
+    );
+}
+
+#[test]
 fn transcript_restore_keeps_windows_on_inactive_floors() {
     use openpodium::domain::{Floor, FloorLifecycle};
     let temp = tempfile::tempdir().unwrap();

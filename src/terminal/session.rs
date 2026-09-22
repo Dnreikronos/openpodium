@@ -62,12 +62,13 @@ impl Session {
     }
 
     /// The bytes worth storing, or `None` when nothing has changed since the
-    /// last capture.
-    pub(crate) fn take_transcript(&mut self) -> Option<&[u8]> {
-        self.transcript_dirty.then(|| {
-            self.transcript_dirty = false;
-            self.transcript.as_slice()
-        })
+    /// successful store. Capturing does not acknowledge persistence.
+    pub(crate) fn take_transcript(&self) -> Option<&[u8]> {
+        self.transcript_dirty.then_some(self.transcript.as_slice())
+    }
+
+    pub(crate) fn mark_transcript_persisted(&mut self) {
+        self.transcript_dirty = false;
     }
 
     fn record(&mut self, bytes: &[u8]) {
@@ -273,6 +274,8 @@ mod tests {
 
         session.handle_event(ProcessEvent::Output(b"first".to_vec()));
         assert_eq!(session.take_transcript(), Some(b"first".as_slice()));
+        assert_eq!(session.take_transcript(), Some(b"first".as_slice()));
+        session.mark_transcript_persisted();
         assert!(session.take_transcript().is_none());
 
         session.handle_event(ProcessEvent::Output(b" second".to_vec()));
