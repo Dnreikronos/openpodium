@@ -22,6 +22,9 @@ const LINE_ZOOM_SENSITIVITY: f64 = 0.18 / LINE_SCROLL_PIXELS;
 const PIXEL_ZOOM_SENSITIVITY: f64 = 0.003;
 const RESIZE_HANDLE_PIXELS: f32 = 18.0;
 
+#[cfg(test)]
+mod scroll_tests;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ConnectionMode {
     #[default]
@@ -245,6 +248,7 @@ struct State {
     preedit: String,
     connection_cursor: Option<Point>,
     connection_press: Option<(NodeId, ConnectionMode)>,
+    terminal_scroll: Option<(NodeId, f64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -463,16 +467,27 @@ impl canvas::Program<Message> for Surface {
                         .and_capture(),
                     );
                 }
-                if state.modifiers.alt()
-                    && let Some((node_id, row, column, _)) = self.terminal_cell_at(anchor, bounds)
+                if let Some(node) = self.hit_node(anchor, bounds)
+                    && let Some(terminal) = self.document.terminal(node.id())
                 {
-                    let lines = (y / f64::from(CELL_HEIGHT)).round() as i32;
+                    let node_id = node.id();
+                    let remainder = match state.terminal_scroll {
+                        Some((previous, remainder)) if previous == node_id => remainder,
+                        _ => 0.0,
+                    };
+                    let total = remainder + y / f64::from(CELL_HEIGHT);
+                    let lines = total.trunc() as i32;
+                    state.terminal_scroll = Some((node_id, total - f64::from(lines)));
                     if lines != 0 {
-                        if self.document.terminal(node_id)?.mode.mouse_reporting {
+                        if terminal.mode.mouse_reporting {
+                            let (_, row, column, _) = self
+                                .terminal_cell_at(anchor, bounds)
+                                .unwrap_or((node_id, 0, 0, false));
                             return Some(
                                 Action::publish(Message::TerminalInput {
                                     node_id,
-                                    bytes: terminal::encode_mouse_wheel(row, column, lines > 0),
+                                    bytes: terminal::encode_mouse_wheel(row, column, lines > 0)
+                                        .repeat(lines.unsigned_abs().min(100) as usize),
                                 })
                                 .and_capture(),
                             );
@@ -482,7 +497,9 @@ impl canvas::Program<Message> for Surface {
                                 .and_capture(),
                         );
                     }
+                    return Some(Action::capture());
                 }
+                state.terminal_scroll = None;
                 let camera = match (*delta, state.modifiers.alt()) {
                     (_, true) | (mouse::ScrollDelta::Pixels { .. }, false) => {
                         self.camera.pan_by_screen(x, y)
