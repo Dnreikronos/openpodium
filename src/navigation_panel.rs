@@ -274,13 +274,13 @@ pub fn view<'a>(state: &'a UiState, commands: &'a CommandRegistry) -> Element<'a
             .style(shell::scrim),
     )
     .on_press(Message::Close);
-    let card = container(
+    let card = container(iced::widget::opaque(
         container(palette)
             .style(shell::card)
             .width(Fill)
             .max_width(680)
             .padding(16),
-    )
+    ))
     .width(Fill)
     .height(Fill)
     .align_x(iced::Alignment::Center)
