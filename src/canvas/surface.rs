@@ -244,7 +244,7 @@ struct State {
     rendered_revision: Cell<u64>,
     preedit: String,
     connection_cursor: Option<Point>,
-    connection_press: Option<NodeId>,
+    connection_press: Option<(NodeId, ConnectionMode)>,
 }
 
 #[derive(Debug, Clone)]
@@ -313,7 +313,7 @@ impl canvas::Program<Message> for Surface {
                 let Some(node) = self.hit_node(position, bounds) else {
                     return Some(Action::publish(Message::CancelConnection).and_capture());
                 };
-                state.connection_press = Some(node.id());
+                state.connection_press = Some((node.id(), self.connection_mode));
                 Some(
                     Action::publish(match self.connection_mode {
                         ConnectionMode::PickSource => Message::ConnectionSourceSelected(node.id()),
@@ -333,11 +333,12 @@ impl canvas::Program<Message> for Surface {
             {
                 let pressed = state.connection_press.take();
                 if let ConnectionMode::PickTarget(source) = self.connection_mode
-                    && pressed == Some(source)
+                    && let Some((pressed_node, started_in)) = pressed
+                    && pressed_node == source
                     && let Some(target) = cursor
                         .position_in(bounds)
                         .and_then(|position| self.hit_node(position, bounds))
-                    && target.id() != source
+                    && (target.id() != source || started_in == ConnectionMode::PickTarget(source))
                 {
                     return Some(
                         Action::publish(Message::ConnectNodes {
@@ -1336,6 +1337,13 @@ mod tests {
                 .update(&mut state, &release, bounds, cursor(-230.0))
                 .unwrap();
             assert!(action.into_inner().0.is_none());
+            let _ = surface.update(&mut state, &press, bounds, cursor(-230.0));
+            let action = surface
+                .update(&mut state, &release, bounds, cursor(-230.0))
+                .unwrap();
+            assert!(matches!(action.into_inner().0,
+                Some(Message::ConnectNodes { source: from, target: to }) if from == source && to == source
+            ));
             let action = surface
                 .update(&mut state, &press, bounds, cursor(170.0))
                 .unwrap();
