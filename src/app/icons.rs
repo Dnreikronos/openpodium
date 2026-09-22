@@ -19,6 +19,7 @@ pub(super) enum Icon {
     Files,
     Text,
     Link,
+    Trash,
 }
 
 pub(super) fn view<'a, Message: 'a>(icon: Icon) -> Element<'a, Message> {
@@ -88,6 +89,13 @@ impl<Message> canvas::Program<Message> for Icon {
                 ],
             ],
             Self::Link => &[&[(5.0, 11.0), (11.0, 5.0)]],
+            Self::Trash => &[
+                &[(2.0, 4.0), (14.0, 4.0)],
+                &[(5.0, 4.0), (5.0, 2.0), (11.0, 2.0), (11.0, 4.0)],
+                &[(3.5, 4.0), (4.5, 14.0), (11.5, 14.0), (12.5, 4.0)],
+                &[(6.5, 7.0), (6.5, 11.0)],
+                &[(9.5, 7.0), (9.5, 11.0)],
+            ],
         };
         for points in lines {
             let path = canvas::Path::new(|path| {

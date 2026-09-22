@@ -305,6 +305,88 @@ impl Journal {
         Ok(workspace_ids)
     }
 
+    pub fn recorded_workspace_ids(&self) -> Result<Vec<WorkspaceId>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT workspace_id FROM journal_events")
+            .map_err(|source| PersistenceError::database("prepare recorded workspaces", source))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|source| PersistenceError::database("query recorded workspaces", source))?;
+        rows.map(|row| {
+            let value = row
+                .map_err(|source| PersistenceError::database("read recorded workspace", source))?;
+            parse_workspace_id(&value, "journal events")
+        })
+        .collect()
+    }
+
+    /// Remove open-list membership while retaining the recoverable journal.
+    pub fn remove_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<WorkspaceId>, PersistenceError> {
+        let key = workspace_id.get().to_string();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| PersistenceError::database("begin workspace removal", source))?;
+        transaction.execute(
+            "UPDATE application_state SET active_workspace_id = (SELECT workspace_id FROM workspace_registry WHERE workspace_id != ?1 ORDER BY length(last_opened_at) DESC, last_opened_at DESC, workspace_id LIMIT 1) WHERE singleton = 1 AND active_workspace_id = ?1", [&key],
+        ).map_err(|source| PersistenceError::database("select remaining workspace", source))?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM workspace_registry WHERE workspace_id = ?1",
+                [&key],
+            )
+            .map_err(|source| {
+                PersistenceError::database("remove workspace registration", source)
+            })?;
+        if removed == 0 {
+            return Err(PersistenceError::UnknownWorkspace { workspace_id });
+        }
+        let next: Option<String> = transaction
+            .query_row(
+                "SELECT active_workspace_id FROM application_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| PersistenceError::database("read remaining workspace", source))?;
+        let next = next
+            .map(|id| parse_workspace_id(&id, "active workspace"))
+            .transpose()?;
+        transaction
+            .commit()
+            .map_err(|source| PersistenceError::database("commit workspace removal", source))?;
+        Ok(next)
+    }
+
+    pub fn restore_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        opened_at: Timestamp,
+    ) -> Result<(), PersistenceError> {
+        if self.recover(workspace_id)?.is_none() {
+            return Err(PersistenceError::UnknownWorkspace { workspace_id });
+        }
+        let key = workspace_id.get().to_string();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| PersistenceError::database("begin workspace restoration", source))?;
+        transaction.execute("INSERT INTO workspace_registry (workspace_id, last_opened_at) VALUES (?1, ?2) ON CONFLICT (workspace_id) DO UPDATE SET last_opened_at = excluded.last_opened_at", params![key, opened_at.as_unix_millis().to_string()])
+            .map_err(|source| PersistenceError::database("restore workspace registration", source))?;
+        transaction
+            .execute(
+                "UPDATE application_state SET active_workspace_id = ?1 WHERE singleton = 1",
+                [&key],
+            )
+            .map_err(|source| PersistenceError::database("activate restored workspace", source))?;
+        transaction
+            .commit()
+            .map_err(|source| PersistenceError::database("commit workspace restoration", source))
+    }
+
     pub fn active_workspace_id(&self) -> Result<Option<WorkspaceId>, PersistenceError> {
         let value = self
             .connection

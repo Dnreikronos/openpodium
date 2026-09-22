@@ -158,6 +158,15 @@ pub(super) fn update(state: &mut OpenPodium, message: navigation_panel::Message)
             documents,
         } => {
             state.navigation_ui.busy = None;
+            if state
+                .workspaces
+                .as_ref()
+                .and_then(|manager| manager.workspace(workspace_id))
+                .is_none()
+            {
+                state.navigation_ui.index.remove_workspace(workspace_id);
+                return Task::none();
+            }
             let documents = match documents {
                 Ok(documents) => documents,
                 Err(error) => {

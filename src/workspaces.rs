@@ -103,6 +103,25 @@ impl WorkspaceManager {
         occurred_at: Timestamp,
     ) -> Result<WorkspaceId, WorkspaceError> {
         let (canonical_path, working_directory) = validate_directory(directory.as_ref())?;
+        for workspace_id in self.journal.recorded_workspace_ids()? {
+            if self.workspaces.contains_key(&workspace_id) {
+                continue;
+            }
+            let Some(workspace) = self.journal.recover(workspace_id)? else {
+                continue;
+            };
+            if workspace
+                .settings()
+                .working_directory()
+                .is_some_and(|directory| Path::new(directory.as_str()) == canonical_path)
+            {
+                self.journal.restore_workspace(workspace_id, occurred_at)?;
+                self.workspaces.insert(workspace_id, workspace);
+                self.mark_recent(workspace_id);
+                self.active = Some(workspace_id);
+                return Ok(workspace_id);
+            }
+        }
         let name = default_workspace_name(&canonical_path)?;
         let workspace_id = self.next_workspace_id()?;
         let settings = WorkspaceSettings::new(name.clone(), None, Some(working_directory), None);
@@ -346,6 +365,17 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    pub fn remove_workspace(&mut self, workspace_id: WorkspaceId) -> Result<(), WorkspaceError> {
+        if !self.workspaces.contains_key(&workspace_id) {
+            return Err(WorkspaceError::UnknownWorkspace { workspace_id });
+        }
+        let next = self.journal.remove_workspace(workspace_id)?;
+        self.workspaces.remove(&workspace_id);
+        self.recent.retain(|id| *id != workspace_id);
+        self.active = next;
+        Ok(())
+    }
+
     pub fn active_workspace_id(&self) -> Option<WorkspaceId> {
         self.active
     }
@@ -447,9 +477,12 @@ impl WorkspaceManager {
 
     fn next_workspace_id(&self) -> Result<WorkspaceId, WorkspaceError> {
         let next = self
-            .workspaces
-            .last_key_value()
-            .map_or(0, |(workspace_id, _)| workspace_id.get())
+            .journal
+            .recorded_workspace_ids()?
+            .into_iter()
+            .map(|id| id.get())
+            .max()
+            .unwrap_or(0)
             .checked_add(1)
             .ok_or(WorkspaceError::WorkspaceIdExhausted)?;
         Ok(WorkspaceId::new(next))

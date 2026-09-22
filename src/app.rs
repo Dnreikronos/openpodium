@@ -9,6 +9,7 @@ mod trackpad;
 #[cfg(test)]
 mod transcript_tests;
 pub(crate) mod ui;
+mod workspace_actions;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -348,6 +349,7 @@ enum Message {
     Floor(floors::Message),
     Portal(portals::Message),
     Rename(renaming::Message),
+    RemoveWorkspace(WorkspaceId),
     OrchestrationTick,
     Canvas(canvas::Message),
     CycleTextScale,
@@ -488,6 +490,7 @@ enum Controls {
     Notifications,
     Node,
     Rename,
+    RemoveWorkspace(WorkspaceId),
 }
 
 impl Controls {
@@ -506,6 +509,7 @@ impl Controls {
             Self::Notifications => "Notifications",
             Self::Node => "Selected node",
             Self::Rename => "Rename window",
+            Self::RemoveWorkspace(_) => "Remove workspace?",
         }
     }
 }
@@ -633,11 +637,17 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             state.focused_terminal = None;
             state.focused_portal = None;
             state.controls = Some(controls);
+            if matches!(controls, Controls::RemoveWorkspace(_)) {
+                state.notice = None;
+            }
             if controls == Controls::Node {
                 return context_nodes::open_editor(state);
             }
         }
         Message::CloseControls => state.controls = None,
+        Message::RemoveWorkspace(workspace_id) => {
+            return workspace_actions::remove(state, workspace_id);
+        }
         Message::TrackpadMagnified(delta) => {
             if let Some(factor) = trackpad::magnification_factor(delta) {
                 state.camera = state.camera.zoom_centered(factor);
@@ -1028,13 +1038,24 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                     .align_y(IcedAlignment::Center),
                 );
             }
-            workspace_list = workspace_list.push(
+            let entry = row![
                 button(entry)
                     .style(shell::navigation_button(selected))
                     .padding([7, 8])
                     .on_press(Message::SwitchWorkspace(workspace.id()))
                     .width(Fill),
-            );
+                selected.then(|| labelled(
+                    icons::control(Icon::Trash)
+                        .style(shell::danger_button)
+                        .on_press(Message::OpenControls(Controls::RemoveWorkspace(
+                            workspace.id()
+                        ))),
+                    "Remove workspace",
+                )),
+            ]
+            .spacing(1)
+            .align_y(IcedAlignment::Center);
+            workspace_list = workspace_list.push(entry);
         }
     }
 
@@ -1121,6 +1142,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .into()
     };
     let mut settings = match state.controls {
+        Some(Controls::RemoveWorkspace(id)) => column![workspace_actions::confirmation(state, id)],
         Some(Controls::Rename) => column![renaming::view(&state.rename_ui)],
         Some(Controls::Workspace) => column![section(
             "Details",
@@ -2100,7 +2122,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .width(Fill)
         .max_width(match controls {
             Controls::Menu | Controls::Advanced => 340.0,
-            Controls::Rename => 420.0,
+            Controls::Rename | Controls::RemoveWorkspace(_) => 420.0,
             _ => 620.0,
         });
         stack![
