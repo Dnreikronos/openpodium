@@ -1059,7 +1059,9 @@ fn viewport(bounds: Rectangle) -> ViewportSize {
 fn is_application_shortcut(shortcuts: &[Shortcut], key: &Key, modifiers: Modifiers) -> bool {
     crate::navigation_panel::shortcut_from_key(key, modifiers)
         .as_ref()
-        .is_some_and(|shortcut| shortcuts.contains(shortcut))
+        .is_some_and(|shortcut| {
+            (shortcut.primary() || shortcut.alt()) && shortcuts.contains(shortcut)
+        })
 }
 
 fn scroll_delta(delta: mouse::ScrollDelta) -> (f64, f64, f64) {
@@ -1472,24 +1474,24 @@ mod tests {
     }
 
     #[test]
-    fn focused_embedded_content_releases_zoom_shortcuts_to_the_application() {
+    fn focused_embedded_content_keeps_printable_zoom_keys_as_text() {
         let shortcuts = [
             Shortcut::parse("plus").unwrap(),
             Shortcut::parse("minus").unwrap(),
             Shortcut::parse("0").unwrap(),
         ];
 
-        assert!(is_application_shortcut(
+        assert!(!is_application_shortcut(
             &shortcuts,
             &Key::Character("+".into()),
             Modifiers::empty(),
         ));
-        assert!(is_application_shortcut(
+        assert!(!is_application_shortcut(
             &shortcuts,
             &Key::Character("-".into()),
             Modifiers::empty(),
         ));
-        assert!(is_application_shortcut(
+        assert!(!is_application_shortcut(
             &shortcuts,
             &Key::Character("0".into()),
             Modifiers::empty(),
@@ -1498,6 +1500,26 @@ mod tests {
             &shortcuts,
             &Key::Character("z".into()),
             Modifiers::empty(),
+        ));
+        for character in ["0", "+", "-"] {
+            assert_eq!(
+                terminal::encode_key(
+                    &Key::Character(character.into()),
+                    Some(character),
+                    Modifiers::empty(),
+                    terminal::InputMode::default()
+                ),
+                Some(character.as_bytes().to_vec())
+            );
+        }
+        assert!(is_application_shortcut(
+            &[Shortcut::parse("Primary+0").unwrap()],
+            &Key::Character("0".into()),
+            if cfg!(target_os = "macos") {
+                Modifiers::LOGO
+            } else {
+                Modifiers::CTRL
+            },
         ));
     }
 

@@ -288,6 +288,9 @@ pub(super) fn handle_key(
     }
     let embedded_content_focused =
         state.focused_terminal.is_some() || state.focused_portal.is_some();
+    if embedded_content_focused && !shortcut.primary() && !shortcut.alt() {
+        return Task::none();
+    }
     if status == Status::Captured
         && !matches!(command, CommandId::OpenPalette | CommandId::FocusCanvas)
         && !(embedded_content_focused

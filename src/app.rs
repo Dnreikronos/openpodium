@@ -5953,7 +5953,42 @@ mod tests {
             Some(zoom_out),
             event::Status::Captured,
         );
-        assert_eq!(state.camera.zoom_percent(), 83);
+        assert_eq!(state.camera.zoom_percent(), 100);
+    }
+
+    #[test]
+    fn zero_and_other_printable_shortcuts_do_not_move_the_board_while_typing() {
+        let temp = TempDir::new().unwrap();
+        let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+        let camera = Camera::default()
+            .zoom_centered(0.75)
+            .pan_by_screen(150.0, 80.0);
+        for portal in [false, true] {
+            state.focused_terminal = (!portal).then_some(NodeId::new(1));
+            state.focused_portal = portal.then_some(NodeId::new(1));
+            for status in [event::Status::Captured, event::Status::Ignored] {
+                for binding in ["0", "plus", "minus"] {
+                    state.camera = camera;
+                    let _ = navigation::handle_key(
+                        &mut state,
+                        navigation::NavigationKey::Other,
+                        Some(Shortcut::parse(binding).unwrap()),
+                        status,
+                    );
+                    assert_eq!(state.camera, camera);
+                }
+            }
+        }
+        state.focused_terminal = None;
+        state.focused_portal = None;
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Other,
+            Some(Shortcut::parse("0").unwrap()),
+            event::Status::Ignored,
+        );
+        assert_eq!(state.camera, Camera::default());
     }
 
     #[test]
