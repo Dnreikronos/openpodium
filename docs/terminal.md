@@ -61,6 +61,22 @@ copies the selection and platform-paste sends clipboard text, using bracketed pa
 by the terminal mode. OSC 52 copy requests are forwarded to the system clipboard; OSC 52 paste is
 disabled by the emulator's default security policy.
 
+`Shift+Enter` inserts a newline as a bracketed paste when the child enables that mode. This keeps
+the newline in the input buffer of supporting shells and agents until ordinary `Enter` submits
+it. Without bracketed paste, the mapper sends the distinct CSI-u sequence `ESC [ 13 ; 2 u` so
+applications can bind the shortcut; it never substitutes an ordinary `Enter`. Additional
+Ctrl, Alt, or Super modifiers retain their existing mappings.
+
+Older shells without bracketed paste need a binding. For Bash 3.2 (bundled with macOS), add this
+to `~/.inputrc` and start a new shell:
+
+```inputrc
+"\e[13;2u": "\C-v\C-j"
+```
+
+This uses Readline's quoted insertion to put a newline into the buffer without executing it.
+Shells with custom keymaps or disabled bracketed paste may also need a matching binding.
+
 ## Known text limitations
 
 Unicode width and combining characters follow `alacritty_terminal`. Iced performs glyph shaping,
@@ -72,6 +88,7 @@ canvas; candidate-window positioning is controlled by Iced and the operating sys
 ## Verification
 
 Targeted tests cover ANSI style and alternate-screen parsing, Unicode/wide/combining cells,
-scrollback, selection, resize, bracketed paste, application-cursor keys, control-key mapping, and
+scrollback, selection, resize, bracketed paste, Shift+Enter with paste mode toggled, ordinary Enter
+and modifier preservation, application-cursor keys, control-key mapping, and
 canvas shortcut suppression while a terminal is focused. Existing PTY tests continue to prove
 native input, output, resize, termination, and cancellation behavior.

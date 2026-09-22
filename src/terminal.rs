@@ -557,6 +557,13 @@ pub(crate) fn encode_key(
     modifiers: Modifiers,
     mode: InputMode,
 ) -> Option<Vec<u8>> {
+    if matches!(key, Key::Named(Named::Enter)) && modifiers == Modifiers::SHIFT {
+        return Some(if mode.bracketed_paste {
+            encode_paste("\n", mode)
+        } else {
+            b"\x1b[13;2u".to_vec()
+        });
+    }
     let mut bytes = if modifiers.control() {
         control_bytes(key).or_else(|| named_key_bytes(key, modifiers, mode))?
     } else if let Some(bytes) = named_key_bytes(key, modifiers, mode) {
@@ -761,6 +768,44 @@ mod tests {
         mode.bracketed_paste = true;
         assert_eq!(encode_paste("a\r\nb", mode), b"\x1b[200~a\nb\x1b[201~");
         assert_eq!(encode_mouse_wheel(2, 4, true), b"\x1b[<64;5;3M");
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline_without_submitting() {
+        let mut model = model();
+        let key = Key::Named(Named::Enter);
+        let encode =
+            |model: &Model| encode_key(&key, Some("\r"), Modifiers::SHIFT, model.input_mode());
+
+        assert_eq!(encode(&model), Some(b"\x1b[13;2u".to_vec()));
+        model.feed(b"\x1b[?2004h");
+        assert_eq!(encode(&model), Some(b"\x1b[200~\n\x1b[201~".to_vec()));
+        model.feed(b"\x1b[?2004l");
+        assert_eq!(encode(&model), Some(b"\x1b[13;2u".to_vec()));
+    }
+
+    #[test]
+    fn newline_shortcut_preserves_other_enter_combinations() {
+        for bracketed_paste in [false, true] {
+            let mode = InputMode {
+                bracketed_paste,
+                ..InputMode::default()
+            };
+            for (modifiers, expected) in [
+                (Modifiers::empty(), b"\r".as_slice()),
+                (Modifiers::CTRL, b"\r"),
+                (Modifiers::ALT, b"\x1b\r"),
+                (Modifiers::CTRL | Modifiers::SHIFT, b"\r"),
+                (Modifiers::ALT | Modifiers::SHIFT, b"\x1b\r"),
+                (Modifiers::LOGO | Modifiers::SHIFT, b"\r"),
+            ] {
+                assert_eq!(
+                    encode_key(&Key::Named(Named::Enter), Some("\r"), modifiers, mode),
+                    Some(expected.to_vec()),
+                    "modifiers: {modifiers:?}, bracketed paste: {bracketed_paste}"
+                );
+            }
+        }
     }
 
     #[test]
