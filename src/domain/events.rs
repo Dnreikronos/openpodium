@@ -33,6 +33,10 @@ pub enum DomainCommand {
         role_id: Option<RoleId>,
     },
     AddAgent(Agent),
+    RenameAgent {
+        agent_id: AgentId,
+        name: Name,
+    },
     AddChatThread(ChatThread),
     UpdateChatThread {
         thread_id: ChatThreadId,
@@ -165,6 +169,11 @@ pub enum DomainEvent {
         to: Option<RoleId>,
     },
     AgentAdded(Agent),
+    AgentRenamed {
+        agent_id: AgentId,
+        from: Name,
+        to: Name,
+    },
     ChatThreadAdded(ChatThread),
     ChatThreadChanged {
         thread_id: ChatThreadId,
@@ -478,6 +487,7 @@ pub enum DomainError {
         expected: AgentState,
         actual: AgentState,
     },
+    AgentNameConflict(AgentId),
     TaskStateConflict {
         task_id: TaskId,
         expected: TaskState,
@@ -689,6 +699,10 @@ impl Display for DomainError {
             } => write!(
                 formatter,
                 "agent {agent_id} event expected state {expected}, but current state is {actual}"
+            ),
+            Self::AgentNameConflict(agent_id) => write!(
+                formatter,
+                "agent {agent_id} was renamed by another operation; reopen the name editor"
             ),
             Self::TaskStateConflict {
                 task_id,

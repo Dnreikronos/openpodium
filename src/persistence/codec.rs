@@ -25,7 +25,7 @@ use crate::domain::{
 
 use super::PersistenceError;
 
-pub(crate) const EVENT_FORMAT_VERSION: u32 = 12;
+pub(crate) const EVENT_FORMAT_VERSION: u32 = 13;
 pub(crate) const SNAPSHOT_FORMAT_VERSION: u32 = 12;
 
 pub(crate) fn encode_event(event: &DomainEvent) -> Result<Vec<u8>, PersistenceError> {
@@ -127,6 +127,13 @@ pub(crate) fn decode_event(
             "routines, routine runs, and structured step outputs require event format version 12",
         ));
     }
+    if format_version < 13 && matches!(stored, StoredEvent::AgentRenamed { .. }) {
+        return Err(PersistenceError::invalid_record(
+            "domain event",
+            sequence,
+            "agent renaming requires event format version 13",
+        ));
+    }
     stored
         .into_domain()
         .map_err(|detail| PersistenceError::invalid_record("domain event", sequence, detail))
@@ -215,6 +222,11 @@ enum StoredEvent {
     },
     AgentAdded {
         agent: AgentV1,
+    },
+    AgentRenamed {
+        agent_id: u64,
+        from: String,
+        to: String,
     },
     ChatThreadAdded {
         thread: ChatThreadV1,
@@ -385,6 +397,11 @@ impl From<&DomainEvent> for StoredEvent {
             },
             DomainEvent::AgentAdded(agent) => Self::AgentAdded {
                 agent: AgentV1::from(agent),
+            },
+            DomainEvent::AgentRenamed { agent_id, from, to } => Self::AgentRenamed {
+                agent_id: agent_id.get(),
+                from: from.as_str().to_owned(),
+                to: to.as_str().to_owned(),
             },
             DomainEvent::ChatThreadAdded(thread) => Self::ChatThreadAdded {
                 thread: ChatThreadV1::from(thread),
@@ -729,6 +746,11 @@ impl StoredEvent {
             Self::ChatThreadAdded { thread } => {
                 Ok(DomainEvent::ChatThreadAdded(thread.into_domain()?))
             }
+            Self::AgentRenamed { agent_id, from, to } => Ok(DomainEvent::AgentRenamed {
+                agent_id: AgentId::new(agent_id),
+                from: Name::new(from).map_err(|error| error.to_string())?,
+                to: Name::new(to).map_err(|error| error.to_string())?,
+            }),
             Self::ChatThreadChanged {
                 thread_id,
                 from_name,

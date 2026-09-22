@@ -451,6 +451,17 @@ impl Workspace {
                     }
                 }
                 DomainCommand::AddAgent(agent) => DomainEvent::AgentAdded(agent),
+                DomainCommand::RenameAgent { agent_id, name } => {
+                    let agent = self
+                        .agents
+                        .get(&agent_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Agent(agent_id)))?;
+                    DomainEvent::AgentRenamed {
+                        agent_id,
+                        from: agent.name().clone(),
+                        to: name,
+                    }
+                }
                 DomainCommand::AddChatThread(thread) => DomainEvent::ChatThreadAdded(thread),
                 DomainCommand::UpdateChatThread {
                     thread_id,
@@ -880,6 +891,17 @@ impl Workspace {
                     )?;
                 }
                 self.agents.insert(agent.id(), agent.clone());
+            }
+            DomainEvent::AgentRenamed { agent_id, from, to } => {
+                let agent = self
+                    .agents
+                    .get_mut(agent_id)
+                    .or_else(|| self.archived_agents.get_mut(agent_id))
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Agent(*agent_id)))?;
+                if agent.name() != from {
+                    return Err(DomainError::AgentNameConflict(*agent_id));
+                }
+                agent.set_name(to.clone());
             }
             DomainEvent::ChatThreadAdded(thread) => {
                 self.ensure_absent(EntityRef::ChatThread(thread.id()))?;

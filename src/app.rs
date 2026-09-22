@@ -3,6 +3,7 @@ mod floors;
 mod icons;
 mod navigation;
 mod portals;
+mod renaming;
 pub(crate) mod shell;
 mod trackpad;
 pub(crate) mod ui;
@@ -133,6 +134,7 @@ struct OpenPodium {
     window_size: Size,
     floor_ui: floors::UiState,
     context_ui: context_nodes::UiState,
+    rename_ui: renaming::State,
     portal_ui: portals::UiState,
     camera: Camera,
     canvas_selection: Vec<NodeId>,
@@ -265,6 +267,7 @@ impl Default for OpenPodium {
             window_size: DEFAULT_WINDOW_SIZE,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
+            rename_ui: renaming::State::default(),
             portal_ui: portals::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
@@ -342,6 +345,7 @@ impl Default for OpenPodium {
 enum Message {
     Floor(floors::Message),
     Portal(portals::Message),
+    Rename(renaming::Message),
     OrchestrationTick,
     Canvas(canvas::Message),
     CycleTextScale,
@@ -481,6 +485,7 @@ enum Controls {
     Tasks,
     Notifications,
     Node,
+    Rename,
 }
 
 impl Controls {
@@ -498,6 +503,7 @@ impl Controls {
             Self::Tasks => "Task actions",
             Self::Notifications => "Notifications",
             Self::Node => "Selected node",
+            Self::Rename => "Rename window",
         }
     }
 }
@@ -639,6 +645,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::ExecuteCommand(command) => return navigation::execute_command(state, command),
         Message::Floor(message) => return floors::update(state, message),
         Message::Portal(message) => return portals::update(state, message),
+        Message::Rename(message) => return renaming::update(state, message),
         Message::WindowResized(size) => state.window_size = size,
         Message::OrchestrationTick => {
             state.transcript_ticks = state.transcript_ticks.wrapping_add(1);
@@ -1112,6 +1119,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .into()
     };
     let mut settings = match state.controls {
+        Some(Controls::Rename) => column![renaming::view(&state.rename_ui)],
         Some(Controls::Workspace) => column![section(
             "Details",
             column![
@@ -1661,7 +1669,10 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     }
     let editing_note = state.controls == Some(Controls::Node)
         && context_nodes::editor_title(&state.context_ui).is_some();
-    if !editing_note && let Some(notice) = &state.notice {
+    if !editing_note
+        && state.controls != Some(Controls::Rename)
+        && let Some(notice) = &state.notice
+    {
         settings = settings.push(
             container(text(notice).size(12))
                 .style(shell::section_card)
@@ -1876,8 +1887,10 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                         Message::StartTerminal(node_id)
                     }),
                 )
+                .push(button(text("Chat").size(12)).on_press(Message::OpenControls(Controls::Node)))
                 .push(
-                    button(text("Chat").size(12)).on_press(Message::OpenControls(Controls::Node)),
+                    button(text("Rename").size(12))
+                        .on_press(Message::Rename(renaming::Message::Open(node_id))),
                 );
         } else if state.canvas_selection.len() == 1
             && state
@@ -2083,10 +2096,10 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .style(shell::card)
         .padding(18)
         .width(Fill)
-        .max_width(if matches!(controls, Controls::Menu | Controls::Advanced) {
-            340.0
-        } else {
-            620.0
+        .max_width(match controls {
+            Controls::Menu | Controls::Advanced => 340.0,
+            Controls::Rename => 420.0,
+            _ => 620.0,
         });
         stack![
             application,
@@ -3207,6 +3220,9 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
             state.canvas_selection = vec![node_id];
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
             return context_nodes::open_editor(state);
+        }
+        canvas::Message::RenameRequested(node_id) => {
+            return renaming::update(state, renaming::Message::Open(node_id));
         }
         canvas::Message::PreviewLayout(layout) => {
             state.canvas_preview = Some(layout);
@@ -5666,6 +5682,7 @@ mod tests {
             controls: None,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
+            rename_ui: renaming::State::default(),
             portal_ui: portals::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
@@ -6692,6 +6709,7 @@ mod tests {
             controls: None,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
+            rename_ui: renaming::State::default(),
             portal_ui: portals::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),

@@ -42,6 +42,7 @@ pub(crate) enum Message {
     CameraChanged(Camera),
     SelectionChanged(Vec<NodeId>),
     EditRequested(NodeId),
+    RenameRequested(NodeId),
     ConnectionSourceSelected(NodeId),
     ConnectNodes {
         source: NodeId,
@@ -560,6 +561,7 @@ impl canvas::Program<Message> for Surface {
             return mouse::Interaction::default();
         };
         if self.resize_hit(position, bounds).is_some()
+            || self.rename_hit(position, bounds).is_some()
             || self.portal_point_at(position, bounds).is_some()
         {
             mouse::Interaction::Pointer
@@ -626,6 +628,12 @@ impl Surface {
         position: Point,
         bounds: Rectangle,
     ) -> Option<Action<Message>> {
+        if !state.modifiers.shift()
+            && let Some(node_id) = self.rename_hit(position, bounds)
+        {
+            state.drag = None;
+            return Some(Action::publish(Message::RenameRequested(node_id)).and_capture());
+        }
         let before = self.document.layout().clone();
         if let Some(node) = self.resize_hit(position, bounds) {
             state.drag = Some(Drag::Resize {
@@ -883,6 +891,13 @@ impl Surface {
         ))
     }
 
+    fn rename_hit(&self, position: Point, bounds: Rectangle) -> Option<NodeId> {
+        let node = self.hit_node(position, bounds)?;
+        (self.selection.contains(&node.id())
+            && scene::rename_button_bounds(node, self.camera, viewport(bounds))?.contains(position))
+        .then_some(node.id())
+    }
+
     fn editable_body_at(&self, position: Point, bounds: Rectangle) -> Option<NodeId> {
         let node = self.hit_node(position, bounds)?;
         if !matches!(
@@ -1090,6 +1105,72 @@ mod tests {
     use openpodium::portal::{PortalConfig, PortalFrame, PortalFrameEncoding, PortalViewport};
 
     use super::*;
+
+    #[test]
+    fn rename_button_uses_header_hit_bounds_at_every_zoom_without_breaking_drag() {
+        use openpodium::domain::{Agent, AgentId, DomainCommand, NodeTarget};
+        let node_id = NodeId::new(1);
+        let mut workspace = Workspace::new(WorkspaceId::new(1), Name::new("Test").unwrap());
+        let node = Node::new(
+            node_id,
+            NodeTarget::Agent(AgentId::new(1)),
+            CanvasPoint::new(-180.0, -130.0).unwrap(),
+            CanvasSize::new(360.0, 260.0).unwrap(),
+        );
+        workspace
+            .execute(DomainCommand::AddAgentNode {
+                agent: Agent::new(AgentId::new(1), Name::new("Codex 9").unwrap(), None),
+                node: node.clone(),
+            })
+            .unwrap();
+        let document = CanvasDocument::new(
+            &workspace,
+            workspace.canvas_layout(),
+            BTreeMap::new(),
+            &Localizer::new(Locale::EnUs),
+        );
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1_000.0, 800.0));
+        for zoom in [0.5, 1.0, 2.0] {
+            let camera = Camera::default().zoom_centered(zoom);
+            let mut surface = portal_surface(camera, node_id, document.clone());
+            surface.focused_portal = None;
+            surface.selection = vec![node_id];
+            let button = scene::rename_button_bounds(&node, camera, viewport(bounds)).unwrap();
+            let mut state = State::default();
+            let action = surface
+                .begin_left_drag(&mut state, button.center(), bounds)
+                .unwrap();
+            assert!(
+                matches!(action.into_inner().0, Some(Message::RenameRequested(id)) if id == node_id)
+            );
+            assert!(state.drag.is_none());
+            state.modifiers = Modifiers::SHIFT;
+            let action = surface
+                .begin_left_drag(&mut state, button.center(), bounds)
+                .unwrap();
+            assert!(matches!(
+                action.into_inner().0,
+                Some(Message::SelectionChanged(_))
+            ));
+            assert!(matches!(state.drag, Some(Drag::Move { .. })));
+            state.modifiers = Modifiers::empty();
+            let top = camera.world_to_screen(WorldPoint::new(-180.0, -130.0), viewport(bounds));
+            let action = surface
+                .begin_left_drag(
+                    &mut state,
+                    Point::new(top.x as f32 + 30.0, top.y as f32 + 10.0),
+                    bounds,
+                )
+                .unwrap();
+            assert!(matches!(
+                action.into_inner().0,
+                Some(Message::SelectionChanged(_))
+            ));
+            assert!(matches!(state.drag, Some(Drag::Move { .. })));
+            surface.selection.clear();
+            assert_eq!(surface.rename_hit(button.center(), bounds), None);
+        }
+    }
 
     fn portal_document(node_id: NodeId) -> CanvasDocument {
         let node = Node::with_content(

@@ -271,6 +271,9 @@ fn project_event(workspace: &Workspace, event: &TimelineEvent) -> TimelineItem {
             "Agent added".to_owned(),
             format!("{} is {}", agent.name(), agent.state()),
         ),
+        DomainEvent::AgentRenamed { from, to, .. } => {
+            (None, "Agent renamed".to_owned(), format!("{from} → {to}"))
+        }
         DomainEvent::ChatThreadAdded(thread) => (
             None,
             "Chat thread added".to_owned(),

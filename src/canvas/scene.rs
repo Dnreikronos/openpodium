@@ -6,7 +6,7 @@ use iced::widget::image::Handle;
 use iced::{Color, Font, Pixels, Point, Radians, Rectangle, Size, Theme, Vector, font};
 use openpodium::domain::{
     AgentProgram, CanvasColor, CanvasNodeContent, ConnectionKind, Node, NodeGroup, NodeId,
-    ShapeKind,
+    NodeTarget, ShapeKind,
 };
 use openpodium::portal::{PortalFrame, PortalFrameTransform, PortalRect};
 
@@ -296,6 +296,28 @@ fn node_screen_rect(node: &Node, camera: Camera, viewport: ViewportSize) -> Rect
             node.size().height() * camera.zoom() as f32,
         ),
     )
+}
+
+pub(super) fn rename_button_bounds(
+    node: &Node,
+    camera: Camera,
+    viewport: ViewportSize,
+) -> Option<Rectangle> {
+    rename_button_in_rect(node, camera, node_screen_rect(node, camera, viewport))
+}
+
+fn rename_button_in_rect(node: &Node, camera: Camera, rect: Rectangle) -> Option<Rectangle> {
+    if !matches!(node.reference(), Some(NodeTarget::Agent(_))) {
+        return None;
+    }
+    if rect.width < 80.0 {
+        return None;
+    }
+    let header = (HEADER_HEIGHT * camera.zoom() as f32).clamp(28.0, 60.0);
+    Some(Rectangle::new(
+        Point::new(rect.x + rect.width - 28.0, rect.y + (header - 24.0) * 0.5),
+        Size::new(24.0, 24.0),
+    ))
 }
 
 fn edge_anchor(rect: Rectangle, toward: Point) -> Point {
@@ -608,12 +630,39 @@ fn draw_node(
             Stroke::default().with_color(accent).with_width(1.4),
         );
         let shows_detail = camera.zoom() >= BODY_MIN_ZOOM && size.width >= 300.0;
+        let rename_button = is_selected
+            .then(|| rename_button_in_rect(node, camera, rect))
+            .flatten();
+        let name_inset = if rename_button.is_some() { 28.0 } else { 0.0 };
+        if let Some(button) = rename_button {
+            let center = button.center();
+            frame.fill(
+                &Path::rounded_rectangle(button.position(), button.size(), 5.0.into()),
+                shell::surface_color(palette),
+            );
+            let pencil = Path::new(|path| {
+                path.move_to(Point::new(center.x - 5.0, center.y + 5.0));
+                path.line_to(Point::new(center.x - 4.0, center.y + 1.0));
+                path.line_to(Point::new(center.x + 3.0, center.y - 6.0));
+                path.line_to(Point::new(center.x + 6.0, center.y - 3.0));
+                path.line_to(Point::new(center.x - 1.0, center.y + 4.0));
+                path.close();
+                path.move_to(Point::new(center.x + 1.0, center.y - 4.0));
+                path.line_to(Point::new(center.x + 4.0, center.y - 1.0));
+            });
+            frame.stroke(
+                &pencil,
+                Stroke::default()
+                    .with_color(shell::muted_color(palette))
+                    .with_width(1.2),
+            );
+        }
         let title_size = (12.0 * zoom).clamp(9.0, 16.0);
         let title_x = top_left.x + padding + marker_size + 6.0;
         let title_width = if shows_detail {
             size.width * 0.45
         } else {
-            size.width
+            size.width - name_inset
         };
         let title_bounds = Rectangle::new(
             Point::new(title_x, top_left.y),
@@ -637,7 +686,10 @@ fn draw_node(
         if shows_detail {
             let detail_bounds = Rectangle::new(
                 Point::new(top_left.x + title_width, top_left.y),
-                Size::new(size.width - title_width - padding, header_height),
+                Size::new(
+                    (size.width - title_width - padding - name_inset).max(1.0),
+                    header_height,
+                ),
             );
             clip_text(frame, regions, detail_bounds, |frame| {
                 let detail_size = (10.0 * zoom).clamp(8.0, 12.0);
