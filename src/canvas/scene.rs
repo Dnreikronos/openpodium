@@ -190,22 +190,11 @@ fn draw_connections(
         else {
             continue;
         };
-        let from = camera.world_to_screen(node_center(source), viewport);
-        let to = camera.world_to_screen(node_center(target), viewport);
-        let from = Point::new(from.x as f32, from.y as f32);
-        let to = Point::new(to.x as f32, to.y as f32);
-        // A dashed curve reads as a link rather than a hard edge, and the
-        // horizontal control points keep it clear of the node bodies the way a
-        // straight center-to-center line does not.
-        let reach = ((to.x - from.x).abs() * 0.5).clamp(40.0, 220.0);
-        let path = Path::new(|builder| {
-            builder.move_to(from);
-            builder.bezier_curve_to(
-                Point::new(from.x + reach, from.y),
-                Point::new(to.x - reach, to.y),
-                to,
-            );
-        });
+        let source_rect = node_screen_rect(source, camera, viewport);
+        let target_rect = node_screen_rect(target, camera, viewport);
+        let from = edge_anchor(source_rect, target_rect.center());
+        let to = edge_anchor(target_rect, source_rect.center());
+        let path = connection_path(from, to);
         frame.stroke(
             &path,
             Stroke {
@@ -221,6 +210,138 @@ fn draw_connections(
     }
 }
 
+pub(super) struct ConnectionPreview {
+    pub source: NodeId,
+    pub pointer: Point,
+    pub target: Option<NodeId>,
+}
+
+pub(super) fn draw_connection_preview(
+    frame: &mut canvas::Frame,
+    camera: Camera,
+    viewport: ViewportSize,
+    document: &CanvasDocument,
+    preview: ConnectionPreview,
+    palette: &palette::Extended,
+) {
+    let Some(source) = document
+        .layout()
+        .nodes()
+        .iter()
+        .find(|node| node.id() == preview.source)
+    else {
+        return;
+    };
+    let target = preview.target.and_then(|id| {
+        document
+            .layout()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == id)
+    });
+    let source_rect = node_screen_rect(source, camera, viewport);
+    let target_rect = target.map(|node| node_screen_rect(node, camera, viewport));
+    let from = edge_anchor(
+        source_rect,
+        target_rect.map_or(preview.pointer, |rect| rect.center()),
+    );
+    let to = target_rect.map_or(preview.pointer, |rect| {
+        edge_anchor(rect, source_rect.center())
+    });
+    let valid = target.is_none_or(|target| {
+        target.id() != source.id()
+            && ConnectionKind::between_content(source.content(), target.content()).is_some()
+            && !document.layout().connections().iter().any(|connection| {
+                connection.source() == source.id() && connection.target() == target.id()
+            })
+    });
+    let color = if valid {
+        palette.primary.base.color
+    } else {
+        palette.danger.base.color
+    };
+    frame.stroke(
+        &connection_path(from, to),
+        Stroke {
+            line_dash: canvas::LineDash {
+                segments: &[6.0, 5.0],
+                offset: 0,
+            },
+            ..Stroke::default().with_color(color).with_width(1.5)
+        },
+    );
+    for point in [from, to] {
+        frame.fill(&Path::circle(point, 4.0), color);
+    }
+    if let Some(rect) = target_rect {
+        frame.stroke(
+            &Path::rounded_rectangle(rect.position(), rect.size(), 6.0.into()),
+            Stroke::default().with_color(color).with_width(2.0),
+        );
+    }
+}
+
+fn node_screen_rect(node: &Node, camera: Camera, viewport: ViewportSize) -> Rectangle {
+    let origin = camera.world_to_screen(
+        WorldPoint::new(
+            f64::from(node.position().x()),
+            f64::from(node.position().y()),
+        ),
+        viewport,
+    );
+    Rectangle::new(
+        Point::new(origin.x as f32, origin.y as f32),
+        Size::new(
+            node.size().width() * camera.zoom() as f32,
+            node.size().height() * camera.zoom() as f32,
+        ),
+    )
+}
+
+fn edge_anchor(rect: Rectangle, toward: Point) -> Point {
+    let center = rect.center();
+    let dx = toward.x - center.x;
+    let dy = toward.y - center.y;
+    if dx.abs() > dy.abs() {
+        Point::new(
+            if dx >= 0.0 {
+                rect.x + rect.width
+            } else {
+                rect.x
+            },
+            center.y,
+        )
+    } else {
+        Point::new(
+            center.x,
+            if dy >= 0.0 {
+                rect.y + rect.height
+            } else {
+                rect.y
+            },
+        )
+    }
+}
+
+fn connection_path(from: Point, to: Point) -> Path {
+    let delta = to - from;
+    let vertical = delta.y.abs() >= delta.x.abs();
+    let reach = (if vertical {
+        delta.y.abs()
+    } else {
+        delta.x.abs()
+    } * 0.5)
+        .clamp(20.0, 220.0);
+    let offset = if vertical {
+        Vector::new(0.0, reach * delta.y.signum())
+    } else {
+        Vector::new(reach * delta.x.signum(), 0.0)
+    };
+    Path::new(|builder| {
+        builder.move_to(from);
+        builder.bezier_curve_to(from + offset, to - offset, to);
+    })
+}
 
 /// Emits text only where a node is actually exposed.
 ///
@@ -963,13 +1084,6 @@ fn node_bounds(node: &Node) -> WorldRect {
     )
 }
 
-fn node_center(node: &Node) -> WorldPoint {
-    WorldPoint::new(
-        f64::from(node.position().x() + node.size().width() / 2.0),
-        f64::from(node.position().y() + node.size().height() / 2.0),
-    )
-}
-
 fn grid_step(zoom: f64) -> f64 {
     let mut step = BASE_GRID_STEP;
     while step * zoom < MIN_GRID_PIXELS {
@@ -1121,4 +1235,24 @@ mod tests {
         assert!(regions.len() <= MAX_VISIBLE_REGIONS.max(1));
         assert_eq!(regions, vec![node]);
     }
+}
+#[test]
+fn connection_anchors_stay_on_the_edges_facing_the_other_card() {
+    let rect = Rectangle::new(Point::new(100.0, 100.0), Size::new(300.0, 200.0));
+    assert_eq!(
+        edge_anchor(rect, Point::new(250.0, 600.0)),
+        Point::new(250.0, 300.0)
+    );
+    assert_eq!(
+        edge_anchor(rect, Point::new(250.0, -200.0)),
+        Point::new(250.0, 100.0)
+    );
+    assert_eq!(
+        edge_anchor(rect, Point::new(800.0, 200.0)),
+        Point::new(400.0, 200.0)
+    );
+    assert_eq!(
+        edge_anchor(rect, Point::new(-200.0, 200.0)),
+        Point::new(100.0, 200.0)
+    );
 }

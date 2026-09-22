@@ -136,6 +136,8 @@ struct OpenPodium {
     portal_ui: portals::UiState,
     camera: Camera,
     canvas_selection: Vec<NodeId>,
+    connection_mode: canvas::ConnectionMode,
+    connection_error: Option<String>,
     canvas_preview: Option<CanvasLayout>,
     canvas_history: History,
     canvas_revision: u64,
@@ -266,6 +268,8 @@ impl Default for OpenPodium {
             portal_ui: portals::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
+            connection_mode: canvas::ConnectionMode::Off,
+            connection_error: None,
             canvas_preview: None,
             canvas_history: History::default(),
             canvas_revision: 1,
@@ -617,6 +621,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             persist_application_preference(state, REDUCED_MOTION_KEY, &value);
         }
         Message::OpenControls(controls) => {
+            state.cancel_connection();
             state.focused_terminal = None;
             state.focused_portal = None;
             state.controls = Some(controls);
@@ -1731,9 +1736,12 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         let canvas = canvas::view(
             state.camera,
             document,
-            state.canvas_selection.clone(),
-            state.focused_terminal,
-            state.focused_portal,
+            canvas::Interaction {
+                selection: state.canvas_selection.clone(),
+                focused_terminal: state.focused_terminal,
+                focused_portal: state.focused_portal,
+                connection_mode: state.connection_mode,
+            },
             [
                 CommandId::OpenPalette,
                 CommandId::FocusCanvas,
@@ -1797,11 +1805,12 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             add_node(Icon::Files, "Add file tree", context_nodes::Kind::FileTree),
             add_node(Icon::Text, "Add text", context_nodes::Kind::Text),
             labelled(
-                icons::control(Icon::Link).on_press_maybe(
-                    (state.canvas_selection.len() == 2)
-                        .then_some(Message::CanvasAction(CanvasAction::Connect)),
-                ),
-                "Connect two selected cards",
+                icons::control(Icon::Link)
+                    .style(shell::navigation_button(
+                        state.connection_mode != canvas::ConnectionMode::Off
+                    ))
+                    .on_press(Message::CanvasAction(CanvasAction::Connect)),
+                "Connect cards · choose a source and destination",
             ),
         ]
         .spacing(1)
@@ -1889,12 +1898,33 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                     .on_press(Message::OpenControls(Controls::Node)),
             );
         }
+        let connection_hint = (state.connection_mode != canvas::ConnectionMode::Off).then(|| {
+            container(
+                row![
+                    text(state.connection_error.as_deref().unwrap_or(
+                        match state.connection_mode {
+                            canvas::ConnectionMode::PickSource =>
+                                "Click or drag from a card to connect",
+                            _ => "Choose the destination card",
+                        }
+                    ))
+                    .size(12),
+                    button(text("Cancel · Esc").size(12))
+                        .on_press(Message::Canvas(canvas::Message::CancelConnection)),
+                ]
+                .spacing(10)
+                .align_y(IcedAlignment::Center),
+            )
+            .style(shell::floating_pill)
+            .padding([6, 10])
+        });
         let overlay = column![
             float_row(
                 rail_toggle,
                 tool_pill.into(),
                 iced::widget::Space::new().into()
             ),
+            container(column![connection_hint]).center_x(Fill),
             iced::widget::Space::new().width(Fill).height(Fill),
             container(node_actions).center_x(Fill),
             row![container(workspace_chip).width(Fill).clip(true), zoom_pill,]
@@ -2082,7 +2112,14 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
 }
 
 impl OpenPodium {
+    fn cancel_connection(&mut self) {
+        self.connection_mode = canvas::ConnectionMode::Off;
+        self.connection_error = None;
+        self.canvas_revision = self.canvas_revision.wrapping_add(1);
+    }
+
     fn reset_canvas_session(&mut self) {
+        self.cancel_connection();
         self.controls = None;
         self.focused_terminal = None;
         self.focused_portal = None;
@@ -3147,6 +3184,14 @@ fn delivery_target(
 
 fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Task<Message> {
     match message {
+        canvas::Message::ConnectionSourceSelected(source) => {
+            state.connection_mode = canvas::ConnectionMode::PickTarget(source);
+            state.connection_error = None;
+            state.canvas_selection = vec![source];
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        }
+        canvas::Message::ConnectNodes { source, target } => connect_nodes(state, source, target),
+        canvas::Message::CancelConnection => state.cancel_connection(),
         canvas::Message::CameraChanged(camera) => {
             state.camera = camera;
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
@@ -4922,6 +4967,27 @@ fn paste_canvas_fragment(state: &mut OpenPodium, payload: Option<&str>) {
 }
 
 fn apply_canvas_action(state: &mut OpenPodium, action: CanvasAction) {
+    if matches!(action, CanvasAction::Connect) {
+        if state.connection_mode != canvas::ConnectionMode::Off {
+            state.cancel_connection();
+            return;
+        }
+        state.controls = None;
+        state.focused_terminal = None;
+        state.focused_portal = None;
+        state.connection_error = None;
+        state.connection_mode = match state.canvas_selection.as_slice() {
+            [source] => canvas::ConnectionMode::PickTarget(*source),
+            [source, target] => {
+                let (source, target) = (*source, *target);
+                connect_nodes(state, source, target);
+                return;
+            }
+            _ => canvas::ConnectionMode::PickSource,
+        };
+        state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        return;
+    }
     if matches!(action, CanvasAction::Undo) {
         undo_canvas(state);
         return;
@@ -4953,16 +5019,11 @@ fn apply_canvas_action(state: &mut OpenPodium, action: CanvasAction) {
         }
         CanvasAction::Group => canvas::editor::group(&before, &selection, &all),
         CanvasAction::Ungroup => canvas::editor::ungroup(&before, &selection),
-        CanvasAction::Connect => match canvas::editor::connect(&before, &selection, &all) {
-            Ok(after) => after,
-            Err(error) => {
-                state.notice = Some(error.to_owned());
-                return;
-            }
-        },
         CanvasAction::Align(alignment) => canvas::editor::align(&before, &selection, alignment),
         CanvasAction::ZOrder(order) => canvas::editor::change_z_order(&before, &selection, order),
-        CanvasAction::Undo | CanvasAction::Redo => unreachable!("handled above"),
+        CanvasAction::Undo | CanvasAction::Redo | CanvasAction::Connect => {
+            unreachable!("handled above")
+        }
     };
     if before == after {
         return;
@@ -4971,6 +5032,35 @@ fn apply_canvas_action(state: &mut OpenPodium, action: CanvasAction) {
         state.canvas_history.record(before);
         state.canvas_selection = selection;
         state.notice = None;
+    }
+}
+
+fn connect_nodes(state: &mut OpenPodium, source: NodeId, target: NodeId) {
+    let Some(before) = current_canvas(state) else {
+        return;
+    };
+    state.connection_mode = canvas::ConnectionMode::PickTarget(source);
+    if source == target {
+        state.connection_error = Some("Choose a different card".to_owned());
+        return;
+    }
+    let all = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .map(Workspace::all_canvas_layout)
+        .unwrap_or_else(|| before.clone());
+    match canvas::editor::connect(&before, &[source, target], &all) {
+        Ok(after) => {
+            if persist_canvas(state, before.clone(), after).is_ok() {
+                state.canvas_history.record(before);
+                state.canvas_selection = vec![source, target];
+                state.cancel_connection();
+            } else {
+                state.connection_error = state.notice.take();
+            }
+        }
+        Err(error) => state.connection_error = Some(error.to_owned()),
     }
 }
 
@@ -5528,6 +5618,8 @@ mod tests {
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
+            connection_mode: canvas::ConnectionMode::Off,
+            connection_error: None,
             canvas_history: History::default(),
             canvas_revision: 1,
             terminals: BTreeMap::new(),
@@ -5874,6 +5966,109 @@ mod tests {
         assert!(
             matches!(node.content(), openpodium::domain::CanvasNodeContent::Text { markdown } if markdown.as_str().trim_end() == "Edited text")
         );
+    }
+
+    #[test]
+    fn connection_tool_creates_a_durable_link_with_undo_redo_and_duplicate_protection() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let mut workspaces = WorkspaceManager::open(&database).unwrap();
+        workspaces.create_workspace(temp.path(), now()).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+        let _ = context_nodes::add(&mut state, context_nodes::Kind::Note);
+        let source = state.canvas_selection[0];
+        let _ = context_nodes::add(&mut state, context_nodes::Kind::Note);
+        let target = state.canvas_selection[0];
+        state.canvas_selection = vec![source];
+        state.focused_terminal = Some(source);
+        apply_canvas_action(&mut state, CanvasAction::Connect);
+        assert_eq!(
+            state.connection_mode,
+            canvas::ConnectionMode::PickTarget(source)
+        );
+        assert!(state.controls.is_none());
+        assert!(state.focused_terminal.is_none());
+
+        let _ = handle_canvas_message(&mut state, canvas::Message::ConnectNodes { source, target });
+        assert_eq!(state.connection_mode, canvas::ConnectionMode::Off);
+        let layout = current_canvas(&state).unwrap();
+        assert_eq!(layout.connections().len(), 1);
+        assert_eq!(layout.connections()[0].source(), source);
+        assert_eq!(layout.connections()[0].target(), target);
+
+        undo_canvas(&mut state);
+        assert!(current_canvas(&state).unwrap().connections().is_empty());
+        redo_canvas(&mut state);
+        assert_eq!(current_canvas(&state).unwrap().connections().len(), 1);
+        connect_nodes(&mut state, source, target);
+        assert!(
+            state
+                .connection_error
+                .as_deref()
+                .unwrap()
+                .contains("already connected")
+        );
+        assert_eq!(current_canvas(&state).unwrap().connections().len(), 1);
+        connect_nodes(&mut state, source, source);
+        assert_eq!(
+            state.connection_error.as_deref(),
+            Some("Choose a different card")
+        );
+        assert_eq!(current_canvas(&state).unwrap().connections().len(), 1);
+        let restored = WorkspaceManager::open(database).unwrap();
+        assert_eq!(
+            restored
+                .active_workspace()
+                .unwrap()
+                .canvas_layout()
+                .connections(),
+            layout.connections()
+        );
+    }
+
+    #[test]
+    fn connection_tool_can_pick_a_source_and_cancel_without_changing_the_canvas() {
+        let temp = TempDir::new().unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        workspaces.create_workspace(temp.path(), now()).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+        let _ = context_nodes::add(&mut state, context_nodes::Kind::Note);
+        let source = state.canvas_selection[0];
+        state.canvas_selection.clear();
+        let before = current_canvas(&state).unwrap();
+        apply_canvas_action(&mut state, CanvasAction::Connect);
+        assert_eq!(state.connection_mode, canvas::ConnectionMode::PickSource);
+        let _ = handle_canvas_message(
+            &mut state,
+            canvas::Message::ConnectionSourceSelected(source),
+        );
+        assert_eq!(
+            state.connection_mode,
+            canvas::ConnectionMode::PickTarget(source)
+        );
+        let delete = state.command_registry.binding(CommandId::Delete).cloned();
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Other,
+            delete,
+            event::Status::Ignored,
+        );
+        assert_eq!(current_canvas(&state).unwrap(), before);
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Escape,
+            None,
+            event::Status::Ignored,
+        );
+        assert_eq!(state.connection_mode, canvas::ConnectionMode::Off);
+        assert_eq!(current_canvas(&state).unwrap(), before);
+        apply_canvas_action(&mut state, CanvasAction::Connect);
+        let _ = handle_canvas_message(&mut state, canvas::Message::CancelConnection);
+        assert_eq!(state.connection_mode, canvas::ConnectionMode::Off);
+        apply_canvas_action(&mut state, CanvasAction::Connect);
+        apply_canvas_action(&mut state, CanvasAction::Connect);
+        assert_eq!(state.connection_mode, canvas::ConnectionMode::Off);
+        assert_eq!(current_canvas(&state).unwrap(), before);
     }
 
     #[test]
@@ -6449,6 +6644,8 @@ mod tests {
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
+            connection_mode: canvas::ConnectionMode::Off,
+            connection_error: None,
             canvas_history: History::default(),
             canvas_revision: 1,
             terminals,

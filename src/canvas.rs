@@ -5,7 +5,7 @@ mod surface;
 
 pub(crate) use camera::Camera;
 pub(crate) use editor::{Alignment, History, ZOrder};
-pub(crate) use surface::{Message, view};
+pub(crate) use surface::{ConnectionMode, Interaction, Message, view};
 
 use std::collections::{BTreeMap, BTreeSet};
 

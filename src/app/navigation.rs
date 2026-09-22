@@ -110,6 +110,7 @@ pub(super) fn tick(state: &mut OpenPodium) -> Task<Message> {
 pub(super) fn update(state: &mut OpenPodium, message: navigation_panel::Message) -> Task<Message> {
     match message {
         navigation_panel::Message::Open => {
+            state.cancel_connection();
             state.controls = None;
             state.navigation_ui.open = true;
             state.navigation_ui.selected = 0;
@@ -210,6 +211,12 @@ pub(super) fn handle_key(
     shortcut: Option<Shortcut>,
     status: Status,
 ) -> Task<Message> {
+    if state.connection_mode != crate::canvas::ConnectionMode::Off
+        && matches!(navigation_key, NavigationKey::Escape)
+    {
+        state.cancel_connection();
+        return Task::none();
+    }
     if state.controls.is_some() {
         return match navigation_key {
             NavigationKey::Escape => {
@@ -261,6 +268,14 @@ pub(super) fn handle_key(
     let Some(command) = state.command_registry.command_for(&shortcut) else {
         return Task::none();
     };
+    if state.connection_mode != crate::canvas::ConnectionMode::Off
+        && !matches!(
+            command,
+            CommandId::OpenPalette | CommandId::ZoomIn | CommandId::ZoomOut | CommandId::ResetZoom
+        )
+    {
+        return Task::none();
+    }
     let embedded_content_focused =
         state.focused_terminal.is_some() || state.focused_portal.is_some();
     if status == Status::Captured

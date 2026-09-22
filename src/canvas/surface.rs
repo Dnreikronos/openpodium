@@ -22,11 +22,32 @@ const LINE_ZOOM_SENSITIVITY: f64 = 0.18 / LINE_SCROLL_PIXELS;
 const PIXEL_ZOOM_SENSITIVITY: f64 = 0.003;
 const RESIZE_HANDLE_PIXELS: f32 = 18.0;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ConnectionMode {
+    #[default]
+    Off,
+    PickSource,
+    PickTarget(NodeId),
+}
+
+pub(crate) struct Interaction {
+    pub selection: Vec<NodeId>,
+    pub focused_terminal: Option<NodeId>,
+    pub focused_portal: Option<NodeId>,
+    pub connection_mode: ConnectionMode,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
     CameraChanged(Camera),
     SelectionChanged(Vec<NodeId>),
     EditRequested(NodeId),
+    ConnectionSourceSelected(NodeId),
+    ConnectNodes {
+        source: NodeId,
+        target: NodeId,
+    },
+    CancelConnection,
     PreviewLayout(CanvasLayout),
     CommitLayout {
         before: CanvasLayout,
@@ -87,18 +108,17 @@ pub(crate) enum Message {
 pub(crate) fn view(
     camera: Camera,
     document: CanvasDocument,
-    selection: Vec<NodeId>,
-    focused_terminal: Option<NodeId>,
-    focused_portal: Option<NodeId>,
+    interaction: Interaction,
     application_shortcuts: Vec<Shortcut>,
     revision: u64,
 ) -> Element<'static, Message> {
     TerminalCanvas::element(Surface {
         camera,
         document,
-        selection,
-        focused_terminal,
-        focused_portal,
+        selection: interaction.selection,
+        focused_terminal: interaction.focused_terminal,
+        focused_portal: interaction.focused_portal,
+        connection_mode: interaction.connection_mode,
         application_shortcuts,
         revision,
     })
@@ -210,6 +230,7 @@ struct Surface {
     selection: Vec<NodeId>,
     focused_terminal: Option<NodeId>,
     focused_portal: Option<NodeId>,
+    connection_mode: ConnectionMode,
     application_shortcuts: Vec<Shortcut>,
     revision: u64,
 }
@@ -221,6 +242,8 @@ struct State {
     modifiers: Modifiers,
     rendered_revision: Cell<u64>,
     preedit: String,
+    connection_cursor: Option<Point>,
+    connection_press: Option<NodeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +296,58 @@ impl canvas::Program<Message> for Surface {
         cursor: mouse::Cursor,
     ) -> Option<Action<Message>> {
         match event {
+            canvas::Event::Mouse(mouse::Event::CursorMoved { position })
+                if self.connection_mode != ConnectionMode::Off =>
+            {
+                state.connection_cursor =
+                    Some(Point::new(position.x - bounds.x, position.y - bounds.y));
+                Some(Action::request_redraw())
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if self.connection_mode != ConnectionMode::Off =>
+            {
+                let position = cursor.position_in(bounds)?;
+                state.drag = None;
+                state.connection_cursor = Some(position);
+                let Some(node) = self.hit_node(position, bounds) else {
+                    return Some(Action::publish(Message::CancelConnection).and_capture());
+                };
+                state.connection_press = Some(node.id());
+                Some(
+                    Action::publish(match self.connection_mode {
+                        ConnectionMode::PickSource => Message::ConnectionSourceSelected(node.id()),
+                        ConnectionMode::PickTarget(source) if source != node.id() => {
+                            Message::ConnectNodes {
+                                source,
+                                target: node.id(),
+                            }
+                        }
+                        _ => return Some(Action::capture()),
+                    })
+                    .and_capture(),
+                )
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                if self.connection_mode != ConnectionMode::Off =>
+            {
+                let pressed = state.connection_press.take();
+                if let ConnectionMode::PickTarget(source) = self.connection_mode
+                    && pressed == Some(source)
+                    && let Some(target) = cursor
+                        .position_in(bounds)
+                        .and_then(|position| self.hit_node(position, bounds))
+                    && target.id() != source
+                {
+                    return Some(
+                        Action::publish(Message::ConnectNodes {
+                            source,
+                            target: target.id(),
+                        })
+                        .and_capture(),
+                    );
+                }
+                Some(Action::capture())
+            }
             canvas::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
                 None
@@ -426,7 +501,7 @@ impl canvas::Program<Message> for Surface {
         renderer: &Renderer,
         theme: &Theme,
         bounds: Rectangle,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         if state.rendered_revision.get() != self.revision {
             state.geometry.clear();
@@ -447,7 +522,26 @@ impl canvas::Program<Message> for Surface {
                 theme,
             );
         });
-        vec![geometry]
+        let mut layers = vec![geometry];
+        if let ConnectionMode::PickTarget(source) = self.connection_mode
+            && let Some(pointer) = cursor.position_in(bounds).or(state.connection_cursor)
+        {
+            let mut preview = canvas::Frame::new(renderer, bounds.size());
+            scene::draw_connection_preview(
+                &mut preview,
+                self.camera,
+                viewport,
+                &self.document,
+                scene::ConnectionPreview {
+                    source,
+                    pointer,
+                    target: self.hit_node(pointer, bounds).map(Node::id),
+                },
+                theme.extended_palette(),
+            );
+            layers.push(preview.into_geometry());
+        }
+        layers
     }
 
     fn mouse_interaction(
@@ -456,6 +550,9 @@ impl canvas::Program<Message> for Surface {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
+        if self.connection_mode != ConnectionMode::Off && cursor.is_over(bounds) {
+            return mouse::Interaction::Crosshair;
+        }
         if state.drag.is_some() {
             return mouse::Interaction::Grabbing;
         }
@@ -1027,6 +1124,7 @@ mod tests {
             selection: Vec::new(),
             focused_terminal: None,
             focused_portal: Some(node_id),
+            connection_mode: ConnectionMode::Off,
             application_shortcuts: Vec::new(),
             revision: 1,
         }
@@ -1060,6 +1158,7 @@ mod tests {
                 selection: vec![node_id],
                 focused_terminal: None,
                 focused_portal: None,
+                connection_mode: ConnectionMode::Off,
                 application_shortcuts: vec![],
                 revision: 1,
             };
@@ -1096,6 +1195,93 @@ mod tests {
                 bounds,
             );
             assert!(matches!(state.drag, Some(Drag::Resize { .. })));
+        }
+    }
+
+    #[test]
+    fn connection_gestures_pick_click_or_drag_between_cards_at_any_zoom() {
+        use iced::widget::canvas::Program;
+        let source = NodeId::new(1);
+        let target = NodeId::new(2);
+        let workspace = Workspace::new(WorkspaceId::new(1), Name::new("Test").unwrap());
+        let nodes = [(source, -350.0), (target, 50.0)]
+            .into_iter()
+            .map(|(id, x)| {
+                Node::with_content(
+                    id,
+                    CanvasNodeContent::Note {
+                        path: openpodium::domain::ProjectPath::new(format!("{id}.md")).unwrap(),
+                        title: Name::new("Note").unwrap(),
+                    },
+                    CanvasPoint::new(x, -100.0).unwrap(),
+                    CanvasSize::new(240.0, 180.0).unwrap(),
+                )
+            })
+            .collect();
+        let document = CanvasDocument::new(
+            &workspace,
+            CanvasLayout::new(nodes, vec![], vec![]),
+            BTreeMap::new(),
+            &Localizer::new(Locale::EnUs),
+        );
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1_200.0, 800.0));
+        let press = canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        for zoom in [0.5, 1.0, 2.0] {
+            let camera = Camera::default().zoom_centered(zoom);
+            let cursor = |x| {
+                let point = camera.world_to_screen(WorldPoint::new(x, -10.0), viewport(bounds));
+                mouse::Cursor::Available(Point::new(point.x as f32, point.y as f32))
+            };
+            let mut surface = Surface {
+                camera,
+                document: document.clone(),
+                selection: vec![],
+                focused_terminal: None,
+                focused_portal: None,
+                connection_mode: ConnectionMode::PickSource,
+                application_shortcuts: vec![],
+                revision: 1,
+            };
+            let mut state = State::default();
+            let action = surface
+                .update(&mut state, &press, bounds, cursor(-230.0))
+                .unwrap();
+            assert!(
+                matches!(action.into_inner().0, Some(Message::ConnectionSourceSelected(id)) if id == source)
+            );
+            surface.connection_mode = ConnectionMode::PickTarget(source);
+            let action = surface
+                .update(&mut state, &release, bounds, cursor(-230.0))
+                .unwrap();
+            assert!(action.into_inner().0.is_none());
+            let action = surface
+                .update(&mut state, &press, bounds, cursor(170.0))
+                .unwrap();
+            assert!(
+                matches!(action.into_inner().0, Some(Message::ConnectNodes { source: from, target: to }) if from == source && to == target)
+            );
+            assert!(state.drag.is_none());
+
+            let _ = surface.update(&mut state, &press, bounds, cursor(-230.0));
+            let action = surface
+                .update(&mut state, &release, bounds, cursor(170.0))
+                .unwrap();
+            assert!(
+                matches!(action.into_inner().0, Some(Message::ConnectNodes { source: from, target: to }) if from == source && to == target)
+            );
+            let action = surface
+                .update(
+                    &mut state,
+                    &press,
+                    bounds,
+                    mouse::Cursor::Available(Point::new(10.0, 10.0)),
+                )
+                .unwrap();
+            assert!(matches!(
+                action.into_inner().0,
+                Some(Message::CancelConnection)
+            ));
         }
     }
 
