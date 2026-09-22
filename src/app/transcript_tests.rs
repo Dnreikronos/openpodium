@@ -16,7 +16,14 @@ fn transcript_flush_retries_unchanged_output_after_a_storage_failure() {
     let connection = rusqlite::Connection::open(&database).unwrap();
     connection.execute_batch("CREATE TRIGGER reject_transcript BEFORE INSERT ON terminal_transcripts BEGIN SELECT RAISE(FAIL, 'test storage failure'); END;").unwrap();
     state.flush_terminal_transcripts();
-    assert!(state.terminals[&key].take_transcript().is_some());
+    assert!(
+        state
+            .terminals
+            .get_mut(&key)
+            .unwrap()
+            .take_transcript()
+            .is_some()
+    );
     assert!(
         state
             .workspaces
@@ -30,15 +37,26 @@ fn transcript_flush_retries_unchanged_output_after_a_storage_failure() {
         .execute_batch("DROP TRIGGER reject_transcript;")
         .unwrap();
     state.flush_terminal_transcripts();
-    assert!(state.terminals[&key].take_transcript().is_none());
-    assert_eq!(
+    assert!(
         state
-            .workspaces
-            .as_ref()
+            .terminals
+            .get_mut(&key)
             .unwrap()
-            .terminal_transcripts(workspace_id)
-            .unwrap(),
-        vec![(1, b"Retain this output".to_vec())]
+            .take_transcript()
+            .is_none()
+    );
+    let stored = state
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .terminal_transcripts(workspace_id)
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    let mut expected = state.terminals[&key].view();
+    expected.status = terminal::Status::Offline;
+    assert_eq!(
+        Session::restored(expected.size, 2, stored[0].1.clone()).view(),
+        expected
     );
 }
 

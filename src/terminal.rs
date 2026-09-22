@@ -12,6 +12,7 @@ use iced::keyboard::{Key, Modifiers, key::Named};
 use openpodium::localization::Localizer;
 
 pub(crate) mod session;
+mod snapshot;
 
 pub(crate) const CELL_WIDTH: f32 = 8.0;
 pub(crate) const CELL_HEIGHT: f32 = 16.0;

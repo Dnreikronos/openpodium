@@ -17,18 +17,12 @@ pub(crate) enum Action {
     Bell,
 }
 
-/// How much recent output a node keeps so it can reopen showing its screen.
-/// Bounded because a transcript is a display cache, not a log: the tail is the
-/// only part that still tells you where you were.
-const TRANSCRIPT_LIMIT: usize = 128 * 1024;
-
 pub(crate) struct Session {
     model: Model,
     status: Status,
     controller: Option<ProcessController>,
     stream: Option<ProcessStream>,
     generation: u64,
-    transcript: Vec<u8>,
     transcript_dirty: bool,
 }
 
@@ -40,7 +34,6 @@ impl Session {
             controller: None,
             stream: None,
             generation,
-            transcript: Vec::new(),
             transcript_dirty: false,
         }
     }
@@ -48,42 +41,26 @@ impl Session {
     /// Rebuilds a node's last screen from a stored transcript. The process is
     /// gone, so the session stays offline and only replays what it showed.
     pub(crate) fn restored(size: GridSize, generation: u64, transcript: Vec<u8>) -> Self {
-        let mut model = Model::new(size);
-        let _ = model.feed(&transcript);
+        let model = super::snapshot::restore(size, &transcript);
         Self {
             model,
             status: Status::Offline,
             controller: None,
             stream: None,
             generation,
-            transcript,
             transcript_dirty: false,
         }
     }
 
     /// The bytes worth storing, or `None` when nothing has changed since the
     /// successful store. Capturing does not acknowledge persistence.
-    pub(crate) fn take_transcript(&self) -> Option<&[u8]> {
-        self.transcript_dirty.then_some(self.transcript.as_slice())
+    pub(crate) fn take_transcript(&mut self) -> Option<Vec<u8>> {
+        self.transcript_dirty
+            .then(|| super::snapshot::capture(&mut self.model))
     }
 
     pub(crate) fn mark_transcript_persisted(&mut self) {
         self.transcript_dirty = false;
-    }
-
-    fn record(&mut self, bytes: &[u8]) {
-        self.transcript.extend_from_slice(bytes);
-        if self.transcript.len() > TRANSCRIPT_LIMIT {
-            // Keep the tail, and start it at a line boundary so the replay does
-            // not begin partway through an escape sequence.
-            let excess = self.transcript.len() - TRANSCRIPT_LIMIT;
-            let start = self.transcript[excess..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(excess, |offset| excess + offset + 1);
-            self.transcript.drain(..start);
-        }
-        self.transcript_dirty = true;
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -136,6 +113,7 @@ impl Session {
     }
 
     pub(crate) fn resize(&mut self, size: GridSize) -> Result<(), String> {
+        self.transcript_dirty |= self.model.size != size;
         self.model.resize(size);
         let Some(controller) = &self.controller else {
             return Ok(());
@@ -171,7 +149,7 @@ impl Session {
     pub(crate) fn handle_event(&mut self, event: ProcessEvent) -> Vec<Action> {
         match event {
             ProcessEvent::Output(bytes) => {
-                self.record(&bytes);
+                self.transcript_dirty = true;
                 self.model
                     .feed(&bytes)
                     .into_iter()
@@ -246,7 +224,7 @@ pub(crate) fn process_spec(
 
 #[cfg(test)]
 mod tests {
-    use super::{Session, TRANSCRIPT_LIMIT};
+    use super::Session;
     use crate::terminal::{GridSize, Status};
     use openpodium::runtime::ProcessEvent;
 
@@ -273,32 +251,27 @@ mod tests {
         assert!(session.take_transcript().is_none());
 
         session.handle_event(ProcessEvent::Output(b"first".to_vec()));
-        assert_eq!(session.take_transcript(), Some(b"first".as_slice()));
-        assert_eq!(session.take_transcript(), Some(b"first".as_slice()));
+        let first = session.take_transcript().unwrap();
+        assert_eq!(session.take_transcript(), Some(first.clone()));
         session.mark_transcript_persisted();
         assert!(session.take_transcript().is_none());
 
         session.handle_event(ProcessEvent::Output(b" second".to_vec()));
-        assert_eq!(session.take_transcript(), Some(b"first second".as_slice()));
+        assert_ne!(session.take_transcript(), Some(first));
     }
 
-    /// The buffer is bounded, and trimming starts at a line boundary so the
-    /// replay never begins partway through an escape sequence.
     #[test]
-    fn an_overlong_transcript_keeps_whole_lines_from_the_tail() {
+    fn large_output_preserves_early_styles_in_a_bounded_screen_snapshot() {
         let mut session = Session::starting(size(), 1);
-        let line = b"0123456789abcdef\n";
-        let repeats = TRANSCRIPT_LIMIT / line.len() + 8;
-        for _ in 0..repeats {
+        session.handle_event(ProcessEvent::Output(b"\x1b[31m".to_vec()));
+        let line = b"0123456789abcdef\r\n";
+        for _ in 0..10_000 {
             session.handle_event(ProcessEvent::Output(line.to_vec()));
         }
-
-        let transcript = session.take_transcript().unwrap();
-        assert!(transcript.len() <= TRANSCRIPT_LIMIT);
-        assert!(
-            transcript.starts_with(b"0123456789abcdef"),
-            "a trimmed transcript should resume at the start of a line"
-        );
-        assert!(transcript.ends_with(b"\n"));
+        let payload = session.take_transcript().unwrap();
+        assert!(payload.len() < 128 * 1024);
+        let mut expected = session.view();
+        expected.status = Status::Offline;
+        assert_eq!(Session::restored(size(), 2, payload).view(), expected);
     }
 }

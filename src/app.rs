@@ -2213,7 +2213,7 @@ impl OpenPodium {
             .filter_map(|(key, session)| {
                 session
                     .take_transcript()
-                    .map(|transcript| (*key, transcript.to_vec()))
+                    .map(|transcript| (*key, transcript))
             })
             .collect::<Vec<_>>();
         if pending.is_empty() {

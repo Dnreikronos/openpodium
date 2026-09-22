@@ -12,19 +12,20 @@ Switching workspaces detaches the terminal view while its workspace-keyed proces
 background. Removing a node, stopping a terminal, or closing the application cancels its process
 through the runtime boundary.
 
-Reopening replays a node's last screen. Each session keeps a bounded tail of
-the raw output it received, and that transcript is written to a side table on a
-slow cadence and again as the application closes. On load the bytes are fed to a
-fresh emulator, so a restored node shows the output it had, with its colours and
-layout, while reporting `offline`. The process is gone; nothing restarts until
-the user starts it.
+Reopening restores a node's last screen. On a slow cadence and again at shutdown,
+the session captures its active screen as a versioned, self-contained ANSI
+snapshot with the original grid dimensions. Resolved colors, cell styles,
+Unicode text, hyperlinks, title, visible cursor, and input-mode indicators
+survive without depending on earlier output. Captures do not alter the live
+selection or scroll position. Failed database writes remain dirty and retry.
 
-A transcript is a display cache, never domain truth. It is capped so only the
-tail survives, trimmed at a line boundary so a replay cannot begin partway
-through an escape sequence, dropped when its node no longer exists, and safe to
-delete at any time without losing anything the journal owns. Conversation
-history is unaffected by any of this: chat threads, messages, and drafts are
-journal-backed and restore on their own.
+The snapshot is a display cache bounded by screen dimensions, not output volume.
+It does not preserve off-screen scrollback, a hidden primary screen while an
+alternate screen is active, or an executable process checkpoint. Restored nodes
+report `offline`; nothing starts until the user explicitly reconnects. Older raw
+transcripts remain readable, though state already lost by old truncation cannot
+be recovered. Orphan cleanup checks every floor, not just the visible floor.
+Deleting this cache does not affect journal-backed conversations or workspaces.
 
 Shell nodes launch the user's login shell on Unix and `COMSPEC` on Windows. Codex and Claude nodes
 launch the `codex` and `claude` executables. Every child receives `TERM=xterm-256color`,
@@ -32,7 +33,7 @@ launch the `codex` and `claude` executables. Every child receives `TERM=xterm-25
 remain follow-up work; issue #9 custom environments are argv-based wrappers around these programs.
 
 The node header reports `offline`, `starting`, `running`, `exited`, `stopped`, or `failed`. Runtime
-handles and live emulator state are never serialized; only the bounded output transcript above is.
+handles and full live emulator state are never serialized; only the screen cache above is.
 
 ## Emulation and rendering
 
