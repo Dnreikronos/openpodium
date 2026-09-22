@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 
 use iced::widget::{column, row, text, text_editor};
 
-use super::ui::button;
-use super::ui::section_label;
+use super::ui::{button, primary_button};
 use iced::{Element, Fill, Task};
 use openpodium::context::{
     FilePreview, NoteBuffer, list_directory, preview_file, render_diff, resolve_project_path,
@@ -41,6 +40,7 @@ pub(super) struct UiState {
     bodies: BTreeMap<NodeId, String>,
     refresh_busy: bool,
     search_match: Option<usize>,
+    feedback: Option<String>,
 }
 
 impl Default for UiState {
@@ -54,6 +54,7 @@ impl Default for UiState {
             bodies: BTreeMap::new(),
             refresh_busy: false,
             search_match: None,
+            feedback: None,
         }
     }
 }
@@ -82,6 +83,7 @@ pub(super) fn selection_changed(state: &mut OpenPodium) {
         state.context_ui.note = None;
         state.context_ui.editor = text_editor::Content::new();
         state.context_ui.search_match = None;
+        state.context_ui.feedback = None;
         return;
     };
     match target {
@@ -93,14 +95,17 @@ pub(super) fn selection_changed(state: &mut OpenPodium) {
             if state.context_ui.note_key == Some(key) {
                 return;
             }
+            state.context_ui.note_key = Some(key);
+            state.context_ui.text_key = None;
+            state.context_ui.note = None;
+            state.context_ui.editor = text_editor::Content::new();
+            state.context_ui.feedback = None;
             match NoteBuffer::load(&checkout, path) {
                 Ok(note) => {
                     state.context_ui.editor = text_editor::Content::with_text(note.text());
-                    state.context_ui.note_key = Some(key);
-                    state.context_ui.text_key = None;
                     state.context_ui.note = Some(note);
                 }
-                Err(error) => state.notice = Some(error.to_string()),
+                Err(error) => state.context_ui.feedback = Some(error.to_string()),
             }
         }
         SelectedEditor::Text { key, text } => {
@@ -111,6 +116,7 @@ pub(super) fn selection_changed(state: &mut OpenPodium) {
             state.context_ui.note_key = None;
             state.context_ui.text_key = Some(key);
             state.context_ui.note = None;
+            state.context_ui.feedback = None;
         }
     }
 }
@@ -125,6 +131,29 @@ enum SelectedEditor {
         key: (WorkspaceId, NodeId),
         text: String,
     },
+}
+
+pub(super) fn open_editor(state: &mut OpenPodium) -> Task<Message> {
+    let editable = state.canvas_selection.len() == 1
+        && state
+            .workspaces
+            .as_ref()
+            .and_then(WorkspaceManager::active_workspace)
+            .and_then(|workspace| workspace.node(state.canvas_selection[0]))
+            .is_some_and(|node| {
+                matches!(
+                    node.content(),
+                    CanvasNodeContent::Note { .. } | CanvasNodeContent::Text { .. }
+                )
+            });
+    if !editable {
+        return Task::none();
+    }
+    selection_changed(state);
+    state.focused_terminal = None;
+    state.focused_portal = None;
+    state.controls = Some(super::Controls::Node);
+    iced::widget::operation::focus(EDITOR_ID)
 }
 
 #[derive(Clone)]
@@ -214,6 +243,9 @@ pub(super) fn scan_completed(state: &mut OpenPodium, result: Result<ScanResult, 
 }
 
 pub(super) fn edit_note(state: &mut OpenPodium, action: text_editor::Action) {
+    if action.is_edit() {
+        state.context_ui.feedback = None;
+    }
     state.context_ui.search_match = None;
     state.context_ui.editor.perform(action);
     if let Some(note) = state.context_ui.note.as_mut() {
@@ -235,7 +267,7 @@ pub(super) fn save_canvas_text(state: &mut OpenPodium) {
     let text = match CanvasText::new(state.context_ui.editor.text()) {
         Ok(text) => text,
         Err(error) => {
-            state.notice = Some(error.to_string());
+            state.context_ui.feedback = Some(error.to_string());
             return;
         }
     };
@@ -245,7 +277,7 @@ pub(super) fn save_canvas_text(state: &mut OpenPodium) {
         .and_then(|manager| manager.workspace(workspace_id))
         .map(Workspace::canvas_layout)
     else {
-        state.notice = Some("The text node workspace is unavailable".to_owned());
+        state.context_ui.feedback = Some("The text node workspace is unavailable".to_owned());
         return;
     };
     let nodes = before
@@ -273,12 +305,15 @@ pub(super) fn save_canvas_text(state: &mut OpenPodium) {
         before.connections().to_vec(),
     );
     if before == after {
-        state.notice = Some("Text is unchanged".to_owned());
+        state.context_ui.feedback = Some("No changes to save".to_owned());
         return;
     }
-    if super::persist_canvas(state, before.clone(), after).is_ok() {
-        state.canvas_history.record(before);
-        state.notice = Some("Text node saved".to_owned());
+    match super::persist_canvas(state, before.clone(), after) {
+        Ok(()) => {
+            state.canvas_history.record(before);
+            state.context_ui.feedback = Some("Saved".to_owned());
+        }
+        Err(()) => state.context_ui.feedback = state.notice.take(),
     }
 }
 
@@ -293,16 +328,16 @@ pub(super) fn save_note(state: &mut OpenPodium, overwrite: bool) {
         .and_then(|workspace| workspace.node_directory(node_id))
         .map(|directory| PathBuf::from(directory.as_str()))
     else {
-        state.notice = Some("The note checkout is unavailable".to_owned());
+        state.context_ui.feedback = Some("The note checkout is unavailable".to_owned());
         return;
     };
     let Some(note) = state.context_ui.note.as_mut() else {
         return;
     };
-    state.notice = Some(match note.save(&checkout, overwrite) {
-        Ok(()) => "Note saved".to_owned(),
-        Err(error) => error.to_string(),
-    });
+    state.context_ui.feedback = note
+        .save(&checkout, overwrite)
+        .err()
+        .map(|error| error.to_string());
 }
 
 pub(super) fn reload_note(state: &mut OpenPodium) {
@@ -316,7 +351,7 @@ pub(super) fn reload_note(state: &mut OpenPodium) {
         .and_then(|workspace| workspace.node_directory(node_id))
         .map(|directory| PathBuf::from(directory.as_str()))
     else {
-        state.notice = Some("The note checkout is unavailable".to_owned());
+        state.context_ui.feedback = Some("The note checkout is unavailable".to_owned());
         return;
     };
     let Some(note) = state.context_ui.note.as_mut() else {
@@ -325,51 +360,49 @@ pub(super) fn reload_note(state: &mut OpenPodium) {
     match note.reload_discarding_edits(&checkout) {
         Ok(()) => {
             state.context_ui.editor = text_editor::Content::with_text(note.text());
-            state.notice = Some("Note reloaded".to_owned());
+            state.context_ui.feedback = None;
         }
-        Err(error) => state.notice = Some(error.to_string()),
+        Err(error) => state.context_ui.feedback = Some(error.to_string()),
+    }
+}
+
+pub(super) fn editor_title(state: &UiState) -> Option<&'static str> {
+    if state.note_key.is_some() {
+        Some("Edit note")
+    } else if state.text_key.is_some() {
+        Some("Edit text")
+    } else {
+        None
     }
 }
 
 pub(super) fn note_panel(state: &UiState) -> Option<Element<'_, Message>> {
-    let Some(note) = state.note.as_ref() else {
-        return state.text_key.map(|_| {
-            column![
-                section_label("Editing text node"),
-                state
-                    .search_match
-                    .map(|offset| text(format!("Search match near character {offset}")).size(12)),
-                text_editor(&state.editor)
-                    .id(EDITOR_ID)
-                    .placeholder("Write Markdown…")
-                    .on_action(Message::EditNote)
-                    .height(180),
-                button("Save text node").on_press(Message::SaveCanvasText),
-            ]
-            .spacing(8)
-            .width(Fill)
-            .into()
-        });
-    };
+    editor_title(state)?;
+    let note = state.note.as_ref();
     let mut panel = column![
-        text(format!("Editing {}", note.path())).size(18),
+        text(note.map_or_else(|| "Markdown".to_owned(), |note| note.path().to_string()))
+            .size(12)
+            .style(super::shell::muted_text),
         state
             .search_match
             .map(|offset| text(format!("Search match near character {offset}")).size(12)),
-        text_editor(&state.editor)
-            .id(EDITOR_ID)
-            .placeholder("Write Markdown…")
-            .on_action(Message::EditNote)
-            .height(180),
-        row![
-            button("Save note").on_press(Message::SaveNote(false)),
-            text(if note.is_dirty() { "Unsaved" } else { "Saved" }),
-        ]
-        .spacing(8),
     ]
-    .spacing(8)
+    .spacing(12)
     .width(Fill);
-    if note.has_external_change() {
+    if note.is_some() || state.text_key.is_some() {
+        panel = panel.push(
+            text_editor(&state.editor)
+                .id(EDITOR_ID)
+                .placeholder("Write your note…")
+                .on_action(Message::EditNote)
+                .padding(12)
+                .height(240),
+        );
+    }
+    if let Some(feedback) = &state.feedback {
+        panel = panel.push(text(feedback).size(12));
+    }
+    if note.is_some_and(NoteBuffer::has_external_change) {
         panel = panel.push(text(
             "The file changed outside OpenPodium; local edits were kept.",
         ));
@@ -379,6 +412,29 @@ pub(super) fn note_panel(state: &UiState) -> Option<Element<'_, Message>> {
                 button("Overwrite external change").on_press(Message::SaveNote(true)),
             ]
             .spacing(8),
+        );
+    }
+    if note.is_some() || state.text_key.is_some() {
+        panel = panel.push(
+            row![
+                text(if note.is_some_and(NoteBuffer::is_dirty) {
+                    "Unsaved changes"
+                } else if note.is_some() {
+                    "Saved"
+                } else {
+                    ""
+                })
+                .size(12)
+                .style(super::shell::muted_text)
+                .width(Fill),
+                primary_button(text("Save").size(13)).on_press(if note.is_some() {
+                    Message::SaveNote(false)
+                } else {
+                    Message::SaveCanvasText
+                }),
+            ]
+            .align_y(iced::Alignment::Center)
+            .spacing(12),
         );
     }
     Some(panel.into())
@@ -570,6 +626,7 @@ pub(super) fn add(state: &mut OpenPodium, kind: Kind) -> Task<Message> {
             state.canvas_preview = None;
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
             state.notice = Some(format!("{} node added", label(kind)));
+            return open_editor(state);
         }
         Err(error) => state.notice = Some(error.to_string()),
     }
@@ -698,6 +755,45 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn editor_feedback_preserves_save_conflicts_without_background_notices() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        workspaces.create_workspace(temp.path(), now()).unwrap();
+        let mut state = crate::app::tests::test_state(workspaces, BTreeMap::new());
+        let _ = add(&mut state, Kind::Note);
+        let path = state.context_ui.note.as_ref().unwrap().path().clone();
+        state.notice = Some("Unrelated background Git error".to_owned());
+        edit_note(
+            &mut state,
+            text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        );
+        fs::write(temp.path().join(path.as_str()), "External edit").unwrap();
+
+        save_note(&mut state, false);
+        assert!(state.context_ui.feedback.is_some());
+        assert!(state.context_ui.note.as_ref().unwrap().is_dirty());
+        assert_eq!(editor_title(&state.context_ui), Some("Edit note"));
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Unrelated background Git error")
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join(path.as_str())).unwrap(),
+            "External edit"
+        );
+
+        save_note(&mut state, true);
+        assert!(state.context_ui.feedback.is_none());
+        assert!(!state.context_ui.note.as_ref().unwrap().is_dirty());
+        assert_eq!(
+            fs::read_to_string(temp.path().join(path.as_str()))
+                .unwrap()
+                .trim_end(),
+            "x"
+        );
+    }
 
     #[test]
     fn connected_notes_resolve_only_direct_note_neighbors() {

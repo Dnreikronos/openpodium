@@ -26,6 +26,7 @@ const RESIZE_HANDLE_PIXELS: f32 = 18.0;
 pub(crate) enum Message {
     CameraChanged(Camera),
     SelectionChanged(Vec<NodeId>),
+    EditRequested(NodeId),
     PreviewLayout(CanvasLayout),
     CommitLayout {
         before: CanvasLayout,
@@ -465,7 +466,9 @@ impl canvas::Program<Message> for Surface {
             || self.portal_point_at(position, bounds).is_some()
         {
             mouse::Interaction::Pointer
-        } else if self.terminal_cell_at(position, bounds).is_some() {
+        } else if self.terminal_cell_at(position, bounds).is_some()
+            || self.editable_body_at(position, bounds).is_some()
+        {
             mouse::Interaction::Text
         } else if self.hit_node(position, bounds).is_some() {
             mouse::Interaction::Grab
@@ -553,6 +556,12 @@ impl Surface {
             );
         }
         if let Some(node) = self.hit_node(position, bounds) {
+            if !state.modifiers.shift()
+                && let Some(node_id) = self.editable_body_at(position, bounds)
+            {
+                state.drag = None;
+                return Some(Action::publish(Message::EditRequested(node_id)).and_capture());
+            }
             if let Some((node_id, row, column, right_side)) =
                 self.terminal_cell_at(position, bounds)
             {
@@ -775,6 +784,25 @@ impl Surface {
                 point.y().min(f64::from(viewport.height() - 1)),
             ),
         ))
+    }
+
+    fn editable_body_at(&self, position: Point, bounds: Rectangle) -> Option<NodeId> {
+        let node = self.hit_node(position, bounds)?;
+        if !matches!(
+            node.content(),
+            CanvasNodeContent::Note { .. } | CanvasNodeContent::Text { .. }
+        ) {
+            return None;
+        }
+        let top_left = self.camera.world_to_screen(
+            WorldPoint::new(
+                f64::from(node.position().x()),
+                f64::from(node.position().y()),
+            ),
+            viewport(bounds),
+        );
+        let header = (HEADER_HEIGHT * self.camera.zoom() as f32).clamp(28.0, 60.0);
+        (position.y >= top_left.y as f32 + header).then_some(node.id())
     }
 
     fn hit_node(&self, position: Point, bounds: Rectangle) -> Option<&Node> {
@@ -1001,6 +1029,73 @@ mod tests {
             focused_portal: Some(node_id),
             application_shortcuts: Vec::new(),
             revision: 1,
+        }
+    }
+
+    #[test]
+    fn note_body_edits_while_header_shift_click_and_resize_keep_canvas_gestures() {
+        let node_id = NodeId::new(1);
+        let workspace = Workspace::new(WorkspaceId::new(1), Name::new("Test").unwrap());
+        let node = Node::with_content(
+            node_id,
+            CanvasNodeContent::Note {
+                path: openpodium::domain::ProjectPath::new("note.md").unwrap(),
+                title: Name::new("Note").unwrap(),
+            },
+            CanvasPoint::new(-180.0, -130.0).unwrap(),
+            CanvasSize::new(360.0, 260.0).unwrap(),
+        );
+        let document = CanvasDocument::new(
+            &workspace,
+            CanvasLayout::new(vec![node], vec![], vec![]),
+            BTreeMap::new(),
+            &Localizer::new(Locale::EnUs),
+        );
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1_000.0, 800.0));
+        for zoom in [0.5, 1.0, 2.0] {
+            let camera = Camera::default().zoom_centered(zoom);
+            let surface = Surface {
+                camera,
+                document: document.clone(),
+                selection: vec![node_id],
+                focused_terminal: None,
+                focused_portal: None,
+                application_shortcuts: vec![],
+                revision: 1,
+            };
+            let top = camera.world_to_screen(WorldPoint::new(-180.0, -130.0), viewport(bounds));
+            let header = Point::new(top.x as f32 + 30.0, top.y as f32 + 10.0);
+            let body = Point::new(500.0, 400.0);
+            let mut state = State::default();
+            let action = surface.begin_left_drag(&mut state, body, bounds).unwrap();
+            assert!(
+                matches!(action.into_inner().0, Some(Message::EditRequested(id)) if id == node_id)
+            );
+            assert!(state.drag.is_none());
+
+            let action = surface.begin_left_drag(&mut state, header, bounds).unwrap();
+            assert!(matches!(
+                action.into_inner().0,
+                Some(Message::SelectionChanged(_))
+            ));
+            assert!(matches!(state.drag, Some(Drag::Move { .. })));
+
+            state.modifiers = Modifiers::SHIFT;
+            let action = surface.begin_left_drag(&mut state, body, bounds).unwrap();
+            assert!(matches!(
+                action.into_inner().0,
+                Some(Message::SelectionChanged(_))
+            ));
+            assert!(matches!(state.drag, Some(Drag::Move { .. })));
+
+            state.modifiers = Modifiers::empty();
+            let corner = camera.world_to_screen(WorldPoint::new(180.0, 130.0), viewport(bounds));
+            let _ = surface.begin_left_drag(
+                &mut state,
+                Point::new(corner.x as f32, corner.y as f32),
+                bounds,
+            );
+            assert!(matches!(state.drag, Some(Drag::Resize { .. })));
         }
     }
 

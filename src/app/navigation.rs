@@ -486,8 +486,7 @@ fn focus_content(state: &mut OpenPodium) -> Task<Message> {
             state.timeline_ui.select_task(workspace_id, Some(task_id));
         }
         Some((_, CanvasNodeContent::Note { .. } | CanvasNodeContent::Text { .. })) => {
-            crate::app::context_nodes::selection_changed(state);
-            return iced::widget::operation::focus(crate::app::context_nodes::EDITOR_ID);
+            return crate::app::context_nodes::open_editor(state);
         }
         Some((_, _)) | None => {}
     }
@@ -570,7 +569,7 @@ pub(super) fn navigate_to_search_target(
         }
         Some(ContentTarget::Note { character_offset })
         | Some(ContentTarget::Text { character_offset }) => {
-            crate::app::context_nodes::selection_changed(state);
+            let _ = crate::app::context_nodes::open_editor(state);
             state.notice = Some(format!(
                 "Opened matching content near character {character_offset}"
             ));

@@ -621,7 +621,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             state.focused_portal = None;
             state.controls = Some(controls);
             if controls == Controls::Node {
-                context_nodes::selection_changed(state);
+                return context_nodes::open_editor(state);
             }
         }
         Message::CloseControls => state.controls = None,
@@ -1654,7 +1654,9 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
     {
         settings = settings.push(panel);
     }
-    if let Some(notice) = &state.notice {
+    let editing_note = state.controls == Some(Controls::Node)
+        && context_nodes::editor_title(&state.context_ui).is_some();
+    if !editing_note && let Some(notice) = &state.notice {
         settings = settings.push(
             container(text(notice).size(12))
                 .style(shell::section_card)
@@ -2033,7 +2035,13 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         let dialog = container(
             column![
                 row![
-                    text(controls.title()).size(18).width(Fill),
+                    text(if editing_note {
+                        context_nodes::editor_title(&state.context_ui).unwrap_or(controls.title())
+                    } else {
+                        controls.title()
+                    })
+                    .size(18)
+                    .width(Fill),
                     button(text("Close").size(12)).on_press(Message::CloseControls),
                 ]
                 .align_y(IcedAlignment::Center)
@@ -3149,6 +3157,11 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
             state.focused_portal = None;
             context_nodes::selection_changed(state);
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        }
+        canvas::Message::EditRequested(node_id) => {
+            state.canvas_selection = vec![node_id];
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            return context_nodes::open_editor(state);
         }
         canvas::Message::PreviewLayout(layout) => {
             state.canvas_preview = Some(layout);
@@ -5782,6 +5795,88 @@ mod tests {
     }
 
     #[test]
+    fn note_editing_opens_on_create_click_and_enter_and_saves_to_disk() {
+        let temp = TempDir::new().unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        workspaces.create_workspace(temp.path(), now()).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        let _ = update(
+            &mut state,
+            Message::AddContextNode(context_nodes::Kind::Note),
+        );
+        let node_id = state.canvas_selection[0];
+        assert_eq!(state.controls, Some(Controls::Node));
+        assert!(context_nodes::note_panel(&state.context_ui).is_some());
+        let _ = update(
+            &mut state,
+            Message::EditNote(text_editor::Action::Edit(text_editor::Edit::Paste(
+                std::sync::Arc::new("A writable note".to_owned()),
+            ))),
+        );
+        let _ = update(&mut state, Message::SaveNote(false));
+        let note_path = temp
+            .path()
+            .join(format!(".openpodium/notes/{}.md", node_id.get()));
+        assert_eq!(
+            fs::read_to_string(&note_path).unwrap().trim_end(),
+            "A writable note"
+        );
+
+        let _ = update(&mut state, Message::CloseControls);
+        let _ = handle_canvas_message(&mut state, canvas::Message::SelectionChanged(Vec::new()));
+        let _ = handle_canvas_message(&mut state, canvas::Message::EditRequested(node_id));
+        assert_eq!(state.controls, Some(Controls::Node));
+        assert_eq!(state.canvas_selection, vec![node_id]);
+        assert_eq!(
+            context_nodes::bodies(&state.context_ui)[&node_id].trim_end(),
+            "A writable note"
+        );
+
+        let _ = update(&mut state, Message::CloseControls);
+        let _ = update(&mut state, Message::ExecuteCommand(CommandId::FocusContent));
+        assert_eq!(state.controls, Some(Controls::Node));
+        assert!(context_nodes::note_panel(&state.context_ui).is_some());
+    }
+
+    #[test]
+    fn text_editing_opens_on_create_and_saves_to_the_canvas() {
+        let temp = TempDir::new().unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        workspaces.create_workspace(temp.path(), now()).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+        let _ = update(
+            &mut state,
+            Message::AddContextNode(context_nodes::Kind::Text),
+        );
+        let node_id = state.canvas_selection[0];
+        assert_eq!(state.controls, Some(Controls::Node));
+        assert!(context_nodes::note_panel(&state.context_ui).is_some());
+        let _ = update(
+            &mut state,
+            Message::EditNote(text_editor::Action::SelectAll),
+        );
+        let _ = update(
+            &mut state,
+            Message::EditNote(text_editor::Action::Edit(text_editor::Edit::Paste(
+                std::sync::Arc::new("Edited text".to_owned()),
+            ))),
+        );
+        let _ = update(&mut state, Message::SaveCanvasText);
+        let node = state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .active_workspace()
+            .unwrap()
+            .node(node_id)
+            .unwrap();
+        assert!(
+            matches!(node.content(), openpodium::domain::CanvasNodeContent::Text { markdown } if markdown.as_str().trim_end() == "Edited text")
+        );
+    }
+
+    #[test]
     fn chat_draft_is_journaled_and_restored() {
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("state.sqlite");
@@ -6337,7 +6432,7 @@ mod tests {
         assert_eq!(state.notice.as_deref(), Some("Workspace created"));
     }
 
-    fn test_state(
+    pub(super) fn test_state(
         workspaces: WorkspaceManager,
         terminals: BTreeMap<TerminalKey, Session>,
     ) -> OpenPodium {
