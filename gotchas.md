@@ -1,5 +1,12 @@
 # Gotchas
 
+- A bounded terminal cache must store a self-contained screen, not an arbitrary tail of escape sequences. A newline does not reset SGR or terminal modes. Acknowledge cache writes only after storage succeeds, and check all floors before treating a cache entry as orphaned.
+- A rendering budget must fail closed: omit excess visible fragments rather than fall back to painting a rectangle that includes occluded content.
+
+- When a UI change exists only in a new build, lead the handoff with that limitation. Do not imply the control is already visible in the running app; explain that switching builds requires a restart and confirm before interrupting active terminals.
+
+- Deleting an agent window must also remove its agent record, not merely hide it or adjust the sidebar count. Account for shared cards, saved conversations, task references, persistence, and undo before changing the deletion lifecycle.
+
 - A connection tool must expose a source-to-target gesture with visible preview and cancellation. Silently disabling it until two cards are selected makes it look broken; verify interactions against the reference video, not just the final connected appearance.
 
 - Close temporary QA app instances after verification and confirm only the user's existing instance remains. Do not leave duplicate OpenPodium windows running after a UI test.
