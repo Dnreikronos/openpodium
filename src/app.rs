@@ -1,3 +1,4 @@
+mod appearance;
 mod context_nodes;
 mod floors;
 mod icons;
@@ -24,8 +25,7 @@ use iced::widget::{
     button as iced_button, column, container, row, scrollable, stack, text, text_editor,
 };
 use iced::{
-    Alignment as IcedAlignment, Color, Element, Fill, Size, Subscription, Task, Theme, clipboard,
-    event, theme,
+    Alignment as IcedAlignment, Element, Fill, Size, Subscription, Task, clipboard, event, theme,
 };
 use openpodium::domain::{
     Agent, AgentId, AgentProgram, CanvasLayout, CanvasPoint, CanvasSize, ChatAttachmentId,
@@ -49,9 +49,7 @@ use openpodium::persistence::{
     import_role,
 };
 use openpodium::portal::{PortalAction, PortalFrame};
-use openpodium::presentation::{
-    HIGH_CONTRAST_KEY, PresentationPreferences, REDUCED_MOTION_KEY, TEXT_SCALE_KEY,
-};
+use openpodium::presentation::{PresentationPreferences, THEME_KEY, ThemePreference};
 use openpodium::routines::{
     MissedOccurrences, RoutineDispatch, RoutineScheduler, RunRequest, TriggerEvent, TriggerWatcher,
 };
@@ -136,6 +134,7 @@ struct PortableImportDraft {
 struct OpenPodium {
     localizer: Localizer,
     presentation: PresentationPreferences,
+    system_theme: theme::Mode,
     controls: Option<Controls>,
     sidebar_open: bool,
     window_size: Size,
@@ -271,6 +270,7 @@ impl Default for OpenPodium {
         let mut state = Self {
             localizer: Localizer::default(),
             presentation: PresentationPreferences::default(),
+            system_theme: theme::Mode::None,
             controls: None,
             sidebar_open: true,
             window_size: DEFAULT_WINDOW_SIZE,
@@ -359,10 +359,8 @@ enum Message {
     RemoveWorkspace(WorkspaceId),
     OrchestrationTick,
     Canvas(canvas::Message),
-    CycleTextScale,
-    CycleLocale,
-    ToggleHighContrast,
-    ToggleReducedMotion,
+    ThemeSelected(ThemePreference),
+    SystemThemeChanged(theme::Mode),
     OpenControls(Controls),
     CloseControls,
     TrackpadMagnified(f64),
@@ -530,43 +528,35 @@ impl Controls {
 
 pub(crate) fn run() -> iced::Result {
     trackpad::install();
-    iced::application(OpenPodium::default, update, view)
-        .title(APP_NAME)
-        .theme(|state: &OpenPodium| application_theme(state.presentation))
-        .scale_factor(|state: &OpenPodium| state.presentation.text_scale())
-        .window(iced::window::Settings {
-            size: DEFAULT_WINDOW_SIZE,
-            min_size: Some(Size::new(900.0, 620.0)),
-            ..iced::window::Settings::default()
-        })
-        .subscription(|_| {
-            Subscription::batch([
-                iced::time::every(Duration::from_millis(100)).map(|_| Message::OrchestrationTick),
-                navigation::subscription(),
-                iced::window::resize_events().map(|(_, size)| Message::WindowResized(size)),
-                trackpad::subscription().map(Message::TrackpadMagnified),
-            ])
-        })
-        .centered()
-        .run()
-}
-
-fn application_theme(preferences: PresentationPreferences) -> Theme {
-    if preferences.high_contrast() {
-        Theme::custom(
-            "OpenPodium high contrast",
-            theme::Palette {
-                background: Color::BLACK,
-                text: Color::WHITE,
-                primary: Color::from_rgb8(0, 255, 255),
-                success: Color::from_rgb8(0, 255, 0),
-                warning: Color::from_rgb8(255, 255, 0),
-                danger: Color::from_rgb8(255, 96, 96),
-            },
-        )
-    } else {
-        shell::theme()
-    }
+    iced::application(
+        || {
+            (
+                OpenPodium::default(),
+                iced::system::theme().map(Message::SystemThemeChanged),
+            )
+        },
+        update,
+        view,
+    )
+    .title(APP_NAME)
+    .theme(|state: &OpenPodium| appearance::theme(state.presentation, state.system_theme))
+    .scale_factor(|state: &OpenPodium| state.presentation.text_scale())
+    .window(iced::window::Settings {
+        size: DEFAULT_WINDOW_SIZE,
+        min_size: Some(Size::new(900.0, 620.0)),
+        ..iced::window::Settings::default()
+    })
+    .subscription(|_| {
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(100)).map(|_| Message::OrchestrationTick),
+            navigation::subscription(),
+            iced::window::resize_events().map(|(_, size)| Message::WindowResized(size)),
+            trackpad::subscription().map(Message::TrackpadMagnified),
+            iced::system::theme_changes().map(Message::SystemThemeChanged),
+        ])
+    })
+    .centered()
+    .run()
 }
 
 fn load_application_preferences(state: &mut OpenPodium) {
@@ -619,32 +609,16 @@ fn persist_application_preference(state: &mut OpenPodium, key: &str, value: &str
 
 fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
-        Message::CycleTextScale => {
-            let previous_scale = state.presentation.text_scale();
-            state.presentation.cycle_text_scale();
-            let ratio = previous_scale / state.presentation.text_scale();
-            state.window_size = Size::new(
-                state.window_size.width * ratio,
-                state.window_size.height * ratio,
-            );
-            let value = state.presentation.text_scale().to_string();
-            persist_application_preference(state, TEXT_SCALE_KEY, &value);
-        }
-        Message::CycleLocale => {
-            state.localizer.cycle_user_locale();
-            let value = state.localizer.locale().tag();
-            persist_application_preference(state, LOCALE_KEY, value);
-        }
-        Message::ToggleHighContrast => {
-            state.presentation.toggle_high_contrast();
+        Message::ThemeSelected(theme) => {
+            state.presentation.set_theme(theme);
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
-            let value = state.presentation.high_contrast().to_string();
-            persist_application_preference(state, HIGH_CONTRAST_KEY, &value);
+            persist_application_preference(state, THEME_KEY, theme.as_str());
         }
-        Message::ToggleReducedMotion => {
-            state.presentation.toggle_reduced_motion();
-            let value = state.presentation.reduced_motion().to_string();
-            persist_application_preference(state, REDUCED_MOTION_KEY, &value);
+        Message::SystemThemeChanged(theme) => {
+            state.system_theme = theme;
+            if state.presentation.theme() == ThemePreference::System {
+                state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            }
         }
         Message::OpenControls(controls) => {
             state.cancel_connection();
@@ -1082,73 +1056,12 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         }
     }
 
-    let enabled = |enabled| {
-        state
-            .localizer
-            .text(if enabled { "state-on" } else { "state-off" })
-    };
-    // Display preferences stay reachable but sit at footnote weight, so the
-    // rail never competes with the canvas for attention.
-    let preference = |label: String, message: Message| {
-        button(text(label).size(12))
-            .style(shell::utility_button)
-            .padding([5, 8])
-            .on_press(message)
-            .width(Fill)
-    };
-    let accessibility_controls = column![
-        rule(),
-        section_label(state.localizer.text("display-settings")),
-        row![
-            preference(
-                state
-                    .localizer
-                    .text(match state.localizer.locale() {
-                        Locale::EnUs | Locale::PseudoRtl => "locale-short-en",
-                        Locale::PtBr => "locale-short-pt",
-                    })
-                    .to_string(),
-                Message::CycleLocale,
-            ),
-            preference(
-                format!("{}%", state.presentation.text_scale_percent()),
-                Message::CycleTextScale,
-            ),
-        ]
-        .spacing(4),
-        row![
-            preference(
-                state
-                    .localizer
-                    .with_str(
-                        "contrast-short",
-                        "state",
-                        enabled(state.presentation.high_contrast()),
-                    )
-                    .to_string(),
-                Message::ToggleHighContrast,
-            ),
-            preference(
-                state
-                    .localizer
-                    .with_str(
-                        "motion-short",
-                        "state",
-                        enabled(state.presentation.reduced_motion()),
-                    )
-                    .to_string(),
-                Message::ToggleReducedMotion,
-            ),
-        ]
-        .spacing(4),
-    ]
-    .spacing(6);
     let sidebar = container(
         column![
             brand,
             search,
             scrollable(workspace_list).height(Fill),
-            accessibility_controls,
+            appearance::controls(state.presentation),
         ]
         .spacing(10)
         .height(Fill),
@@ -4962,6 +4875,7 @@ fn handle_terminal_event(
     generation: u64,
     event: Option<ProcessEvent>,
 ) -> Task<Message> {
+    let colors = appearance::terminal_colors(state.presentation, state.system_theme);
     let key = TerminalKey {
         workspace_id,
         node_id,
@@ -4975,7 +4889,7 @@ fn handle_terminal_event(
     };
     let continues = matches!(event, Some(ProcessEvent::Output(_)));
     let actions = match event {
-        Some(event) => session.handle_event(event),
+        Some(event) => session.handle_event(event, colors),
         None => {
             session.fail("the terminal event stream closed unexpectedly");
             Vec::new()
@@ -5769,6 +5683,7 @@ mod tests {
             maximised_node: None,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
+            system_theme: theme::Mode::None,
             controls: None,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
@@ -6747,52 +6662,57 @@ mod tests {
     }
 
     #[test]
-    fn changing_one_application_preference_does_not_freeze_system_defaults() {
+    fn theme_selection_persists_without_freezing_system_defaults() {
         let temp = TempDir::new().unwrap();
         let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
         let mut state = test_state(workspaces, BTreeMap::new());
 
-        let _ = update(&mut state, Message::CycleLocale);
-        assert_eq!(state.localizer.locale(), Locale::PtBr);
+        let previous_revision = state.canvas_revision;
+        let _ = update(&mut state, Message::ThemeSelected(ThemePreference::Dark));
+        assert_ne!(state.canvas_revision, previous_revision);
         assert_eq!(
             state.workspaces.as_ref().unwrap().preferences().unwrap(),
-            vec![(LOCALE_KEY.to_owned(), "pt-BR".to_owned())]
+            vec![(THEME_KEY.to_owned(), "dark".to_owned())]
         );
 
-        let previous_contrast = state.presentation.high_contrast();
-        let previous_canvas_revision = state.canvas_revision;
-        let _ = update(&mut state, Message::ToggleHighContrast);
-        assert_eq!(state.presentation.high_contrast(), !previous_contrast);
-        assert_ne!(state.canvas_revision, previous_canvas_revision);
-        assert_eq!(
-            state.workspaces.as_ref().unwrap().preferences().unwrap(),
-            vec![
-                (
-                    HIGH_CONTRAST_KEY.to_owned(),
-                    (!previous_contrast).to_string()
-                ),
-                (LOCALE_KEY.to_owned(), "pt-BR".to_owned()),
-            ]
+        let _ = update(&mut state, Message::SystemThemeChanged(theme::Mode::Light));
+        assert!(
+            appearance::theme(state.presentation, state.system_theme)
+                .extended_palette()
+                .is_dark
         );
+        let _ = update(&mut state, Message::ThemeSelected(ThemePreference::System));
+        assert!(
+            !appearance::theme(state.presentation, state.system_theme)
+                .extended_palette()
+                .is_dark
+        );
+        let previous_revision = state.canvas_revision;
+        let _ = update(&mut state, Message::SystemThemeChanged(theme::Mode::Dark));
+        assert_ne!(state.canvas_revision, previous_revision);
+        assert!(
+            appearance::theme(state.presentation, state.system_theme)
+                .extended_palette()
+                .is_dark
+        );
+        state.presentation.set_theme(ThemePreference::Light);
+        load_application_preferences(&mut state);
+        assert_eq!(state.presentation.theme(), ThemePreference::System);
     }
 
     #[test]
-    fn interface_scale_and_workspace_controls_preserve_canvas_geometry() {
+    fn theme_and_workspace_controls_preserve_canvas_geometry() {
         let temp = TempDir::new().unwrap();
         let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
         let mut state = test_state(workspaces, BTreeMap::new());
-        state
-            .presentation
-            .apply_stored([(TEXT_SCALE_KEY.to_owned(), "1".to_owned())]);
         let initial_viewport = canvas_viewport(&state);
         let _ = update(&mut state, Message::OpenControls(Controls::Workspace));
         assert_eq!(canvas_viewport(&state), initial_viewport);
 
-        for _ in 0..4 {
-            let _ = update(&mut state, Message::CycleTextScale);
+        for theme in ThemePreference::ALL {
+            let _ = update(&mut state, Message::ThemeSelected(theme));
+            assert_eq!(canvas_viewport(&state), initial_viewport);
         }
-        assert_eq!(state.presentation.text_scale_percent(), 200);
-        assert!((state.window_size.width - 640.0).abs() < 0.01);
         let with_controls = canvas_viewport(&state);
         assert!(with_controls.0 > 400.0);
         let _ = update(&mut state, Message::CloseControls);
@@ -6832,6 +6752,7 @@ mod tests {
             maximised_node: None,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
+            system_theme: theme::Mode::None,
             controls: None,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),

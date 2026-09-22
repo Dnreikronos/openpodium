@@ -1,9 +1,12 @@
 use std::fmt::Write;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use serde::{Deserialize, Serialize};
 
-use super::{CellView, CursorStyle, GridSize, Model, Status};
+use super::{CellView, CursorStyle, DefaultColor, GridSize, Model, Status};
 
 const PREFIX: &[u8] = b"\0OPENPODIUM_SCREEN_V1\n";
 const HISTORY_BYTES: usize = 256 * 1024;
@@ -15,6 +18,8 @@ struct Screen {
     ansi: String,
     #[serde(default)]
     history: Vec<String>,
+    #[serde(default)]
+    semantic_colors: bool,
 }
 
 /// Capture the active screen and a bounded tail of complete scrollback rows.
@@ -67,6 +72,7 @@ pub(super) fn capture(model: &mut Model) -> Vec<u8> {
         rows: view.size.rows,
         ansi,
         history,
+        semantic_colors: true,
     };
     let mut bytes = PREFIX.to_vec();
     bytes.extend(serde_json::to_vec(&screen).expect("screen contains only strings and integers"));
@@ -82,19 +88,40 @@ fn paint_cells(ansi: &mut String, cells: &[CellView], absolute_rows: bool) {
             write!(ansi, "\x1b[{}G", cell.column + 1).unwrap();
         }
         if previous.is_none_or(|previous| !same_style(previous, cell)) {
-            let foreground = cell.foreground;
-            let background = cell.background;
-            write!(
-                ansi,
-                "\x1b[0;38;2;{};{};{};48;2;{};{};{}m",
-                foreground.red,
-                foreground.green,
-                foreground.blue,
-                background.red,
-                background.green,
-                background.blue
-            )
-            .unwrap();
+            let inverse = matches!(
+                cell.foreground.default_role,
+                Some(DefaultColor::Background | DefaultColor::DimBackground)
+            ) || matches!(
+                cell.background.default_role,
+                Some(DefaultColor::Foreground | DefaultColor::DimForeground)
+            );
+            let (foreground, background) = if inverse {
+                (cell.background, cell.foreground)
+            } else {
+                (cell.foreground, cell.background)
+            };
+            ansi.push_str("\x1b[0m");
+            if inverse {
+                ansi.push_str("\x1b[7m");
+            }
+            if matches!(
+                cell.foreground.default_role,
+                Some(DefaultColor::DimForeground | DefaultColor::DimBackground)
+            ) {
+                ansi.push_str("\x1b[2m");
+            }
+            for (color, channel, default) in [(foreground, 38, 39), (background, 48, 49)] {
+                if color.default_role.is_some() {
+                    write!(ansi, "\x1b[{default}m").unwrap();
+                } else {
+                    write!(
+                        ansi,
+                        "\x1b[{channel};2;{};{};{}m",
+                        color.red, color.green, color.blue
+                    )
+                    .unwrap();
+                }
+            }
             for (enabled, code) in [
                 (cell.bold, 1),
                 (cell.italic, 3),
@@ -179,8 +206,57 @@ pub(super) fn restore(size: GridSize, bytes: &[u8]) -> Model {
         }
     }
     let _ = model.feed(screen.ansi.as_bytes());
+    if !screen.semantic_colors {
+        migrate_legacy_colors(&mut model);
+    }
     model.resize(size);
     model
+}
+
+fn migrate_legacy_colors(model: &mut Model) {
+    let grid = model.term.grid_mut();
+    for row in grid.topmost_line().0..grid.screen_lines() as i32 {
+        for column in 0..grid.columns() {
+            let cell = &mut grid[Point::new(Line(row), Column(column))];
+            // The old encoder flattened defaults (and inverse/dim styles) into RGB.
+            cell.fg = match cell.fg {
+                Color::Spec(Rgb {
+                    r: 26,
+                    g: 28,
+                    b: 31,
+                }) => {
+                    cell.flags.insert(Flags::DIM);
+                    Color::Named(NamedColor::Foreground)
+                }
+                Color::Spec(Rgb {
+                    r: 170,
+                    g: 170,
+                    b: 170,
+                }) => {
+                    cell.flags.insert(Flags::DIM);
+                    Color::Named(NamedColor::Background)
+                }
+                color => legacy_default(color),
+            };
+            cell.bg = legacy_default(cell.bg);
+        }
+    }
+}
+
+fn legacy_default(color: Color) -> Color {
+    match color {
+        Color::Spec(Rgb {
+            r: 39,
+            g: 42,
+            b: 47,
+        }) => Color::Named(NamedColor::Foreground),
+        Color::Spec(Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        }) => Color::Named(NamedColor::Background),
+        color => color,
+    }
 }
 
 fn same_style(left: &CellView, right: &CellView) -> bool {
@@ -203,6 +279,82 @@ fn safe_osc(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_snapshots_recover_default_colors_in_screen_and_history() {
+        let size = GridSize {
+            columns: 20,
+            rows: 4,
+        };
+        let json = serde_json::json!({
+            "columns": size.columns,
+            "rows": size.rows,
+            "history": ["\u{1b}[0;38;2;39;42;47;48;2;255;255;255mhistory\u{1b}[0m\r\n"],
+            "ansi": "\u{1b}[1;1H\u{1b}[0;38;2;39;42;47;48;2;255;255;255mA\u{1b}[0;38;2;255;255;255;48;2;39;42;47mB\u{1b}[0;38;2;26;28;31;48;2;255;255;255mC\u{1b}[0;38;2;170;170;170;48;2;39;42;47mD\u{1b}[0;38;2;12;34;56;48;2;65;43;21mE"
+        });
+        let mut payload = PREFIX.to_vec();
+        payload.extend(serde_json::to_vec(&json).unwrap());
+        let mut model = restore(size, &payload);
+        let view = model.view(Status::Offline);
+        for (cell, foreground, background) in [
+            ('A', DefaultColor::Foreground, DefaultColor::Background),
+            ('B', DefaultColor::Background, DefaultColor::Foreground),
+            ('C', DefaultColor::DimForeground, DefaultColor::Background),
+            ('D', DefaultColor::DimBackground, DefaultColor::Foreground),
+        ] {
+            let cell = view
+                .cells
+                .iter()
+                .find(|value| value.text == cell.to_string())
+                .unwrap();
+            assert_eq!(cell.foreground.default_role, Some(foreground));
+            assert_eq!(cell.background.default_role, Some(background));
+        }
+        let colored = view.cells.iter().find(|cell| cell.text == "E").unwrap();
+        assert_eq!(colored.foreground.default_role, None);
+        assert_eq!(colored.foreground.red, 12);
+        assert_eq!(colored.background.default_role, None);
+        assert_eq!(colored.background.red, 65);
+        let saved = capture(&mut model);
+        assert_eq!(restore(size, &saved).view(Status::Offline), view);
+        model.scroll(1);
+        let history = model.view(Status::Offline);
+        let first = &history.cells[0];
+        assert_eq!(first.text, "h");
+        assert_eq!(
+            first.foreground.default_role,
+            Some(DefaultColor::Foreground)
+        );
+        assert_eq!(
+            first.background.default_role,
+            Some(DefaultColor::Background)
+        );
+    }
+
+    #[test]
+    fn raw_output_keeps_explicit_colors_matching_legacy_defaults() {
+        let size = GridSize {
+            columns: 20,
+            rows: 4,
+        };
+        let model = restore(size, b"\x1b[38;2;39;42;47;48;2;255;255;255mA");
+        let cell = &model.view(Status::Offline).cells[0];
+        assert_eq!(cell.foreground.default_role, None);
+        assert_eq!(cell.background.default_role, None);
+    }
+
+    #[test]
+    fn snapshot_retains_theme_defaults_explicit_colors_and_dim_inverse_styles() {
+        let size = GridSize {
+            columns: 30,
+            rows: 4,
+        };
+        let mut model = Model::new(size);
+        model.feed(b"plain \x1b[2mdim\x1b[0;7minverse\x1b[2m dim\x1b[0;38;2;39;42;47;48;2;255;255;255m rgb");
+        let expected = model.view(Status::Offline);
+        let payload = capture(&mut model);
+        assert_eq!(restore(size, &payload).view(Status::Offline), expected);
+    }
 
     #[test]
     fn restored_terminal_can_scroll_back_to_earlier_output() {

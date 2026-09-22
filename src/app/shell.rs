@@ -38,7 +38,15 @@ fn hairline(theme: &Theme) -> Color {
 /// rather than a theme.
 pub(crate) fn hairline_color(palette: &palette::Extended) -> Color {
     if palette.is_dark {
-        palette.background.base.text.scale_alpha(0.7)
+        palette
+            .background
+            .base
+            .text
+            .scale_alpha(if palette.background.base.color == Color::BLACK {
+                0.7
+            } else {
+                0.14
+            })
     } else {
         Color::from_rgb8(222, 225, 229)
     }

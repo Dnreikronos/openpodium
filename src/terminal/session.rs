@@ -8,7 +8,7 @@ use openpodium::runtime::{
 };
 use tokio::sync::Mutex;
 
-use super::{GridSize, InputMode, Model, Status, Update, View, encode_paste};
+use super::{DefaultColors, GridSize, InputMode, Model, Status, Update, View, encode_paste};
 
 pub(crate) type ProcessStream = Arc<Mutex<RunningProcess>>;
 
@@ -155,12 +155,16 @@ impl Session {
         self.model.selected_text()
     }
 
-    pub(crate) fn handle_event(&mut self, event: ProcessEvent) -> Vec<Action> {
+    pub(crate) fn handle_event(
+        &mut self,
+        event: ProcessEvent,
+        colors: DefaultColors,
+    ) -> Vec<Action> {
         match event {
             ProcessEvent::Output(bytes) => {
                 self.transcript_dirty = true;
                 self.model
-                    .feed(&bytes)
+                    .feed_with_colors(&bytes, colors)
                     .into_iter()
                     .filter_map(|update| match update {
                         Update::PtyWrite(bytes) => {
@@ -269,7 +273,10 @@ mod tests {
     #[test]
     fn offline_mouse_reporting_uses_local_scrollback() {
         let mut session = Session::starting(size(), 1);
-        session.handle_event(ProcessEvent::Output(b"\x1b[?1000hhello".to_vec()));
+        session.handle_event(
+            ProcessEvent::Output(b"\x1b[?1000hhello".to_vec()),
+            Default::default(),
+        );
         let payload = session.take_transcript().unwrap();
         let restored = Session::restored(size(), 2, payload);
         assert!(!restored.view().mode.mouse_reporting);
@@ -280,23 +287,29 @@ mod tests {
         let mut session = Session::starting(size(), 1);
         assert!(session.take_transcript().is_none());
 
-        session.handle_event(ProcessEvent::Output(b"first".to_vec()));
+        session.handle_event(ProcessEvent::Output(b"first".to_vec()), Default::default());
         let first = session.take_transcript().unwrap();
         assert_eq!(session.take_transcript(), Some(first.clone()));
         session.mark_transcript_persisted();
         assert!(session.take_transcript().is_none());
 
-        session.handle_event(ProcessEvent::Output(b" second".to_vec()));
+        session.handle_event(
+            ProcessEvent::Output(b" second".to_vec()),
+            Default::default(),
+        );
         assert_ne!(session.take_transcript(), Some(first));
     }
 
     #[test]
     fn large_output_preserves_early_styles_in_a_bounded_screen_snapshot() {
         let mut session = Session::starting(size(), 1);
-        session.handle_event(ProcessEvent::Output(b"\x1b[31m".to_vec()));
+        session.handle_event(
+            ProcessEvent::Output(b"\x1b[31m".to_vec()),
+            Default::default(),
+        );
         let line = b"0123456789abcdef\r\n";
         for _ in 0..10_000 {
-            session.handle_event(ProcessEvent::Output(line.to_vec()));
+            session.handle_event(ProcessEvent::Output(line.to_vec()), Default::default());
         }
         let payload = session.take_transcript().unwrap();
         assert!(payload.len() < 1024 * 1024);
