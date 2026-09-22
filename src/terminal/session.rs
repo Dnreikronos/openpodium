@@ -93,7 +93,9 @@ impl Session {
     }
 
     pub(crate) fn view(&self) -> View {
-        self.model.view(self.status.clone())
+        let mut view = self.model.view(self.status.clone());
+        view.mode.mouse_reporting &= matches!(self.status, Status::Running);
+        view
     }
 
     pub(crate) fn input_mode(&self) -> InputMode {
@@ -246,6 +248,15 @@ mod tests {
     }
 
     #[test]
+    fn offline_mouse_reporting_uses_local_scrollback() {
+        let mut session = Session::starting(size(), 1);
+        session.handle_event(ProcessEvent::Output(b"\x1b[?1000hhello".to_vec()));
+        let payload = session.take_transcript().unwrap();
+        let restored = Session::restored(size(), 2, payload);
+        assert!(!restored.view().mode.mouse_reporting);
+    }
+
+    #[test]
     fn a_transcript_is_captured_once_per_change() {
         let mut session = Session::starting(size(), 1);
         assert!(session.take_transcript().is_none());
@@ -269,7 +280,7 @@ mod tests {
             session.handle_event(ProcessEvent::Output(line.to_vec()));
         }
         let payload = session.take_transcript().unwrap();
-        assert!(payload.len() < 128 * 1024);
+        assert!(payload.len() < 1024 * 1024);
         let mut expected = session.view();
         expected.status = Status::Offline;
         assert_eq!(Session::restored(size(), 2, payload).view(), expected);

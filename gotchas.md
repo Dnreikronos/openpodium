@@ -1,5 +1,9 @@
 # Gotchas
 
+- Scroll routing tests are not enough: verify visible history before and after a restart. A restored screen-only cache has no older lines to scroll, and offline terminals must not forward wheel events to a dead process.
+
+- Trackpad scrolling over agent windows must go to the terminal without a modifier. Capture fractional and horizontal-only deltas too, accumulate small vertical movements, and test event routing so they never fall through to board panning.
+
 - A bounded terminal cache must store a self-contained screen, not an arbitrary tail of escape sequences. A newline does not reset SGR or terminal modes. Acknowledge cache writes only after storage succeeds, and check all floors before treating a cache entry as orphaned.
 - A rendering budget must fail closed: omit excess visible fragments rather than fall back to painting a rectangle that includes occluded content.
 
