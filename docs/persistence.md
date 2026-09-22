@@ -45,6 +45,14 @@ SQLite-consistent sibling backup before migrations run. Each migration and its
 `user_version` update commit together, and errors report the source and target
 versions plus the backup path when one was created.
 
+Not every table is domain truth. `terminal_transcripts` caches each terminal's
+active screen as a versioned replayable snapshot, including grid dimensions,
+styles, cursor and mode indicators. Legacy raw-output payloads remain readable.
+The cache is keyed by workspace and node, written on a slow cadence, and may be
+deleted without affecting domain recovery. Failed writes retry on the next
+capture; cleanup considers nodes on every floor. The journal remains the only
+source the workspace is rebuilt from.
+
 New and migrated databases use WAL mode, foreign keys, and a busy timeout.
 Tests use temporary on-disk databases so close/reopen recovery, WAL behaviour,
 rollback after an interrupted write, corrupt payload handling, backups, and

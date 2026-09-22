@@ -162,6 +162,10 @@ impl Agent {
     pub(super) const fn set_role_id(&mut self, role_id: Option<RoleId>) {
         self.role_id = role_id;
     }
+
+    pub(super) fn set_name(&mut self, name: Name) {
+        self.name = name;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

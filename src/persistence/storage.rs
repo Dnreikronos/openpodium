@@ -14,7 +14,7 @@ use super::codec::{
     encode_event, encode_workspace,
 };
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MIGRATION_0_TO_1: &str = "
@@ -86,6 +86,19 @@ const MIGRATION_3_TO_4: &str = "
 CREATE TABLE application_preferences (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+) STRICT;
+";
+
+/// Terminal transcripts are a display cache, not domain truth: they let a node
+/// reopen showing the output it had, and they can be dropped at any time
+/// without losing anything the journal is responsible for.
+const MIGRATION_4_TO_5: &str = "
+CREATE TABLE terminal_transcripts (
+    workspace_id TEXT NOT NULL,
+    node_id      INTEGER NOT NULL,
+    captured_at  TEXT NOT NULL,
+    payload      BLOB NOT NULL,
+    PRIMARY KEY (workspace_id, node_id)
 ) STRICT;
 ";
 
@@ -292,6 +305,88 @@ impl Journal {
         Ok(workspace_ids)
     }
 
+    pub fn recorded_workspace_ids(&self) -> Result<Vec<WorkspaceId>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT workspace_id FROM journal_events")
+            .map_err(|source| PersistenceError::database("prepare recorded workspaces", source))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|source| PersistenceError::database("query recorded workspaces", source))?;
+        rows.map(|row| {
+            let value = row
+                .map_err(|source| PersistenceError::database("read recorded workspace", source))?;
+            parse_workspace_id(&value, "journal events")
+        })
+        .collect()
+    }
+
+    /// Remove open-list membership while retaining the recoverable journal.
+    pub fn remove_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<WorkspaceId>, PersistenceError> {
+        let key = workspace_id.get().to_string();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| PersistenceError::database("begin workspace removal", source))?;
+        transaction.execute(
+            "UPDATE application_state SET active_workspace_id = (SELECT workspace_id FROM workspace_registry WHERE workspace_id != ?1 ORDER BY length(last_opened_at) DESC, last_opened_at DESC, workspace_id LIMIT 1) WHERE singleton = 1 AND active_workspace_id = ?1", [&key],
+        ).map_err(|source| PersistenceError::database("select remaining workspace", source))?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM workspace_registry WHERE workspace_id = ?1",
+                [&key],
+            )
+            .map_err(|source| {
+                PersistenceError::database("remove workspace registration", source)
+            })?;
+        if removed == 0 {
+            return Err(PersistenceError::UnknownWorkspace { workspace_id });
+        }
+        let next: Option<String> = transaction
+            .query_row(
+                "SELECT active_workspace_id FROM application_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| PersistenceError::database("read remaining workspace", source))?;
+        let next = next
+            .map(|id| parse_workspace_id(&id, "active workspace"))
+            .transpose()?;
+        transaction
+            .commit()
+            .map_err(|source| PersistenceError::database("commit workspace removal", source))?;
+        Ok(next)
+    }
+
+    pub fn restore_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        opened_at: Timestamp,
+    ) -> Result<(), PersistenceError> {
+        if self.recover(workspace_id)?.is_none() {
+            return Err(PersistenceError::UnknownWorkspace { workspace_id });
+        }
+        let key = workspace_id.get().to_string();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| PersistenceError::database("begin workspace restoration", source))?;
+        transaction.execute("INSERT INTO workspace_registry (workspace_id, last_opened_at) VALUES (?1, ?2) ON CONFLICT (workspace_id) DO UPDATE SET last_opened_at = excluded.last_opened_at", params![key, opened_at.as_unix_millis().to_string()])
+            .map_err(|source| PersistenceError::database("restore workspace registration", source))?;
+        transaction
+            .execute(
+                "UPDATE application_state SET active_workspace_id = ?1 WHERE singleton = 1",
+                [&key],
+            )
+            .map_err(|source| PersistenceError::database("activate restored workspace", source))?;
+        transaction
+            .commit()
+            .map_err(|source| PersistenceError::database("commit workspace restoration", source))
+    }
+
     pub fn active_workspace_id(&self) -> Result<Option<WorkspaceId>, PersistenceError> {
         let value = self
             .connection
@@ -364,6 +459,79 @@ impl Journal {
                 params![key, value],
             )
             .map_err(|source| PersistenceError::database("store preference", source))?;
+        Ok(())
+    }
+
+    /// Every stored terminal transcript for a workspace, keyed by node.
+    pub fn terminal_transcripts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<(u64, Vec<u8>)>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT node_id, payload
+                 FROM terminal_transcripts
+                 WHERE workspace_id = ?1
+                 ORDER BY node_id",
+            )
+            .map_err(|source| PersistenceError::database("prepare terminal transcripts", source))?;
+        let rows = statement
+            .query_map(params![workspace_id.get().to_string()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|source| PersistenceError::database("query terminal transcripts", source))?;
+        rows.map(|row| {
+            row.map(|(node_id, payload)| (node_id.unsigned_abs(), payload))
+                .map_err(|source| PersistenceError::database("read terminal transcripts", source))
+        })
+        .collect()
+    }
+
+    /// Records what a terminal had on screen so its node can reopen showing it.
+    /// An empty transcript removes the row rather than storing nothing.
+    pub fn store_terminal_transcript(
+        &mut self,
+        workspace_id: WorkspaceId,
+        node_id: u64,
+        captured_at: Timestamp,
+        payload: &[u8],
+    ) -> Result<(), PersistenceError> {
+        let workspace_key = workspace_id.get().to_string();
+        let node_key = i64::try_from(node_id).unwrap_or(i64::MAX);
+        if payload.is_empty() {
+            return self.clear_terminal_transcript(workspace_id, node_id);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO terminal_transcripts (workspace_id, node_id, captured_at, payload)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (workspace_id, node_id) DO UPDATE SET
+                     captured_at = excluded.captured_at,
+                     payload = excluded.payload",
+                params![
+                    workspace_key,
+                    node_key,
+                    captured_at.as_unix_millis().to_string(),
+                    payload
+                ],
+            )
+            .map_err(|source| PersistenceError::database("store terminal transcript", source))?;
+        Ok(())
+    }
+
+    pub fn clear_terminal_transcript(
+        &mut self,
+        workspace_id: WorkspaceId,
+        node_id: u64,
+    ) -> Result<(), PersistenceError> {
+        let node_key = i64::try_from(node_id).unwrap_or(i64::MAX);
+        self.connection
+            .execute(
+                "DELETE FROM terminal_transcripts WHERE workspace_id = ?1 AND node_id = ?2",
+                params![workspace_id.get().to_string(), node_key],
+            )
+            .map_err(|source| PersistenceError::database("clear terminal transcript", source))?;
         Ok(())
     }
 
@@ -735,6 +903,11 @@ fn migrate(connection: &mut Connection, path: &Path, from: u32) -> Result<(), Pe
                     .execute_batch(MIGRATION_3_TO_4)
                     .map_err(|source| {
                         PersistenceError::database("apply schema version 4", source)
+                    })?,
+                4 => transaction
+                    .execute_batch(MIGRATION_4_TO_5)
+                    .map_err(|source| {
+                        PersistenceError::database("apply schema version 5", source)
                     })?,
                 _ => {
                     return Err(PersistenceError::Configuration {

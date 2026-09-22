@@ -5,8 +5,11 @@
 
 use std::collections::BTreeMap;
 
-use iced::Element;
-use iced::widget::{button, column, row, text, text_input};
+use iced::widget::{column, row, text};
+use iced::{Alignment, Element, Fill};
+
+use crate::app::shell;
+use crate::app::ui::{action_grid, button, section_label, text_input};
 use openpodium::domain::{
     AgentId, Routine, RoutineApprovalDecision, RoutineId, RoutineInputKey, RoutineRun,
     RoutineRunId, RoutineStepId, RoutineStepRun, RoutineStepState, RoutineTriggerId, Timestamp,
@@ -108,33 +111,37 @@ impl UiState {
 }
 
 pub fn panel<'a>(workspace: &'a Workspace, state: &'a UiState) -> Element<'a, Message> {
-    let mut content = column![text("Routines").size(24)].spacing(8);
+    let mut content = column![section_label("Routines")].spacing(8);
 
-    let mut selector = row![
-        button(if state.selected_routine.is_none() {
-            "✓ New routine"
-        } else {
-            "New routine"
-        })
-        .on_press(Message::SelectRoutine(None)),
+    let mut selector = column![
+        button(text("New routine").size(12))
+            .padding([6, 9])
+            .style(shell::navigation_button(state.selected_routine.is_none()))
+            .width(Fill)
+            .on_press(Message::SelectRoutine(None)),
     ]
-    .spacing(6);
+    .spacing(2);
     for routine in workspace.routines() {
-        let label = format!(
-            "{} · v{}",
-            routine.name(),
-            routine.latest_version().number()
-        );
         selector = selector.push(
-            button(text(if state.selected_routine == Some(routine.id()) {
-                format!("✓ {label}")
-            } else {
-                label
-            }))
+            button(
+                row![
+                    text(routine.name().to_string()).size(12).width(Fill),
+                    text(format!("v{}", routine.latest_version().number()))
+                        .size(11)
+                        .style(shell::muted_text),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 9])
+            .style(shell::navigation_button(
+                state.selected_routine == Some(routine.id()),
+            ))
+            .width(Fill)
             .on_press(Message::SelectRoutine(Some(routine.id()))),
         );
     }
-    content = content.push(selector.wrap());
+    content = content.push(selector);
 
     content = content.push(editor(workspace, state));
 
@@ -152,12 +159,11 @@ pub fn panel<'a>(workspace: &'a Workspace, state: &'a UiState) -> Element<'a, Me
 fn editor<'a>(workspace: &'a Workspace, state: &'a UiState) -> Element<'a, Message> {
     let saving_existing = state.selected_routine.is_some();
     let mut editor = column![
-        text(if saving_existing {
+        section_label(if saving_existing {
             "Edit routine (saves a new version)"
         } else {
             "New routine"
-        })
-        .size(18),
+        }),
         text_input("Routine name", &state.name).on_input(Message::EditName),
         row![
             text_input("Step name", &state.step_name).on_input(Message::EditStepName),
@@ -169,27 +175,33 @@ fn editor<'a>(workspace: &'a Workspace, state: &'a UiState) -> Element<'a, Messa
             &state.step_prompt
         )
         .on_input(Message::EditStepPrompt),
-        row![
-            button("Add step").on_press(Message::AddStep),
-            button(if state.capture_canvas {
-                "✓ Rebuild canvas selection per run"
-            } else {
-                "Rebuild canvas selection per run"
-            })
+        button(text("Rebuild canvas selection per run").size(12))
+            .padding([6, 9])
+            .style(shell::navigation_button(state.capture_canvas))
+            .width(Fill)
             .on_press(Message::ToggleCanvasTemplate),
-            button(if saving_existing {
-                "Save new version"
-            } else {
-                "Save routine"
-            })
-            .on_press(Message::SaveRoutine),
-        ]
-        .spacing(6),
+        action_grid([
+            button(text("Add step").size(12))
+                .padding([6, 10])
+                .on_press(Message::AddStep)
+                .into(),
+            button(
+                text(if saving_existing {
+                    "Save version"
+                } else {
+                    "Save routine"
+                })
+                .size(12),
+            )
+            .padding([6, 10])
+            .on_press(Message::SaveRoutine)
+            .into(),
+        ]),
     ]
     .spacing(6);
 
     if !state.pending_steps.is_empty() {
-        editor = editor.push(text("Unsaved steps").size(14));
+        editor = editor.push(section_label("Unsaved steps"));
         for (index, step) in state.pending_steps.iter().enumerate() {
             editor = editor.push(text(format!(
                 "{}. {} → agent {} · {}",
@@ -205,7 +217,7 @@ fn editor<'a>(workspace: &'a Workspace, state: &'a UiState) -> Element<'a, Messa
     }
 
     if let Some(routine) = state.selected_routine.and_then(|id| workspace.routine(id)) {
-        editor = editor.push(text("Saved steps").size(14));
+        editor = editor.push(section_label("Saved steps"));
         for step in routine.latest_version().steps() {
             let approval = if step.approval() == openpodium::domain::RoutineApproval::Required {
                 " · approval required"
@@ -227,7 +239,7 @@ fn inputs_section<'a>(routine: &'a Routine, state: &'a UiState) -> Element<'a, M
     if declarations.is_empty() {
         return column![].into();
     }
-    let mut section = column![text("Inputs").size(18)].spacing(6);
+    let mut section = column![section_label("Inputs")].spacing(6);
     for declaration in declarations {
         let key = declaration.key().as_str().to_owned();
         let current = state.inputs.get(&key).cloned().unwrap_or_default();
@@ -252,7 +264,7 @@ fn inputs_section<'a>(routine: &'a Routine, state: &'a UiState) -> Element<'a, M
 
 fn triggers_section(routine: &Routine) -> Element<'_, Message> {
     let mut section = column![
-        text("Triggers").size(18),
+        section_label("Triggers"),
         text("Triggers only fire while OpenPodium is open. Occurrences that pass while it is closed are skipped and counted.")
             .size(12),
     ]
@@ -312,7 +324,7 @@ fn format_timezone_offset(offset_minutes: i32) -> String {
 }
 
 fn runs_section<'a>(workspace: &'a Workspace, state: &'a UiState) -> Element<'a, Message> {
-    let mut section = column![text("Runs").size(18)].spacing(6);
+    let mut section = column![section_label("Runs")].spacing(6);
     let runs: Vec<&RoutineRun> = workspace
         .routine_runs()
         .filter(|run| {
@@ -353,7 +365,7 @@ fn runs_section<'a>(workspace: &'a Workspace, state: &'a UiState) -> Element<'a,
             section = section.push(step_row(workspace, run, step));
         }
         if !run.pin().revisions().is_empty() {
-            section = section.push(text("Pinned revisions").size(14));
+            section = section.push(section_label("Pinned revisions"));
             for (checkout, revision) in run.pin().revisions() {
                 let short: String = revision.chars().take(12).collect();
                 section = section.push(text(format!("{checkout} @ {short}")).size(12));

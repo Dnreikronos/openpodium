@@ -97,6 +97,57 @@ fn workspace_metadata_and_active_selection_survive_restart() {
 }
 
 #[test]
+fn workspace_order_stays_stable_across_selection_and_restart() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("state.sqlite");
+    let mut manager = WorkspaceManager::open(&database).unwrap();
+    let mut expected = Vec::new();
+
+    for (index, name) in ["zebra", "alpha", "middle"].into_iter().enumerate() {
+        let directory = temp.path().join(name);
+        fs::create_dir(&directory).unwrap();
+        let id = manager
+            .create_workspace(&directory, timestamp(index as u64 + 1))
+            .unwrap();
+        expected.push(id);
+        assert_eq!(
+            manager
+                .ordered_workspaces()
+                .map(|workspace| workspace.id())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    for (index, id) in [expected[0], expected[2], expected[1], expected[1]]
+        .into_iter()
+        .enumerate()
+    {
+        manager.switch(id, timestamp(index as u64 + 4)).unwrap();
+        assert_eq!(manager.active_workspace_id(), Some(id));
+        assert_eq!(
+            manager
+                .ordered_workspaces()
+                .map(|workspace| workspace.id())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(manager.recent_workspaces().next().unwrap().id(), id);
+    }
+
+    drop(manager);
+    let manager = WorkspaceManager::open(&database).unwrap();
+    assert_eq!(manager.active_workspace_id(), Some(expected[1]));
+    assert_eq!(
+        manager
+            .ordered_workspaces()
+            .map(|workspace| workspace.id())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
 fn switching_workspaces_preserves_running_agents() {
     let temp = TempDir::new().unwrap();
     let first_directory = temp.path().join("first");

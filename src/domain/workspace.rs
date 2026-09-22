@@ -64,6 +64,7 @@ pub struct Workspace {
     command_presets: BTreeMap<CommandPresetId, CommandPreset>,
     roles: BTreeMap<RoleId, Role>,
     agents: BTreeMap<AgentId, Agent>,
+    archived_agents: BTreeMap<AgentId, Agent>,
     chat_threads: BTreeMap<ChatThreadId, ChatThread>,
     chat_attachments: BTreeMap<ChatAttachmentId, ChatAttachment>,
     tasks: BTreeMap<TaskId, Task>,
@@ -85,6 +86,7 @@ impl Workspace {
             command_presets: BTreeMap::new(),
             roles: BTreeMap::new(),
             agents: BTreeMap::new(),
+            archived_agents: BTreeMap::new(),
             chat_threads: BTreeMap::new(),
             chat_attachments: BTreeMap::new(),
             tasks: BTreeMap::new(),
@@ -135,6 +137,55 @@ impl Workspace {
 
     pub fn agents(&self) -> impl Iterator<Item = &Agent> {
         self.agents.values()
+    }
+
+    /// Includes historical identities so deleted agents' IDs are never reused.
+    pub fn recorded_agents(&self) -> impl Iterator<Item = &Agent> {
+        self.agents.values().chain(self.archived_agents.values())
+    }
+
+    pub fn recorded_agent(&self, id: AgentId) -> Option<&Agent> {
+        self.agents
+            .get(&id)
+            .or_else(|| self.archived_agents.get(&id))
+    }
+
+    pub(crate) fn archived_agents(&self) -> impl Iterator<Item = &Agent> {
+        self.archived_agents.values()
+    }
+
+    pub(crate) fn archive_unplaced_agents(
+        &mut self,
+        candidates: impl IntoIterator<Item = AgentId>,
+    ) {
+        for id in candidates {
+            if self
+                .nodes
+                .values()
+                .any(|node| node.reference() == Some(NodeTarget::Agent(id)))
+            {
+                continue;
+            }
+            if let Some(agent) = self.agents.remove(&id) {
+                self.archived_agents.insert(id, agent);
+            }
+        }
+    }
+
+    fn restore_placed_agents(&mut self) {
+        let placed: Vec<_> = self
+            .nodes
+            .values()
+            .filter_map(|node| match node.reference() {
+                Some(NodeTarget::Agent(id)) => Some(id),
+                _ => None,
+            })
+            .collect();
+        for id in placed {
+            if let Some(agent) = self.archived_agents.remove(&id) {
+                self.agents.insert(id, agent);
+            }
+        }
     }
 
     pub fn chat_threads(&self) -> impl Iterator<Item = &ChatThread> {
@@ -400,6 +451,17 @@ impl Workspace {
                     }
                 }
                 DomainCommand::AddAgent(agent) => DomainEvent::AgentAdded(agent),
+                DomainCommand::RenameAgent { agent_id, name } => {
+                    let agent = self
+                        .agents
+                        .get(&agent_id)
+                        .ok_or(DomainError::EntityNotFound(EntityRef::Agent(agent_id)))?;
+                    DomainEvent::AgentRenamed {
+                        agent_id,
+                        from: agent.name().clone(),
+                        to: name,
+                    }
+                }
                 DomainCommand::AddChatThread(thread) => DomainEvent::ChatThreadAdded(thread),
                 DomainCommand::UpdateChatThread {
                     thread_id,
@@ -661,7 +723,7 @@ impl Workspace {
                 for floor in after.entries.values() {
                     if let Some(owner) = floor.owner {
                         let exists = match owner {
-                            FloorOwner::Agent(id) => self.agents.contains_key(&id),
+                            FloorOwner::Agent(id) => self.recorded_agent(id).is_some(),
                             FloorOwner::Task(id) => self.tasks.contains_key(&id),
                         };
                         if !exists {
@@ -699,8 +761,7 @@ impl Workspace {
                     return Err(DomainError::EnvironmentProfileConflict(profile.id()));
                 }
                 if let Some(agent) = self
-                    .agents
-                    .values()
+                    .recorded_agents()
                     .find(|agent| agent.environment_id() == Some(profile.id()))
                 {
                     return Err(DomainError::EnvironmentProfileInUse {
@@ -737,8 +798,7 @@ impl Workspace {
                     return Err(DomainError::CommandPresetConflict(preset.id()));
                 }
                 if let Some(agent) = self
-                    .agents
-                    .values()
+                    .recorded_agents()
                     .find(|agent| agent.program() == super::AgentProgram::Custom(preset.id()))
                 {
                     return Err(DomainError::CommandPresetInUse {
@@ -771,8 +831,7 @@ impl Workspace {
                     return Err(DomainError::RoleConflict(role.id()));
                 }
                 if let Some(agent) = self
-                    .agents
-                    .values()
+                    .recorded_agents()
                     .find(|agent| agent.role_id() == Some(role.id()))
                 {
                     return Err(DomainError::RoleInUse {
@@ -786,6 +845,7 @@ impl Workspace {
                 let agent = self
                     .agents
                     .get(agent_id)
+                    .or_else(|| self.archived_agents.get(agent_id))
                     .ok_or(DomainError::EntityNotFound(EntityRef::Agent(*agent_id)))?;
                 if agent.role_id() != *from {
                     return Err(DomainError::AgentRoleConflict {
@@ -803,6 +863,7 @@ impl Workspace {
                 }
                 self.agents
                     .get_mut(agent_id)
+                    .or_else(|| self.archived_agents.get_mut(agent_id))
                     .expect("agent existence was checked before mutation")
                     .set_role_id(*to);
             }
@@ -830,6 +891,17 @@ impl Workspace {
                     )?;
                 }
                 self.agents.insert(agent.id(), agent.clone());
+            }
+            DomainEvent::AgentRenamed { agent_id, from, to } => {
+                let agent = self
+                    .agents
+                    .get_mut(agent_id)
+                    .or_else(|| self.archived_agents.get_mut(agent_id))
+                    .ok_or(DomainError::EntityNotFound(EntityRef::Agent(*agent_id)))?;
+                if agent.name() != from {
+                    return Err(DomainError::AgentNameConflict(*agent_id));
+                }
+                agent.set_name(to.clone());
             }
             DomainEvent::ChatThreadAdded(thread) => {
                 self.ensure_absent(EntityRef::ChatThread(thread.id()))?;
@@ -1073,6 +1145,7 @@ impl Workspace {
                 if let Some(floor) = self.floors.active {
                     self.floors.node_floors.insert(node.id(), floor);
                 }
+                self.restore_placed_agents();
             }
             DomainEvent::AgentNodeAdded { agent, node } => {
                 self.ensure_absent(EntityRef::Agent(agent.id()))?;
@@ -1172,11 +1245,19 @@ impl Workspace {
                         self.floors.node_floors.insert(node.id(), floor);
                     }
                 }
+                self.archive_unplaced_agents(before.nodes().iter().filter_map(|node| {
+                    match node.reference() {
+                        Some(NodeTarget::Agent(id)) => Some(id),
+                        _ => None,
+                    }
+                }));
+                self.restore_placed_agents();
             }
             DomainEvent::AgentStateChanged { agent_id, from, to } => {
                 let agent = self
                     .agents
                     .get(agent_id)
+                    .or_else(|| self.archived_agents.get(agent_id))
                     .ok_or(DomainError::EntityNotFound(EntityRef::Agent(*agent_id)))?;
                 if agent.state() != *from {
                     return Err(DomainError::AgentStateConflict {
@@ -1194,6 +1275,7 @@ impl Workspace {
                 }
                 self.agents
                     .get_mut(agent_id)
+                    .or_else(|| self.archived_agents.get_mut(agent_id))
                     .expect("agent existence was checked before mutation")
                     .set_state(*to);
             }
@@ -1691,7 +1773,7 @@ impl Workspace {
             EntityRef::EnvironmentProfile(id) => self.environment_profiles.contains_key(&id),
             EntityRef::CommandPreset(id) => self.command_presets.contains_key(&id),
             EntityRef::Role(id) => self.roles.contains_key(&id),
-            EntityRef::Agent(id) => self.agents.contains_key(&id),
+            EntityRef::Agent(id) => self.recorded_agent(id).is_some(),
             EntityRef::ChatThread(id) => self.chat_threads.contains_key(&id),
             EntityRef::ChatMessage(id) => self
                 .chat_threads

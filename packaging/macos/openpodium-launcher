@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+openpodium_bundle_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${SHELL:-/bin/zsh}" -l -c '
+    export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+    exec "$@"
+' openpodium "$openpodium_bundle_dir/openpodium" "$@"

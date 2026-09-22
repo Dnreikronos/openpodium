@@ -30,6 +30,18 @@ track or ignore these ordinary Markdown files as they prefer.
 
 ## Notes and external changes
 
+Click a note or text node's body to open its editor with keyboard focus, or
+select its title bar and press Enter. The title bar remains a drag handle;
+Shift-click remains multi-selection and the resize grip remains available.
+Creating a note or text node opens its initialized editor immediately. Save
+uses the existing explicit save action and external-change protection; the
+canvas preview is not a separate editable copy of the file.
+
+The editor dialog uses a compact, content-sized layout with a quiet file path,
+a clear save action, and note-specific feedback. Background Git status errors
+do not appear in the note editor. All clicks inside the dialog stay inside it;
+only Close, Escape, or a click outside its bounds dismisses the dialog.
+
 A note node stores its project path and display title. Its Markdown body lives
 only in the referenced file so there is one source of truth for agents and the
 UI. Local agents receive the resolved note paths for directly connected notes

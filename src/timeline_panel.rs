@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
-use iced::Element;
-use iced::widget::{button, column, row, text};
+use iced::widget::{column, row, text};
+use iced::{Alignment, Element, Fill};
 use openpodium::domain::{TaskId, Workspace, WorkspaceId};
-use openpodium::timeline::{
-    AttentionLevel, RecoveryAction, TimelineItem, attention_counts, task_summaries,
-};
+use openpodium::timeline::{RecoveryAction, task_summaries};
+
+use crate::app::shell;
+use crate::app::ui::{action_grid, button, count_badge, section};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -36,94 +37,60 @@ impl UiState {
     }
 }
 
-pub fn panel<'a>(
-    workspace: &'a Workspace,
-    items: &'a [TimelineItem],
-    state: &'a UiState,
-) -> Element<'a, Message> {
-    let workspace_id = workspace.id();
-    let selected_task = state.selected_task(workspace_id);
-    let counts = attention_counts(workspace);
-    let mut content = column![
-        text("Orchestration").size(24),
-        text(format!(
-            "{} blocked · {} failed",
-            counts.blocked, counts.failed
-        )),
-        button(if selected_task.is_none() {
-            "✓ All events"
-        } else {
-            "All events"
-        })
-        .on_press(Message::Filter(None)),
-        text("Agents").size(18),
-    ]
-    .spacing(8);
-    for agent in workspace.agents() {
-        content = content.push(text(format!("{} · {}", agent.name(), agent.state())));
+pub fn panel<'a>(workspace: &'a Workspace, state: &'a UiState) -> Element<'a, Message> {
+    let selected_task = state.selected_task(workspace.id());
+    let mut content = column![].spacing(8);
+    if selected_task.is_some() {
+        content =
+            content.push(button(text("Clear selection").size(12)).on_press(Message::Filter(None)));
     }
-    content = content.push(text("Tasks").size(18));
-
     for task in task_summaries(workspace) {
-        let marker = if task.needs_attention() { "! " } else { "" };
-        let label = format!("{marker}{} · {}", task.title(), task.state());
-        let mut task_row = row![
-            button(text(if selected_task == Some(task.id()) {
-                format!("✓ {label}")
-            } else {
-                label
-            }))
-            .on_press(Message::Filter(Some(task.id()))),
+        let selected = selected_task == Some(task.id());
+        let mut heading = row![
+            text(task.title().to_string()).size(12).width(Fill),
+            text(task.state().to_string())
+                .size(11)
+                .style(shell::muted_text),
         ]
-        .spacing(6);
-        for action in task.actions() {
-            let message = match action {
-                RecoveryAction::Inspect => Message::Inspect(task.id()),
-                RecoveryAction::Retry | RecoveryAction::Cancel | RecoveryAction::Resume => {
-                    Message::Recover {
-                        task_id: task.id(),
-                        action,
+        .spacing(6)
+        .align_y(Alignment::Center);
+        if task.needs_attention() {
+            heading = heading.push(count_badge(1, true));
+        }
+        let actions = task.actions();
+        content = content.push(
+            button(heading)
+                .padding([6, 9])
+                .style(shell::navigation_button(selected))
+                .width(Fill)
+                .on_press(Message::Filter(Some(task.id()))),
+        );
+        if selected && !actions.is_empty() {
+            content = content.push(action_grid(actions.into_iter().map(|action| {
+                let message = match action {
+                    RecoveryAction::Inspect => Message::Inspect(task.id()),
+                    RecoveryAction::Retry | RecoveryAction::Cancel | RecoveryAction::Resume => {
+                        Message::Recover {
+                            task_id: task.id(),
+                            action,
+                        }
                     }
-                }
-            };
-            task_row = task_row.push(button(action_label(action)).on_press(message));
+                };
+                button(text(action_label(action)).size(12))
+                    .padding([6, 10])
+                    .on_press(message)
+                    .into()
+            })));
         }
-        content = content.push(task_row.wrap());
     }
-
-    content = content.push(text("Timeline").size(18));
-    let mut visible = 0_usize;
-    for item in items
-        .iter()
-        .filter(|item| selected_task.is_none_or(|task_id| item.task_id() == Some(task_id)))
-    {
-        visible += 1;
-        let attention = match item.attention() {
-            AttentionLevel::Urgent => "! ",
-            AttentionLevel::Informational => "✓ ",
-            AttentionLevel::None => "",
-        };
-        let mut event = row![
-            column![
-                text(format!(
-                    "{attention}{} · {}",
-                    item.title(),
-                    item.occurred_at().as_unix_millis()
-                )),
-                text(item.detail()).size(12),
-            ]
-            .spacing(2),
-        ]
-        .spacing(6);
-        if let Some(task_id) = item.task_id() {
-            event = event.push(button("Inspect").on_press(Message::Inspect(task_id)));
-        }
-        content = content.push(event);
+    if task_summaries(workspace).is_empty() {
+        content = content.push(
+            text("No tasks in this workspace.")
+                .size(13)
+                .style(shell::muted_text),
+        );
     }
-    if visible == 0 {
-        content = content.push(text("No events for this filter."));
-    }
-    content.into()
+    section("Task actions", content)
 }
 
 fn action_label(action: RecoveryAction) -> &'static str {

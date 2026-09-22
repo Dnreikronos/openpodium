@@ -5,7 +5,10 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use iced::widget::{button, column, container, image, markdown, row, scrollable, text, text_input};
+use iced::widget::{column, container, image, markdown, row, scrollable, text};
+
+use crate::app::ui::section_label;
+use crate::app::ui::{button, text_input};
 use iced::{Color, ContentFit, Element, Fill, Task};
 use openpodium::domain::{
     AgentId, ChatAttachment, ChatAttachmentId, ChatMessageId, ChatThreadId, NodeTarget, Workspace,
@@ -192,7 +195,7 @@ pub fn conversation_panel<'a>(
 ) -> Element<'a, Message> {
     let workspace_id = workspace.id();
     let mut panel = column![
-        text("Agent conversation").size(18),
+        section_label("Agent conversation"),
         row![
             button(if state.surface(workspace_id, agent_id) == Surface::Chat {
                 "✓ Chat"

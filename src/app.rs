@@ -1,9 +1,15 @@
 mod context_nodes;
 mod floors;
+mod icons;
 mod navigation;
 mod portals;
-mod shell;
+mod renaming;
+pub(crate) mod shell;
 mod trackpad;
+#[cfg(test)]
+mod transcript_tests;
+pub(crate) mod ui;
+mod workspace_actions;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -14,8 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iced::widget::{
-    button as iced_button, column, container, row, scrollable, text, text_editor,
-    text_input as iced_text_input,
+    button as iced_button, column, container, row, scrollable, stack, text, text_editor,
 };
 use iced::{
     Alignment as IcedAlignment, Color, Element, Fill, Size, Subscription, Task, Theme, clipboard,
@@ -70,25 +75,23 @@ use crate::terminal;
 use crate::terminal::session::{self, Action as TerminalAction, ProcessStream, Session};
 use crate::timeline_panel;
 
+use icons::Icon;
+use ui::{
+    action_grid, button, count_badge, float_row, labelled, panel_card, pill_divider,
+    primary_button, rule, section, section_label, segment, segmented, swatch, text_input,
+};
+
 const APP_NAME: &str = "OpenPodium";
 const DATABASE_FILE: &str = "openpodium.sqlite";
-
-fn button<'a, Message: Clone + 'a>(
-    content: impl Into<Element<'a, Message>>,
-) -> iced::widget::Button<'a, Message> {
-    iced_button(content)
-        .padding([8, 12])
-        .style(shell::secondary_button)
-}
-
-fn text_input<'a, Message: Clone + 'a>(
-    placeholder: &str,
-    value: &'a str,
-) -> iced::widget::TextInput<'a, Message> {
-    iced_text_input(placeholder, value)
-        .padding([10, 12])
-        .style(shell::input)
-}
+/// Orchestration ticks between terminal transcript captures. The tick runs at
+/// 100ms, so transcripts are written about every three seconds while output is
+/// arriving, rather than on every chunk.
+const TRANSCRIPT_FLUSH_TICKS: u32 = 30;
+/// Preference key for whether the workspace rail is showing.
+const SIDEBAR_OPEN_KEY: &str = "sidebar_open";
+/// The window the application opens at, and the size assumed until the first
+/// resize event arrives.
+const DEFAULT_WINDOW_SIZE: Size = Size::new(1_280.0, 820.0);
 
 type TimelineState = (
     BTreeMap<WorkspaceId, Vec<TimelineItem>>,
@@ -129,12 +132,17 @@ struct PortableImportDraft {
 struct OpenPodium {
     localizer: Localizer,
     presentation: PresentationPreferences,
-    inspector_open: bool,
+    controls: Option<Controls>,
+    sidebar_open: bool,
+    window_size: Size,
     floor_ui: floors::UiState,
     context_ui: context_nodes::UiState,
+    rename_ui: renaming::State,
     portal_ui: portals::UiState,
     camera: Camera,
     canvas_selection: Vec<NodeId>,
+    connection_mode: canvas::ConnectionMode,
+    connection_error: Option<String>,
     canvas_preview: Option<CanvasLayout>,
     canvas_history: History,
     canvas_revision: u64,
@@ -143,6 +151,7 @@ struct OpenPodium {
     focused_terminal: Option<NodeId>,
     focused_portal: Option<NodeId>,
     terminal_generation: u64,
+    transcript_ticks: u32,
     chat_ui: chat::UiState,
     timeline_ui: timeline_panel::UiState,
     timeline_items: BTreeMap<WorkspaceId, Vec<TimelineItem>>,
@@ -256,12 +265,17 @@ impl Default for OpenPodium {
         let mut state = Self {
             localizer: Localizer::default(),
             presentation: PresentationPreferences::default(),
-            inspector_open: false,
+            controls: None,
+            sidebar_open: true,
+            window_size: DEFAULT_WINDOW_SIZE,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
+            rename_ui: renaming::State::default(),
             portal_ui: portals::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
+            connection_mode: canvas::ConnectionMode::Off,
+            connection_error: None,
             canvas_preview: None,
             canvas_history: History::default(),
             canvas_revision: 1,
@@ -270,6 +284,7 @@ impl Default for OpenPodium {
             focused_terminal: None,
             focused_portal: None,
             terminal_generation: 0,
+            transcript_ticks: 0,
             chat_ui: chat::UiState::default(),
             timeline_ui: timeline_panel::UiState::default(),
             timeline_items,
@@ -315,7 +330,13 @@ impl Default for OpenPodium {
             notice,
         };
         load_application_preferences(&mut state);
+        let scale = state.presentation.text_scale();
+        state.window_size = Size::new(
+            DEFAULT_WINDOW_SIZE.width / scale,
+            DEFAULT_WINDOW_SIZE.height / scale,
+        );
         state.load_active_settings();
+        state.restore_terminal_transcripts();
         state.sync_ipc_directory();
         refresh_supervisor_snapshot(&mut state);
         navigation::mark_all_stale(&mut state);
@@ -327,14 +348,18 @@ impl Default for OpenPodium {
 enum Message {
     Floor(floors::Message),
     Portal(portals::Message),
+    Rename(renaming::Message),
+    RemoveWorkspace(WorkspaceId),
     OrchestrationTick,
     Canvas(canvas::Message),
     CycleTextScale,
     CycleLocale,
     ToggleHighContrast,
     ToggleReducedMotion,
-    ToggleInspector,
+    OpenControls(Controls),
+    CloseControls,
     TrackpadMagnified(f64),
+    WindowResized(Size),
     ExecuteCommand(CommandId),
     Chat(chat::Message),
     Timeline(timeline_panel::Message),
@@ -450,6 +475,45 @@ enum CanvasAction {
     Redo,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Controls {
+    Menu,
+    Advanced,
+    Workspace,
+    Canvas,
+    Agents,
+    Environments,
+    Worktrees,
+    Portals,
+    Routines,
+    Tasks,
+    Notifications,
+    Node,
+    Rename,
+    RemoveWorkspace(WorkspaceId),
+}
+
+impl Controls {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Menu => "Workspace menu",
+            Self::Advanced => "More tools",
+            Self::Workspace => "Workspace settings",
+            Self::Canvas => "Canvas tools",
+            Self::Agents => "Agent setup",
+            Self::Environments => "Runtime environments",
+            Self::Worktrees => "Worktrees",
+            Self::Portals => "Browser portals",
+            Self::Routines => "Routines",
+            Self::Tasks => "Task actions",
+            Self::Notifications => "Notifications",
+            Self::Node => "Selected node",
+            Self::Rename => "Rename window",
+            Self::RemoveWorkspace(_) => "Remove workspace?",
+        }
+    }
+}
+
 pub(crate) fn run() -> iced::Result {
     trackpad::install();
     iced::application(OpenPodium::default, update, view)
@@ -457,7 +521,7 @@ pub(crate) fn run() -> iced::Result {
         .theme(|state: &OpenPodium| application_theme(state.presentation))
         .scale_factor(|state: &OpenPodium| state.presentation.text_scale())
         .window(iced::window::Settings {
-            size: Size::new(1_280.0, 820.0),
+            size: DEFAULT_WINDOW_SIZE,
             min_size: Some(Size::new(900.0, 620.0)),
             ..iced::window::Settings::default()
         })
@@ -465,6 +529,7 @@ pub(crate) fn run() -> iced::Result {
             Subscription::batch([
                 iced::time::every(Duration::from_millis(100)).map(|_| Message::OrchestrationTick),
                 navigation::subscription(),
+                iced::window::resize_events().map(|(_, size)| Message::WindowResized(size)),
                 trackpad::subscription().map(Message::TrackpadMagnified),
             ])
         })
@@ -499,10 +564,34 @@ fn load_application_preferences(state: &mut OpenPodium) {
             if let Some((_, locale)) = values.iter().find(|(key, _)| key == LOCALE_KEY) {
                 state.localizer = Localizer::new(Locale::from_tag(locale));
             }
+            if let Some((_, open)) = values.iter().find(|(key, _)| key == SIDEBAR_OPEN_KEY) {
+                state.sidebar_open = open != "false";
+            }
             state.presentation.apply_stored(values);
         }
         Err(error) => state.notice = Some(error.to_string()),
     }
+}
+
+/// The area the canvas sheet occupies, derived from the window and the chrome
+/// this layout places beside it.
+fn canvas_viewport(state: &OpenPodium) -> (f64, f64) {
+    let mut width = state.window_size.width - shell::STAGE_PADDING * 2.0;
+    if state.sidebar_open {
+        width -= shell::SIDEBAR_WIDTH + 1.0;
+    }
+    (
+        f64::from(width.max(1.0)),
+        f64::from((state.window_size.height - shell::STAGE_PADDING * 2.0).max(1.0)),
+    )
+}
+
+/// Shows or hides the workspace rail, remembering the choice for next launch.
+fn toggle_sidebar(state: &mut OpenPodium) -> Task<Message> {
+    state.sidebar_open = !state.sidebar_open;
+    let value = state.sidebar_open.to_string();
+    persist_application_preference(state, SIDEBAR_OPEN_KEY, &value);
+    Task::none()
 }
 
 fn persist_application_preference(state: &mut OpenPodium, key: &str, value: &str) {
@@ -517,7 +606,13 @@ fn persist_application_preference(state: &mut OpenPodium, key: &str, value: &str
 fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
     match message {
         Message::CycleTextScale => {
+            let previous_scale = state.presentation.text_scale();
             state.presentation.cycle_text_scale();
+            let ratio = previous_scale / state.presentation.text_scale();
+            state.window_size = Size::new(
+                state.window_size.width * ratio,
+                state.window_size.height * ratio,
+            );
             let value = state.presentation.text_scale().to_string();
             persist_application_preference(state, TEXT_SCALE_KEY, &value);
         }
@@ -528,6 +623,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         }
         Message::ToggleHighContrast => {
             state.presentation.toggle_high_contrast();
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
             let value = state.presentation.high_contrast().to_string();
             persist_application_preference(state, HIGH_CONTRAST_KEY, &value);
         }
@@ -536,7 +632,22 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             let value = state.presentation.reduced_motion().to_string();
             persist_application_preference(state, REDUCED_MOTION_KEY, &value);
         }
-        Message::ToggleInspector => state.inspector_open = !state.inspector_open,
+        Message::OpenControls(controls) => {
+            state.cancel_connection();
+            state.focused_terminal = None;
+            state.focused_portal = None;
+            state.controls = Some(controls);
+            if matches!(controls, Controls::RemoveWorkspace(_)) {
+                state.notice = None;
+            }
+            if controls == Controls::Node {
+                return context_nodes::open_editor(state);
+            }
+        }
+        Message::CloseControls => state.controls = None,
+        Message::RemoveWorkspace(workspace_id) => {
+            return workspace_actions::remove(state, workspace_id);
+        }
         Message::TrackpadMagnified(delta) => {
             if let Some(factor) = trackpad::magnification_factor(delta) {
                 state.camera = state.camera.zoom_centered(factor);
@@ -546,7 +657,16 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
         Message::ExecuteCommand(command) => return navigation::execute_command(state, command),
         Message::Floor(message) => return floors::update(state, message),
         Message::Portal(message) => return portals::update(state, message),
+        Message::Rename(message) => return renaming::update(state, message),
+        Message::WindowResized(size) => state.window_size = size,
         Message::OrchestrationTick => {
+            state.transcript_ticks = state.transcript_ticks.wrapping_add(1);
+            if state
+                .transcript_ticks
+                .is_multiple_of(TRANSCRIPT_FLUSH_TICKS)
+            {
+                state.flush_terminal_transcripts();
+            }
             run_orchestration_tick(state);
             run_routine_tick(state);
             let contexts = context_nodes::tick(state);
@@ -667,6 +787,7 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
                     floors::workspace_changed(state);
                     state.reset_canvas_session();
                     state.load_active_settings();
+                    state.restore_terminal_transcripts();
                 }
                 Err(error) => state.notice = Some(error),
             }
@@ -784,10 +905,37 @@ fn create_workspace(state: &mut OpenPodium, directory: &Path) {
             floors::workspace_changed(state);
             state.reset_canvas_session();
             state.load_active_settings();
+            state.restore_terminal_transcripts();
             state.sync_ipc_directory();
         }
         Err(error) => state.notice = Some(error),
     }
+}
+
+/// The control that shows and hides the workspace rail.
+fn sidebar_toggle(state: &OpenPodium) -> Element<'_, Message> {
+    let shortcut = state
+        .command_registry
+        .binding(CommandId::ToggleSidebar)
+        .map_or_else(String::new, |shortcut| {
+            format!(
+                " ({})",
+                shortcut.display(openpodium::navigation::Platform::current())
+            )
+        });
+    labelled(
+        icons::control(Icon::Sidebar)
+            .style(shell::navigation_button(!state.sidebar_open))
+            .on_press(Message::ExecuteCommand(CommandId::ToggleSidebar)),
+        format!(
+            "{}{shortcut}",
+            state.localizer.text(if state.sidebar_open {
+                "hide-sidebar"
+            } else {
+                "show-sidebar"
+            })
+        ),
+    )
 }
 
 fn view(state: &OpenPodium) -> Element<'_, Message> {
@@ -805,63 +953,109 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             |shortcut| shortcut.display(openpodium::navigation::Platform::current()),
         );
     let brand = row![
-        container(text("O").size(20))
-            .width(42)
-            .height(42)
+        container(text("O").size(14))
+            .width(26)
+            .height(26)
             .align_x(IcedAlignment::Center)
             .align_y(IcedAlignment::Center)
             .style(shell::app_mark),
-        column![
-            text(state.localizer.text("app-name")).size(19),
-            text(state.localizer.text("app-tagline"))
-                .size(12)
-                .style(shell::muted_text),
-        ]
-        .spacing(1),
+        text(state.localizer.text("app-name"))
+            .size(13)
+            .width(Fill)
+            .wrapping(iced::widget::text::Wrapping::None),
+        labelled(
+            icons::control(Icon::Plus).on_press(Message::OpenProject),
+            state.localizer.text(if has_active_workspace {
+                "open-another-project"
+            } else {
+                "open-project"
+            }),
+        ),
+        sidebar_toggle(state),
     ]
-    .spacing(10)
+    .spacing(4)
     .align_y(IcedAlignment::Center);
+    // Styled as a recessed field rather than a button: it is where you go to
+    // type, even though typing happens in the palette it opens.
     let search = button(
-        row![
-            text(state.localizer.text("search-short")).size(13),
-            text(palette_shortcut).size(11).style(shell::subtle_text),
-        ]
-        .spacing(8)
-        .align_y(IcedAlignment::Center),
+        container(
+            row![
+                icons::view(Icon::Search),
+                text(state.localizer.text("search-short"))
+                    .size(11)
+                    .style(shell::muted_text)
+                    .width(Fill)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                text(palette_shortcut).size(10).style(shell::subtle_text),
+            ]
+            .spacing(8)
+            .align_y(IcedAlignment::Center),
+        )
+        .style(shell::field)
+        .padding([7, 8])
+        .width(Fill)
+        .clip(true),
     )
-    .style(shell::secondary_button)
-    .padding([10, 12])
+    .style(shell::utility_button)
+    .padding(0)
     .on_press(Message::Navigation(navigation_panel::Message::Open))
     .width(Fill);
-    let mut workspace_list = column![
-        text(state.localizer.text("workspaces"))
-            .size(11)
-            .style(shell::muted_text)
-    ]
-    .spacing(6)
-    .width(Fill);
+    let mut workspace_list = column![section_label(state.localizer.text("workspaces"))]
+        .spacing(2)
+        .width(Fill);
     if let Some(workspaces) = &state.workspaces {
-        for workspace in workspaces.recent_workspaces() {
+        for workspace in workspaces.ordered_workspaces() {
             let icon = workspace.settings().icon().map_or("", |icon| icon.as_str());
-            let mut label = if icon.is_empty() {
-                workspace.name().to_owned()
+            let workspace_icon: Element<'_, Message> = if icon.is_empty() {
+                icons::view(Icon::Files)
             } else {
-                format!("{icon} {}", workspace.name())
+                text(icon.to_owned()).size(13).into()
             };
             let attention = timeline::attention_counts(workspace).total();
+            let agents = workspace.agents().count();
+            let selected = active_workspace_id == Some(workspace.id());
+            // Agent count on the right tells you how loaded a workspace is;
+            // the red badge only shows up when something wants you.
+            let mut entry = row![
+                workspace_icon,
+                text(workspace.name().to_owned())
+                    .size(13)
+                    .width(Fill)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .spacing(8)
+            .align_y(IcedAlignment::Center);
             if attention > 0 {
-                label = format!(
-                    "{label} · {}",
-                    state.localizer.count("attention-count", attention)
+                entry = entry.push(count_badge(attention, true));
+            }
+            if agents > 0 {
+                entry = entry.push(
+                    row![
+                        icons::view(Icon::Terminal),
+                        text(agents.to_string()).size(11).style(shell::subtle_text),
+                    ]
+                    .spacing(3)
+                    .align_y(IcedAlignment::Center),
                 );
             }
-            let selected = active_workspace_id == Some(workspace.id());
-            workspace_list = workspace_list.push(
-                button(text(label).size(13))
+            let entry = row![
+                button(entry)
                     .style(shell::navigation_button(selected))
+                    .padding([7, 8])
                     .on_press(Message::SwitchWorkspace(workspace.id()))
                     .width(Fill),
-            );
+                selected.then(|| labelled(
+                    icons::control(Icon::Trash)
+                        .style(shell::danger_button)
+                        .on_press(Message::OpenControls(Controls::RemoveWorkspace(
+                            workspace.id()
+                        ))),
+                    "Remove workspace",
+                )),
+            ]
+            .spacing(1)
+            .align_y(IcedAlignment::Center);
+            workspace_list = workspace_list.push(entry);
         }
     }
 
@@ -870,207 +1064,258 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .localizer
             .text(if enabled { "state-on" } else { "state-off" })
     };
+    // Display preferences stay reachable but sit at footnote weight, so the
+    // rail never competes with the canvas for attention.
+    let preference = |label: String, message: Message| {
+        button(text(label).size(12))
+            .style(shell::utility_button)
+            .padding([5, 8])
+            .on_press(message)
+            .width(Fill)
+    };
     let accessibility_controls = column![
-        text(state.localizer.text("display-settings"))
-            .size(11)
-            .style(shell::muted_text),
+        rule(),
+        section_label(state.localizer.text("display-settings")),
         row![
-            button(text(state.localizer.text(match state.localizer.locale() {
-                Locale::EnUs | Locale::PseudoRtl => "locale-short-en",
-                Locale::PtBr => "locale-short-pt",
-            })))
-            .style(shell::utility_button)
-            .on_press(Message::CycleLocale)
-            .width(Fill),
-            button(text(format!(
-                "{}%",
-                state.presentation.text_scale_percent()
-            )))
-            .style(shell::utility_button)
-            .on_press(Message::CycleTextScale)
-            .width(Fill),
+            preference(
+                state
+                    .localizer
+                    .text(match state.localizer.locale() {
+                        Locale::EnUs | Locale::PseudoRtl => "locale-short-en",
+                        Locale::PtBr => "locale-short-pt",
+                    })
+                    .to_string(),
+                Message::CycleLocale,
+            ),
+            preference(
+                format!("{}%", state.presentation.text_scale_percent()),
+                Message::CycleTextScale,
+            ),
         ]
         .spacing(4),
         row![
-            button(text(state.localizer.with_str(
-                "contrast-short",
-                "state",
-                enabled(state.presentation.high_contrast()),
-            )))
-            .style(shell::utility_button)
-            .on_press(Message::ToggleHighContrast)
-            .width(Fill),
-            button(text(state.localizer.with_str(
-                "motion-short",
-                "state",
-                enabled(state.presentation.reduced_motion()),
-            )))
-            .style(shell::utility_button)
-            .on_press(Message::ToggleReducedMotion)
-            .width(Fill),
+            preference(
+                state
+                    .localizer
+                    .with_str(
+                        "contrast-short",
+                        "state",
+                        enabled(state.presentation.high_contrast()),
+                    )
+                    .to_string(),
+                Message::ToggleHighContrast,
+            ),
+            preference(
+                state
+                    .localizer
+                    .with_str(
+                        "motion-short",
+                        "state",
+                        enabled(state.presentation.reduced_motion()),
+                    )
+                    .to_string(),
+                Message::ToggleReducedMotion,
+            ),
         ]
         .spacing(4),
     ]
     .spacing(6);
-    let add_workspace = if has_active_workspace {
-        column![
-            button(text(state.localizer.text("open-another-project")))
-                .style(shell::secondary_button)
-                .on_press(Message::OpenProject)
-                .width(Fill),
-        ]
-    } else {
-        column![]
-    };
     let sidebar = container(
         column![
             brand,
             search,
             scrollable(workspace_list).height(Fill),
-            add_workspace,
             accessibility_controls,
         ]
-        .spacing(14)
+        .spacing(10)
         .height(Fill),
     )
     .style(shell::sidebar)
     .width(shell::SIDEBAR_WIDTH)
     .height(Fill)
-    .padding(16);
+    .padding(10);
 
-    let mut settings = column![
-        text(state.localizer.text("workspace-inspector")).size(24),
-        text(state.localizer.text("workspace-inspector-description"))
-            .size(13)
-            .style(shell::muted_text),
-        text_input("Name", &state.name).on_input(Message::NameChanged),
-        text_input("Icon", &state.icon).on_input(Message::IconChanged),
-        text_input("Working directory", &state.working_directory)
-            .on_input(Message::WorkingDirectoryChanged),
-        text_input("Workspace instructions", &state.instructions)
-            .on_input(Message::InstructionsChanged),
-        button(text(state.localizer.text("save-workspace")))
-            .style(shell::primary_button)
-            .on_press(Message::SaveSettings),
-        floors::view(state),
-        portals::creation_view(state),
-        text("Add agent").size(18),
-        row![
-            button("Codex").on_press(Message::AddAgent(AgentProgram::Codex)),
-            button("Claude").on_press(Message::AddAgent(AgentProgram::Claude)),
-            button("OpenCode").on_press(Message::AddAgent(AgentProgram::OpenCode)),
-            button("Shell").on_press(Message::AddAgent(AgentProgram::Shell)),
-        ]
-        .spacing(8),
-        row![
-            button("Preview Codex").on_press(Message::PreviewAgent(AgentProgram::Codex)),
-            button("Preview Claude").on_press(Message::PreviewAgent(AgentProgram::Claude)),
-            button("Preview OpenCode").on_press(Message::PreviewAgent(AgentProgram::OpenCode)),
-            button("Preview shell").on_press(Message::PreviewAgent(AgentProgram::Shell)),
-        ]
-        .spacing(8),
-        text(format!(
-            "Local tools: Codex {} · Claude {} · OpenCode {} · shell {}",
-            capability_label(AgentProgram::Codex, None),
-            capability_label(AgentProgram::Claude, None),
-            capability_label(AgentProgram::OpenCode, None),
-            capability_label(AgentProgram::Shell, None),
-        ))
-        .size(12),
-        text("Runtime environment for new agents").size(18),
-        button(if state.selected_environment.is_none() {
-            "✓ Local workspace"
-        } else {
-            "Local workspace"
-        })
-        .on_press(Message::SelectEnvironment(None)),
-        text("Canvas tools").size(18),
-        row![
-            button("Undo").on_press(Message::CanvasAction(CanvasAction::Undo)),
-            button("Redo").on_press(Message::CanvasAction(CanvasAction::Redo)),
-            button("Duplicate").on_press(Message::CanvasAction(CanvasAction::Duplicate)),
-            button("Delete").on_press(Message::CanvasAction(CanvasAction::Remove)),
-            button("Copy / export").on_press(Message::Canvas(canvas::Message::CopyRequested)),
-            button("Paste / import").on_press(Message::Canvas(canvas::Message::PasteRequested)),
-        ]
-        .spacing(8),
-        row![
-            button("Save selection as template").on_press(Message::SaveSelectionAsTemplate),
-            button("Instantiate template").on_press(Message::InstantiateTemplate),
-        ]
-        .spacing(8),
-        row![
-            button("Export workspace archive").on_press(Message::ExportWorkspaceArchive),
-            button("Import workspace archive").on_press(Message::ImportWorkspaceArchive),
-        ]
-        .spacing(8),
-        row![
-            button("Group").on_press(Message::CanvasAction(CanvasAction::Group)),
-            button("Ungroup").on_press(Message::CanvasAction(CanvasAction::Ungroup)),
-            button("Connect").on_press(Message::CanvasAction(CanvasAction::Connect)),
-        ]
-        .spacing(8),
-        row![
-            button("Align X").on_press(Message::CanvasAction(CanvasAction::Align(
-                Alignment::HorizontalCenters,
-            ))),
-            button("Align Y").on_press(Message::CanvasAction(CanvasAction::Align(
-                Alignment::VerticalCenters,
-            ))),
-            button("Space X").on_press(Message::CanvasAction(CanvasAction::Align(
-                Alignment::DistributeHorizontally,
-            ))),
-            button("Space Y").on_press(Message::CanvasAction(CanvasAction::Align(
-                Alignment::DistributeVertically,
-            ))),
-        ]
-        .spacing(8),
-        row![
-            button("To front")
-                .on_press(Message::CanvasAction(CanvasAction::ZOrder(ZOrder::Front,))),
-            button("To back").on_press(Message::CanvasAction(CanvasAction::ZOrder(ZOrder::Back,))),
-        ]
-        .spacing(8),
-        text("Context and drawing nodes").size(18),
-        row![
-            button("Note").on_press(Message::AddContextNode(context_nodes::Kind::Note)),
-            button("Files").on_press(Message::AddContextNode(context_nodes::Kind::FileTree)),
-            button("Text").on_press(Message::AddContextNode(context_nodes::Kind::Text)),
-            button("Rectangle").on_press(Message::AddContextNode(context_nodes::Kind::Rectangle)),
-            button("Ellipse").on_press(Message::AddContextNode(context_nodes::Kind::Ellipse)),
-            button("Arrow").on_press(Message::AddContextNode(context_nodes::Kind::Arrow)),
-            button("Freehand").on_press(Message::AddContextNode(context_nodes::Kind::Freehand)),
-        ]
-        .spacing(8),
-        row![
-            text_input("Project-relative file path", &state.context_path)
-                .on_input(Message::ContextPathChanged),
-            button("Artifact").on_press(Message::AddContextNode(context_nodes::Kind::Artifact)),
-            button("Diff").on_press(Message::AddContextNode(context_nodes::Kind::Diff)),
-        ]
-        .spacing(8),
-        text(format!(
-            "Canvas: {}% · x {:.0} · y {:.0} · {} selected · undo {} · redo {}",
-            state.camera.zoom_percent(),
-            state.camera.position().x,
-            state.camera.position().y,
-            state.canvas_selection.len(),
-            if state.canvas_history.can_undo() {
-                "yes"
-            } else {
-                "no"
-            },
-            if state.canvas_history.can_redo() {
-                "yes"
-            } else {
-                "no"
-            },
-        ))
-        .size(12),
-    ]
+    let small = |label: &'static str, message: Message| {
+        button(text(label).size(12))
+            .padding([6, 10])
+            .on_press(message)
+            .into()
+    };
+    let mut settings = match state.controls {
+        Some(Controls::RemoveWorkspace(id)) => column![workspace_actions::confirmation(state, id)],
+        Some(Controls::Rename) => column![renaming::view(&state.rename_ui)],
+        Some(Controls::Workspace) => column![section(
+            "Details",
+            column![
+                text_input("Name", &state.name).on_input(Message::NameChanged),
+                text_input("Icon", &state.icon).on_input(Message::IconChanged),
+                text_input("Working directory", &state.working_directory)
+                    .on_input(Message::WorkingDirectoryChanged),
+                text_input("Workspace instructions", &state.instructions)
+                    .on_input(Message::InstructionsChanged),
+                primary_button(text(state.localizer.text("save-workspace")).size(13))
+                    .on_press(Message::SaveSettings),
+            ]
+            .spacing(8),
+        ),],
+        Some(Controls::Agents) => column![
+            section(
+                "Add agent",
+                column![
+                    action_grid([
+                        small("Codex", Message::AddAgent(AgentProgram::Codex)),
+                        small("Claude", Message::AddAgent(AgentProgram::Claude)),
+                        small("OpenCode", Message::AddAgent(AgentProgram::OpenCode)),
+                        small("Shell", Message::AddAgent(AgentProgram::Shell)),
+                    ]),
+                    section_label("Preview without adding"),
+                    action_grid([
+                        small("Codex", Message::PreviewAgent(AgentProgram::Codex)),
+                        small("Claude", Message::PreviewAgent(AgentProgram::Claude)),
+                        small("OpenCode", Message::PreviewAgent(AgentProgram::OpenCode)),
+                        small("Shell", Message::PreviewAgent(AgentProgram::Shell)),
+                    ]),
+                    rule(),
+                    text(format!(
+                        "Codex {} · Claude {} · OpenCode {} · shell {}",
+                        capability_label(AgentProgram::Codex, None),
+                        capability_label(AgentProgram::Claude, None),
+                        capability_label(AgentProgram::OpenCode, None),
+                        capability_label(AgentProgram::Shell, None),
+                    ))
+                    .size(11)
+                    .style(shell::muted_text),
+                ]
+                .spacing(8),
+            ),
+            section(
+                "Runtime environment for new agents",
+                button(text("Local workspace").size(13))
+                    .style(shell::navigation_button(
+                        state.selected_environment.is_none()
+                    ))
+                    .width(Fill)
+                    .on_press(Message::SelectEnvironment(None)),
+            ),
+        ],
+        Some(Controls::Canvas) => column![
+            section(
+                "Canvas tools",
+                column![
+                    action_grid([
+                        button(text("Undo").size(12))
+                            .on_press_maybe(
+                                state
+                                    .canvas_history
+                                    .can_undo()
+                                    .then_some(Message::CanvasAction(CanvasAction::Undo))
+                            )
+                            .into(),
+                        button(text("Redo").size(12))
+                            .on_press_maybe(
+                                state
+                                    .canvas_history
+                                    .can_redo()
+                                    .then_some(Message::CanvasAction(CanvasAction::Redo))
+                            )
+                            .into(),
+                        small("Duplicate", Message::CanvasAction(CanvasAction::Duplicate)),
+                        small("Delete", Message::CanvasAction(CanvasAction::Remove)),
+                        small("Copy", Message::Canvas(canvas::Message::CopyRequested)),
+                        small("Paste", Message::Canvas(canvas::Message::PasteRequested)),
+                        small("Group", Message::CanvasAction(CanvasAction::Group)),
+                        small("Ungroup", Message::CanvasAction(CanvasAction::Ungroup)),
+                        small("Connect", Message::CanvasAction(CanvasAction::Connect)),
+                        small(
+                            "To front",
+                            Message::CanvasAction(CanvasAction::ZOrder(ZOrder::Front))
+                        ),
+                        small(
+                            "To back",
+                            Message::CanvasAction(CanvasAction::ZOrder(ZOrder::Back))
+                        ),
+                    ]),
+                    section_label("Align and distribute"),
+                    action_grid([
+                        small(
+                            "Align X",
+                            Message::CanvasAction(CanvasAction::Align(
+                                Alignment::HorizontalCenters
+                            )),
+                        ),
+                        small(
+                            "Align Y",
+                            Message::CanvasAction(CanvasAction::Align(Alignment::VerticalCenters)),
+                        ),
+                        small(
+                            "Space X",
+                            Message::CanvasAction(CanvasAction::Align(
+                                Alignment::DistributeHorizontally
+                            )),
+                        ),
+                        small(
+                            "Space Y",
+                            Message::CanvasAction(CanvasAction::Align(
+                                Alignment::DistributeVertically
+                            )),
+                        ),
+                    ]),
+                    section_label("Templates and archives"),
+                    action_grid([
+                        small("Save template", Message::SaveSelectionAsTemplate),
+                        small("Use template", Message::InstantiateTemplate),
+                        small("Export archive", Message::ExportWorkspaceArchive),
+                        small("Import archive", Message::ImportWorkspaceArchive),
+                    ]),
+                ]
+                .spacing(8),
+            ),
+            section(
+                "Context and drawing nodes",
+                column![
+                    action_grid([
+                        small("Note", Message::AddContextNode(context_nodes::Kind::Note)),
+                        small(
+                            "Files",
+                            Message::AddContextNode(context_nodes::Kind::FileTree)
+                        ),
+                        small("Text", Message::AddContextNode(context_nodes::Kind::Text)),
+                        small(
+                            "Rectangle",
+                            Message::AddContextNode(context_nodes::Kind::Rectangle)
+                        ),
+                        small(
+                            "Ellipse",
+                            Message::AddContextNode(context_nodes::Kind::Ellipse)
+                        ),
+                        small("Arrow", Message::AddContextNode(context_nodes::Kind::Arrow)),
+                        small(
+                            "Freehand",
+                            Message::AddContextNode(context_nodes::Kind::Freehand)
+                        ),
+                    ]),
+                    text_input("Project-relative file path", &state.context_path)
+                        .on_input(Message::ContextPathChanged),
+                    action_grid([
+                        small(
+                            "Artifact",
+                            Message::AddContextNode(context_nodes::Kind::Artifact)
+                        ),
+                        small("Diff", Message::AddContextNode(context_nodes::Kind::Diff)),
+                    ]),
+                ]
+                .spacing(8),
+            ),
+        ],
+        Some(Controls::Worktrees) => column![panel_card(floors::view(state))],
+        Some(Controls::Portals) => column![panel_card(portals::creation_view(state))],
+        _ => column![],
+    }
     .spacing(12)
     .max_width(720);
-    if let Some(draft) = &state.portable_import {
+    if state.controls == Some(Controls::Canvas)
+        && let Some(draft) = &state.portable_import
+    {
         let kind = match draft.kind {
             PortableImportKind::Template => "template",
             PortableImportKind::WorkspaceArchive => "workspace archive",
@@ -1170,91 +1415,124 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .as_ref()
         .and_then(WorkspaceManager::active_workspace)
     {
-        let items = state
-            .timeline_items
-            .get(&workspace.id())
-            .map_or(&[][..], Vec::as_slice);
-        settings = column![
-            timeline_panel::panel(workspace, items, &state.timeline_ui).map(Message::Timeline),
-            routines_panel::panel(workspace, &state.routines_ui).map(Message::Routines),
-            settings,
-        ]
-        .spacing(20);
+        if state.controls == Some(Controls::Tasks) {
+            settings = settings
+                .push(timeline_panel::panel(workspace, &state.timeline_ui).map(Message::Timeline));
+        }
+        if state.controls == Some(Controls::Routines) {
+            settings = settings
+                .push(routines_panel::panel(workspace, &state.routines_ui).map(Message::Routines));
+        }
     }
     if let Some(workspace) = state
         .workspaces
         .as_ref()
         .and_then(WorkspaceManager::active_workspace)
     {
-        settings = settings.push(text("Reusable roles").size(18)).push(
-            row![
-                button(if state.selected_role.is_none() {
-                    "✓ No role"
-                } else {
-                    "No role"
-                })
-                .on_press(Message::SelectRole(None)),
-                button("Clear selected agent role").on_press(Message::AssignRoleToSelected(None)),
-                button("Import role from clipboard").on_press(Message::ImportRole),
-            ]
-            .spacing(8),
-        );
+        // Roles. Each role collapses to a single selectable row; its actions
+        // only unfold for the selected one, so a long list stays scannable.
+        let mut roles = column![action_grid([
+            small("No role", Message::SelectRole(None)),
+            small("Clear on agent", Message::AssignRoleToSelected(None)),
+            small("Import role", Message::ImportRole),
+        ])]
+        .spacing(6);
         for role in workspace.roles() {
             let selected = state.selected_role == Some(role.id());
-            let label = format!("{} {} ({})", role.icon(), role.name(), role.color());
-            settings = settings.push(
-                row![
-                    button(text(if selected {
-                        format!("✓ {label}")
-                    } else {
-                        label
-                    }))
-                    .on_press(Message::SelectRole(Some(role.id()))),
-                    button("Assign").on_press(Message::AssignRoleToSelected(Some(role.id()))),
-                    button("Edit").on_press(Message::EditRole(role.id())),
-                    button("Export").on_press(Message::ExportRole(role.id())),
-                    button("Delete").on_press(Message::RemoveRole(role.id())),
-                ]
-                .spacing(8),
+            roles = roles.push(
+                button(
+                    row![
+                        swatch(role.color().as_str()),
+                        text(role.icon().to_string()).size(13),
+                        text(role.name().to_string()).size(13).width(Fill),
+                    ]
+                    .spacing(8)
+                    .align_y(IcedAlignment::Center),
+                )
+                .style(shell::navigation_button(selected))
+                .padding([7, 9])
+                .width(Fill)
+                .on_press(Message::SelectRole(Some(role.id()))),
             );
+            if selected {
+                roles = roles.push(action_grid([
+                    small("Assign", Message::AssignRoleToSelected(Some(role.id()))),
+                    small("Edit", Message::EditRole(role.id())),
+                    small("Export", Message::ExportRole(role.id())),
+                    button(text("Delete").size(12))
+                        .style(shell::danger_button)
+                        .padding([6, 10])
+                        .on_press(Message::RemoveRole(role.id()))
+                        .into(),
+                ]));
+            }
         }
-        settings = settings
+        roles = roles
+            .push(rule())
+            .push(section_label(if state.editing_role.is_some() {
+                "Edit role"
+            } else {
+                "New role"
+            }))
             .push(text_input("Role name", &state.role_name).on_input(Message::RoleNameChanged))
             .push(
                 row![
                     text_input("#RRGGBB", &state.role_color).on_input(Message::RoleColorChanged),
                     text_input("Icon", &state.role_icon).on_input(Message::RoleIconChanged),
                 ]
-                .spacing(8),
+                .spacing(6),
             )
             .push(
                 text_input("Role instructions", &state.role_instructions)
                     .on_input(Message::RoleInstructionsChanged),
             )
             .push(
-                button(if state.editing_role.is_some() {
-                    "Update role"
-                } else {
-                    "Create role"
-                })
+                primary_button(
+                    text(if state.editing_role.is_some() {
+                        "Update role"
+                    } else {
+                        "Create role"
+                    })
+                    .size(13),
+                )
                 .on_press(Message::SaveRole),
-            )
-            .push(text("Custom command presets").size(18));
+            );
+        if state.controls == Some(Controls::Agents) {
+            settings = settings.push(section("Reusable roles", roles));
+        }
+
+        let mut presets = column![].spacing(6);
         for preset in workspace.command_presets() {
             let program = AgentProgram::Custom(preset.id());
-            settings = settings.push(
-                row![
-                    button(text(format!("Add {}", preset.name())))
-                        .on_press(Message::AddAgent(program)),
-                    button("Preview").on_press(Message::PreviewAgent(program)),
-                    text(capability_label(program, Some(preset))).size(12),
-                    button("Edit").on_press(Message::EditPreset(preset.id())),
-                    button("Delete").on_press(Message::RemovePreset(preset.id())),
-                ]
-                .spacing(8),
-            );
+            presets = presets
+                .push(
+                    row![
+                        text(preset.name().to_string()).size(13).width(Fill),
+                        text(capability_label(program, Some(preset)))
+                            .size(11)
+                            .style(shell::muted_text),
+                    ]
+                    .spacing(8)
+                    .align_y(IcedAlignment::Center),
+                )
+                .push(action_grid([
+                    small("Add", Message::AddAgent(program)),
+                    small("Preview", Message::PreviewAgent(program)),
+                    small("Edit", Message::EditPreset(preset.id())),
+                    button(text("Delete").size(12))
+                        .style(shell::danger_button)
+                        .padding([6, 10])
+                        .on_press(Message::RemovePreset(preset.id()))
+                        .into(),
+                ]));
         }
-        settings = settings
+        presets = presets
+            .push(rule())
+            .push(section_label(if state.editing_preset.is_some() {
+                "Edit preset"
+            } else {
+                "New preset"
+            }))
             .push(
                 text_input("Preset name", &state.preset_name).on_input(Message::PresetNameChanged),
             )
@@ -1267,71 +1545,86 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                     .on_input(Message::PresetArgumentsChanged),
             )
             .push(
-                button(if state.editing_preset.is_some() {
-                    "Update preset"
-                } else {
-                    "Create preset"
-                })
+                primary_button(
+                    text(if state.editing_preset.is_some() {
+                        "Update preset"
+                    } else {
+                        "Create preset"
+                    })
+                    .size(13),
+                )
                 .on_press(Message::SavePreset),
             );
+        if state.controls == Some(Controls::Agents) {
+            settings = settings.push(section("Custom command presets", presets));
+        }
+
+        let mut environments = column![].spacing(6);
         for profile in workspace.environment_profiles() {
             let selected = state.selected_environment == Some(profile.id());
-            let label = if selected {
-                format!("✓ {}", profile.name())
-            } else {
-                profile.name().to_string()
-            };
             let health = state
                 .environment_health
                 .get(&(workspace.id(), profile.id()))
                 .copied()
                 .unwrap_or_default();
-            settings = settings.push(
-                row![
-                    button(text(label)).on_press(Message::SelectEnvironment(Some(profile.id()))),
-                    text(health.label()).size(12),
-                    button("Check").on_press(Message::CheckEnvironment(profile.id())),
-                    button("Delete").on_press(Message::RemoveEnvironment(profile.id())),
-                ]
-                .spacing(8),
+            environments = environments.push(
+                button(
+                    row![
+                        text(profile.name().to_string()).size(13).width(Fill),
+                        text(health.label()).size(11).style(shell::muted_text),
+                    ]
+                    .spacing(8)
+                    .align_y(IcedAlignment::Center),
+                )
+                .style(shell::navigation_button(selected))
+                .padding([7, 9])
+                .width(Fill)
+                .on_press(Message::SelectEnvironment(Some(profile.id()))),
             );
+            if selected {
+                environments = environments.push(action_grid([
+                    small("Check", Message::CheckEnvironment(profile.id())),
+                    button(text("Delete").size(12))
+                        .style(shell::danger_button)
+                        .padding([6, 10])
+                        .on_press(Message::RemoveEnvironment(profile.id()))
+                        .into(),
+                ]));
+            }
         }
-        let kind_buttons = row![
-            button(if state.environment_kind == EnvironmentDraftKind::Ssh {
-                "✓ SSH"
-            } else {
-                "SSH"
-            })
-            .on_press(Message::EnvironmentKindSelected(EnvironmentDraftKind::Ssh)),
-            button(
-                if state.environment_kind == EnvironmentDraftKind::Container {
-                    "✓ Container"
-                } else {
-                    "Container"
-                }
+        // A segmented picker makes the three profile kinds mutually exclusive
+        // at a glance, instead of three lookalike buttons with check marks.
+        let kind_picker = segmented([
+            segment("SSH", state.environment_kind == EnvironmentDraftKind::Ssh)
+                .on_press(Message::EnvironmentKindSelected(EnvironmentDraftKind::Ssh))
+                .into(),
+            segment(
+                "Container",
+                state.environment_kind == EnvironmentDraftKind::Container,
             )
             .on_press(Message::EnvironmentKindSelected(
                 EnvironmentDraftKind::Container,
-            )),
-            button(if state.environment_kind == EnvironmentDraftKind::Custom {
-                "✓ Custom"
-            } else {
-                "Custom"
-            })
+            ))
+            .into(),
+            segment(
+                "Custom",
+                state.environment_kind == EnvironmentDraftKind::Custom,
+            )
             .on_press(Message::EnvironmentKindSelected(
                 EnvironmentDraftKind::Custom,
-            )),
+            ))
+            .into(),
+        ]);
+        let mut draft = column![
+            rule(),
+            section_label("Add environment profile"),
+            kind_picker,
+            text_input("Profile name", &state.environment_name)
+                .on_input(Message::EnvironmentNameChanged),
         ]
-        .spacing(8);
-        settings = settings
-            .push(text("Add environment profile").size(18))
-            .push(kind_buttons)
-            .push(
-                text_input("Profile name", &state.environment_name)
-                    .on_input(Message::EnvironmentNameChanged),
-            );
-        settings = match state.environment_kind {
-            EnvironmentDraftKind::Ssh => settings
+        .spacing(6);
+        draft = match state.environment_kind {
+            EnvironmentDraftKind::Ssh => draft
                 .push(
                     text_input("SSH host", &state.environment_primary)
                         .on_input(Message::EnvironmentPrimaryChanged),
@@ -1348,7 +1641,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                     text_input("Remote working directory", &state.environment_directory)
                         .on_input(Message::EnvironmentDirectoryChanged),
                 ),
-            EnvironmentDraftKind::Container => settings
+            EnvironmentDraftKind::Container => draft
                 .push(
                     text_input("Docker-compatible executable", &state.environment_primary)
                         .on_input(Message::EnvironmentPrimaryChanged),
@@ -1364,7 +1657,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                     text_input("Container working directory", &state.environment_directory)
                         .on_input(Message::EnvironmentDirectoryChanged),
                 ),
-            EnvironmentDraftKind::Custom => settings
+            EnvironmentDraftKind::Custom => draft
                 .push(
                     text_input("Wrapper executable", &state.environment_primary)
                         .on_input(Message::EnvironmentPrimaryChanged),
@@ -1378,7 +1671,12 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                         .on_input(Message::EnvironmentDirectoryChanged),
                 ),
         };
-        settings = settings.push(button("Add environment").on_press(Message::CreateEnvironment));
+        environments = environments.push(draft).push(
+            primary_button(text("Add environment").size(13)).on_press(Message::CreateEnvironment),
+        );
+        if state.controls == Some(Controls::Environments) {
+            settings = settings.push(section("Environments", environments));
+        }
     }
     if !has_active_workspace {
         settings = column![
@@ -1388,19 +1686,32 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .spacing(12)
         .max_width(720);
     }
-    if let Some(panel) = context_nodes::note_panel(&state.context_ui) {
+    if state.controls == Some(Controls::Node)
+        && let Some(panel) = context_nodes::note_panel(&state.context_ui)
+    {
         settings = settings.push(panel);
     }
-    if let Some(notice) = &state.notice {
-        settings = settings.push(text(notice));
+    let editing_note = state.controls == Some(Controls::Node)
+        && context_nodes::editor_title(&state.context_ui).is_some();
+    if !editing_note
+        && state.controls != Some(Controls::Rename)
+        && let Some(notice) = &state.notice
+    {
+        settings = settings.push(
+            container(text(notice).size(12))
+                .style(shell::section_card)
+                .padding(12)
+                .width(Fill),
+        );
     }
-    if let Some((workspace_id, agent_id)) = selected_agent(state)
+    if state.controls == Some(Controls::Node)
+        && let Some((workspace_id, agent_id)) = selected_agent(state)
         && let Some(workspace) = state
             .workspaces
             .as_ref()
             .and_then(|workspaces| workspaces.workspace(workspace_id))
     {
-        settings = settings.push(
+        settings = settings.push(panel_card(
             chat::conversation_panel(
                 workspace,
                 agent_id,
@@ -1408,31 +1719,37 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                 state.attachment_store.as_ref(),
             )
             .map(Message::Chat),
-        );
+        ));
     }
-    if let Some(node_id) = selected_terminal_node(state) {
+    if state.controls == Some(Controls::Node)
+        && let Some(node_id) = selected_terminal_node(state)
+    {
         let session = state
             .terminals
             .get(&active_terminal_key(state, node_id).expect("an active workspace exists"));
         let active = session.is_some_and(Session::is_active);
-        settings = settings.push(text("Terminal").size(18)).push(if active {
-            button("Stop terminal").on_press(Message::StopTerminal(node_id))
-        } else if session.is_some() {
-            button("Reconnect terminal").on_press(Message::StartTerminal(node_id))
-        } else {
-            button("Start terminal").on_press(Message::StartTerminal(node_id))
-        });
+        settings = settings.push(section(
+            "Terminal",
+            if active {
+                primary_button(text("Stop terminal").size(13))
+                    .on_press(Message::StopTerminal(node_id))
+            } else if session.is_some() {
+                primary_button(text("Reconnect terminal").size(13))
+                    .on_press(Message::StartTerminal(node_id))
+            } else {
+                primary_button(text("Start terminal").size(13))
+                    .on_press(Message::StartTerminal(node_id))
+            },
+        ));
     }
-    if let Some(portal) = portals::selected_view(state) {
-        settings = settings.push(portal);
+    if state.controls == Some(Controls::Node)
+        && let Some(portal) = portals::selected_view(state)
+    {
+        settings = settings.push(panel_card(portal));
     }
-    if has_active_workspace {
-        settings = settings
-            .push(text(state.localizer.text("workspace-health")).size(18))
-            .push(
-                supervisor_panel::panel(&state.supervisor_snapshot, &state.supervisor_ui)
-                    .map(Message::Supervisor),
-            );
+    if has_active_workspace && state.controls == Some(Controls::Notifications) {
+        settings =
+            settings.push(supervisor_panel::panel(&state.supervisor_ui).map(Message::Supervisor));
     }
 
     let stage: Element<'_, Message> = if has_active_workspace {
@@ -1454,9 +1771,12 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         let canvas = canvas::view(
             state.camera,
             document,
-            state.canvas_selection.clone(),
-            state.focused_terminal,
-            state.focused_portal,
+            canvas::Interaction {
+                selection: state.canvas_selection.clone(),
+                focused_terminal: state.focused_terminal,
+                focused_portal: state.focused_portal,
+                connection_mode: state.connection_mode,
+            },
             [
                 CommandId::OpenPalette,
                 CommandId::FocusCanvas,
@@ -1471,71 +1791,198 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         )
         .map(Message::Canvas);
         let workspace_title = workspace.name().to_owned();
-        let zoom_controls = container(
+
+        let workspace_chip = labelled(
+            iced_button(
+                container(
+                    row![
+                        icons::view(Icon::Files),
+                        text(workspace_title)
+                            .size(11)
+                            .style(shell::muted_text)
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    ]
+                    .spacing(6)
+                    .align_y(IcedAlignment::Center),
+                )
+                .style(shell::floating_chip)
+                .padding([7, 10])
+                .clip(true),
+            )
+            .style(shell::utility_button)
+            .padding(0)
+            .on_press(Message::OpenControls(Controls::Menu)),
+            format!("Workspace menu · {}", state.working_directory),
+        );
+
+        let add_agent = |icon, label: &'static str, program: AgentProgram| {
+            labelled(
+                icons::control(icon).on_press(Message::AddAgent(program)),
+                label,
+            )
+        };
+        let add_node = |icon, label: &'static str, kind: context_nodes::Kind| {
+            labelled(
+                icons::control(icon).on_press(Message::AddContextNode(kind)),
+                label,
+            )
+        };
+        let agent_tools = row![
+            add_agent(Icon::Code, "Add Codex", AgentProgram::Codex),
+            add_agent(Icon::Spark, "Add Claude", AgentProgram::Claude),
+            add_agent(Icon::Agent, "Add OpenCode", AgentProgram::OpenCode),
+            add_agent(Icon::Terminal, "Add shell", AgentProgram::Shell),
+        ]
+        .spacing(1)
+        .align_y(IcedAlignment::Center);
+        let canvas_tools = row![
+            add_node(Icon::Note, "Add note", context_nodes::Kind::Note),
+            add_node(Icon::Files, "Add file tree", context_nodes::Kind::FileTree),
+            add_node(Icon::Text, "Add text", context_nodes::Kind::Text),
+            labelled(
+                icons::control(Icon::Link)
+                    .style(shell::navigation_button(
+                        state.connection_mode != canvas::ConnectionMode::Off
+                    ))
+                    .on_press(Message::CanvasAction(CanvasAction::Connect)),
+                "Connect cards · choose a source and destination",
+            ),
+        ]
+        .spacing(1)
+        .align_y(IcedAlignment::Center);
+        let tools: Element<'_, Message> = if canvas_viewport(state).0 < 560.0 {
+            column![agent_tools, canvas_tools].spacing(2).into()
+        } else {
+            row![agent_tools, pill_divider(), canvas_tools]
+                .spacing(5)
+                .align_y(IcedAlignment::Center)
+                .into()
+        };
+        let tool_pill = container(tools).style(shell::floating_pill).padding(3);
+
+        let zoom_pill = container(
             row![
-                button(text("−").size(18))
+                labelled(
+                    icons::control(Icon::Minus)
+                        .on_press(Message::ExecuteCommand(CommandId::ZoomOut)),
+                    CommandId::ZoomOut.label(),
+                ),
+                iced_button(text(format!("{}%", state.camera.zoom_percent())).size(12))
                     .style(shell::utility_button)
-                    .padding([5, 10])
-                    .on_press(Message::ExecuteCommand(CommandId::ZoomOut)),
-                button(text(format!("{}%", state.camera.zoom_percent())).size(12))
-                    .style(shell::utility_button)
-                    .padding([7, 9])
+                    .padding([7, 6])
                     .on_press(Message::ExecuteCommand(CommandId::ResetZoom)),
-                button(text("+").size(17))
-                    .style(shell::utility_button)
-                    .padding([5, 10])
-                    .on_press(Message::ExecuteCommand(CommandId::ZoomIn)),
+                labelled(
+                    icons::control(Icon::Plus).on_press(Message::ExecuteCommand(CommandId::ZoomIn)),
+                    CommandId::ZoomIn.label(),
+                ),
             ]
             .spacing(1)
             .align_y(IcedAlignment::Center),
         )
-        .style(shell::control_group)
-        .padding(2);
-        let toolbar = container(
-            row![
-                column![
-                    text(workspace_title).size(16),
-                    text(&state.working_directory)
-                        .size(11)
-                        .style(shell::subtle_text),
+        .style(shell::floating_pill)
+        .padding(3);
+
+        let rail_toggle = if state.sidebar_open {
+            iced::widget::Space::new().into()
+        } else {
+            container(sidebar_toggle(state))
+                .style(shell::floating_pill)
+                .padding(3)
+                .into()
+        };
+        let mut node_actions = row![].spacing(4).align_y(IcedAlignment::Center);
+        if let Some(node_id) = selected_terminal_node(state) {
+            let running = active_terminal_key(state, node_id)
+                .and_then(|key| state.terminals.get(&key))
+                .is_some_and(Session::is_active);
+            node_actions = node_actions
+                .push(
+                    button(
+                        text(if running {
+                            "Stop terminal"
+                        } else {
+                            "Start terminal"
+                        })
+                        .size(12),
+                    )
+                    .on_press(if running {
+                        Message::StopTerminal(node_id)
+                    } else {
+                        Message::StartTerminal(node_id)
+                    }),
+                )
+                .push(button(text("Chat").size(12)).on_press(Message::OpenControls(Controls::Node)))
+                .push(
+                    button(text("Rename").size(12))
+                        .on_press(Message::Rename(renaming::Message::Open(node_id))),
+                );
+        } else if state.canvas_selection.len() == 1
+            && state
+                .canvas_selection
+                .first()
+                .and_then(|id| workspace.node(*id))
+                .is_some_and(|node| {
+                    matches!(
+                        node.content(),
+                        openpodium::domain::CanvasNodeContent::Note { .. }
+                            | openpodium::domain::CanvasNodeContent::Text { .. }
+                            | openpodium::domain::CanvasNodeContent::Portal(_)
+                    )
+                })
+        {
+            node_actions = node_actions.push(
+                button(text("Edit selected node").size(12))
+                    .on_press(Message::OpenControls(Controls::Node)),
+            );
+        }
+        let connection_hint = (state.connection_mode != canvas::ConnectionMode::Off).then(|| {
+            container(
+                row![
+                    text(state.connection_error.as_deref().unwrap_or(
+                        match state.connection_mode {
+                            canvas::ConnectionMode::PickSource =>
+                                "Click or drag from a card to connect",
+                            _ => "Choose the destination card",
+                        }
+                    ))
+                    .size(12),
+                    button(text("Cancel · Esc").size(12))
+                        .on_press(Message::Canvas(canvas::Message::CancelConnection)),
                 ]
-                .spacing(1)
-                .width(Fill),
-                zoom_controls,
-                button("+ Codex").on_press(Message::AddAgent(AgentProgram::Codex)),
-                button("+ Claude").on_press(Message::AddAgent(AgentProgram::Claude)),
-                button(text(state.localizer.text(if state.inspector_open {
-                    "hide-inspector"
-                } else {
-                    "inspector"
-                })))
-                .style(shell::navigation_button(state.inspector_open))
-                .on_press(Message::ToggleInspector),
-            ]
-            .spacing(8)
-            .align_y(IcedAlignment::Center),
-        )
-        .style(shell::toolbar)
-        .padding([9, 12]);
-        let canvas = container(canvas)
+                .spacing(10)
+                .align_y(IcedAlignment::Center),
+            )
+            .style(shell::floating_pill)
+            .padding([6, 10])
+        });
+        let overlay = column![
+            float_row(
+                rail_toggle,
+                tool_pill.into(),
+                iced::widget::Space::new().into()
+            ),
+            container(column![connection_hint]).center_x(Fill),
+            iced::widget::Space::new().width(Fill).height(Fill),
+            container(node_actions).center_x(Fill),
+            row![container(workspace_chip).width(Fill).clip(true), zoom_pill,]
+                .spacing(10)
+                .align_y(IcedAlignment::Center),
+        ]
+        .spacing(10)
+        .height(Fill)
+        .padding(10);
+
+        let canvas_sheet = container(stack![container(canvas).width(Fill).height(Fill), overlay,])
             .width(Fill)
             .height(Fill)
-            .style(shell::toolbar);
-        let workspace_body: Element<'_, Message> = if state.inspector_open {
-            let inspector = container(scrollable(settings))
-                .style(shell::inspector)
-                .width(shell::INSPECTOR_WIDTH)
-                .height(Fill)
-                .padding(20);
-            row![canvas, inspector].spacing(12).into()
-        } else {
-            canvas.into()
-        };
-        container(column![toolbar, workspace_body].spacing(12))
+            .style(shell::canvas_surface)
+            .clip(true);
+
+        container(canvas_sheet)
             .style(shell::canvas)
             .width(Fill)
             .height(Fill)
-            .padding(12)
+            .padding(shell::STAGE_PADDING)
             .into()
     } else {
         let mut empty_content = column![
@@ -1552,11 +1999,14 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             text(state.localizer.text("create-first-workspace-detail"))
                 .size(15)
                 .style(shell::muted_text),
-            button(text(state.localizer.text("open-project")))
-                .style(shell::primary_button)
-                .padding([12, 18])
-                .on_press(Message::OpenProject)
-                .width(Fill),
+            primary_button(
+                container(text(state.localizer.text("open-project")).size(14))
+                    .width(Fill)
+                    .align_x(IcedAlignment::Center),
+            )
+            .padding([12, 18])
+            .on_press(Message::OpenProject)
+            .width(Fill),
         ]
         .spacing(14)
         .align_x(IcedAlignment::Center);
@@ -1568,30 +2018,146 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
             .width(Fill)
             .max_width(620)
             .padding(44);
-        container(empty_card)
+        let empty_stage = container(empty_card)
             .style(shell::canvas)
             .width(Fill)
             .height(Fill)
             .center(Fill)
-            .padding(40)
+            .padding(40);
+        if state.sidebar_open {
+            empty_stage.into()
+        } else {
+            // The first-run view has no canvas chip to carry the toggle, so it
+            // gets its own rather than stranding the rail behind a shortcut.
+            stack![
+                empty_stage,
+                container(sidebar_toggle(state))
+                    .width(Fill)
+                    .height(Fill)
+                    .align_x(IcedAlignment::Start)
+                    .align_y(IcedAlignment::Start)
+                    .padding(14),
+            ]
             .into()
+        }
     };
 
-    let application = row![sidebar, stage].height(Fill);
-    if state.navigation_ui.open {
-        column![
-            navigation_panel::view(&state.navigation_ui, &state.command_registry)
-                .map(Message::Navigation),
+    // A hairline is the only thing separating the rail from the stage; both
+    // share the same chrome grey so neither reads as a heavier slab.
+    let application: Element<'_, Message> = if state.sidebar_open {
+        row![
+            sidebar,
+            container(iced::widget::Space::new().width(1).height(Fill))
+                .style(shell::rule)
+                .width(1)
+                .height(Fill),
+            stage,
+        ]
+        .height(Fill)
+        .into()
+    } else {
+        stage
+    };
+    let application = if let Some(controls) = state.controls {
+        if matches!(controls, Controls::Menu | Controls::Advanced) {
+            let choices: &[Controls] = if controls == Controls::Menu {
+                &[Controls::Workspace, Controls::Advanced]
+            } else {
+                &[
+                    Controls::Canvas,
+                    Controls::Agents,
+                    Controls::Environments,
+                    Controls::Worktrees,
+                    Controls::Portals,
+                    Controls::Routines,
+                    Controls::Tasks,
+                    Controls::Notifications,
+                ]
+            };
+            settings = column(choices.iter().map(|choice| {
+                button(text(choice.title()).size(13))
+                    .style(shell::utility_button)
+                    .width(Fill)
+                    .on_press(Message::OpenControls(*choice))
+                    .into()
+            }))
+            .spacing(4);
+        }
+        let scrim = iced::widget::mouse_area(
+            container(iced::widget::Space::new().width(Fill).height(Fill))
+                .width(Fill)
+                .height(Fill)
+                .style(shell::scrim),
+        )
+        .on_press(Message::CloseControls);
+        let height = (state.window_size.height - 100.0).clamp(180.0, 600.0);
+        let body: Element<'_, Message> = if matches!(controls, Controls::Menu | Controls::Advanced)
+        {
+            settings.into()
+        } else {
+            container(scrollable(settings).height(iced::Shrink))
+                .max_height(height)
+                .into()
+        };
+        let dialog = container(
+            column![
+                row![
+                    text(if editing_note {
+                        context_nodes::editor_title(&state.context_ui).unwrap_or(controls.title())
+                    } else {
+                        controls.title()
+                    })
+                    .size(18)
+                    .width(Fill),
+                    button(text("Close").size(12)).on_press(Message::CloseControls),
+                ]
+                .align_y(IcedAlignment::Center)
+                .spacing(12),
+                body,
+            ]
+            .spacing(14),
+        )
+        .style(shell::card)
+        .padding(18)
+        .width(Fill)
+        .max_width(match controls {
+            Controls::Menu | Controls::Advanced => 340.0,
+            Controls::Rename | Controls::RemoveWorkspace(_) => 420.0,
+            _ => 620.0,
+        });
+        stack![
             application,
+            scrim,
+            container(iced::widget::opaque(dialog))
+                .center(Fill)
+                .padding(20)
         ]
         .into()
     } else {
-        application.into()
+        application
+    };
+    if state.navigation_ui.open {
+        stack![
+            application,
+            navigation_panel::view(&state.navigation_ui, &state.command_registry)
+                .map(Message::Navigation),
+        ]
+        .into()
+    } else {
+        application
     }
 }
 
 impl OpenPodium {
+    fn cancel_connection(&mut self) {
+        self.connection_mode = canvas::ConnectionMode::Off;
+        self.connection_error = None;
+        self.canvas_revision = self.canvas_revision.wrapping_add(1);
+    }
+
     fn reset_canvas_session(&mut self) {
+        self.cancel_connection();
+        self.controls = None;
         self.focused_terminal = None;
         self.focused_portal = None;
         self.portal_frames.clear();
@@ -1600,6 +2166,99 @@ impl OpenPodium {
         self.canvas_preview = None;
         self.canvas_history.clear();
         self.canvas_revision = self.canvas_revision.wrapping_add(1);
+    }
+
+    /// Rebuilds offline terminal views for the active workspace from stored
+    /// transcripts, so a reopened node shows the output it had. Nodes with a
+    /// live session keep it; nothing is started here.
+    fn restore_terminal_transcripts(&mut self) {
+        let Some(workspaces) = self.workspaces.as_ref() else {
+            return;
+        };
+        let Some(workspace) = workspaces.active_workspace() else {
+            return;
+        };
+        let workspace_id = workspace.id();
+        let sizes = workspace
+            .all_canvas_layout()
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.reference(), Some(NodeTarget::Agent(_))))
+            .map(|node| {
+                (
+                    node.id(),
+                    terminal::GridSize::for_node(node.size().width(), node.size().height()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let Ok(transcripts) = workspaces.terminal_transcripts(workspace_id) else {
+            return;
+        };
+
+        let mut orphans = Vec::new();
+        for (node_id, payload) in transcripts {
+            let raw_node_id = node_id;
+            let node_id = NodeId::new(node_id);
+            let Some(size) = sizes.get(&node_id).copied() else {
+                // The node is gone and undo history does not survive a reload,
+                // so nothing can bring it back to claim this transcript.
+                orphans.push(raw_node_id);
+                continue;
+            };
+            let key = TerminalKey {
+                workspace_id,
+                node_id,
+            };
+            if self.terminals.contains_key(&key) {
+                continue;
+            }
+            self.terminal_generation = self.terminal_generation.wrapping_add(1);
+            self.terminals.insert(
+                key,
+                Session::restored(size, self.terminal_generation, payload),
+            );
+        }
+
+        if let Some(workspaces) = self.workspaces.as_mut() {
+            for node_id in orphans {
+                let _ = workspaces.clear_terminal_transcript(workspace_id, node_id);
+            }
+        }
+        self.canvas_revision = self.canvas_revision.wrapping_add(1);
+    }
+
+    /// Writes every transcript that changed since the last capture.
+    fn flush_terminal_transcripts(&mut self) {
+        let pending = self
+            .terminals
+            .iter_mut()
+            .filter_map(|(key, session)| {
+                session
+                    .take_transcript()
+                    .map(|transcript| (*key, transcript))
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(workspaces) = self.workspaces.as_mut() else {
+            return;
+        };
+        let captured_at = now();
+        for (key, payload) in pending {
+            if workspaces
+                .store_terminal_transcript(
+                    key.workspace_id,
+                    key.node_id.get(),
+                    captured_at,
+                    &payload,
+                )
+                .is_ok()
+                && let Some(session) = self.terminals.get_mut(&key)
+            {
+                session.mark_transcript_persisted();
+            }
+        }
     }
 
     fn stop_all_terminals(&mut self) {
@@ -1675,6 +2334,8 @@ impl OpenPodium {
 impl Drop for OpenPodium {
     fn drop(&mut self) {
         portals::shutdown(self);
+        // Capture before stopping: stopping drops the sessions holding them.
+        self.flush_terminal_transcripts();
         self.stop_all_terminals();
     }
 }
@@ -1873,6 +2534,7 @@ fn navigate_to_task(state: &mut OpenPodium, target: NavigationTarget) {
         }
         state.reset_canvas_session();
         state.load_active_settings();
+        state.restore_terminal_transcripts();
     }
     state
         .timeline_ui
@@ -2565,6 +3227,14 @@ fn delivery_target(
 
 fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Task<Message> {
     match message {
+        canvas::Message::ConnectionSourceSelected(source) => {
+            state.connection_mode = canvas::ConnectionMode::PickTarget(source);
+            state.connection_error = None;
+            state.canvas_selection = vec![source];
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        }
+        canvas::Message::ConnectNodes { source, target } => connect_nodes(state, source, target),
+        canvas::Message::CancelConnection => state.cancel_connection(),
         canvas::Message::CameraChanged(camera) => {
             state.camera = camera;
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
@@ -2575,6 +3245,14 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
             state.focused_portal = None;
             context_nodes::selection_changed(state);
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        }
+        canvas::Message::EditRequested(node_id) => {
+            state.canvas_selection = vec![node_id];
+            state.canvas_revision = state.canvas_revision.wrapping_add(1);
+            return context_nodes::open_editor(state);
+        }
+        canvas::Message::RenameRequested(node_id) => {
+            return renaming::update(state, renaming::Message::Open(node_id));
         }
         canvas::Message::PreviewLayout(layout) => {
             state.canvas_preview = Some(layout);
@@ -4335,6 +5013,27 @@ fn paste_canvas_fragment(state: &mut OpenPodium, payload: Option<&str>) {
 }
 
 fn apply_canvas_action(state: &mut OpenPodium, action: CanvasAction) {
+    if matches!(action, CanvasAction::Connect) {
+        if state.connection_mode != canvas::ConnectionMode::Off {
+            state.cancel_connection();
+            return;
+        }
+        state.controls = None;
+        state.focused_terminal = None;
+        state.focused_portal = None;
+        state.connection_error = None;
+        state.connection_mode = match state.canvas_selection.as_slice() {
+            [source] => canvas::ConnectionMode::PickTarget(*source),
+            [source, target] => {
+                let (source, target) = (*source, *target);
+                connect_nodes(state, source, target);
+                return;
+            }
+            _ => canvas::ConnectionMode::PickSource,
+        };
+        state.canvas_revision = state.canvas_revision.wrapping_add(1);
+        return;
+    }
     if matches!(action, CanvasAction::Undo) {
         undo_canvas(state);
         return;
@@ -4366,16 +5065,11 @@ fn apply_canvas_action(state: &mut OpenPodium, action: CanvasAction) {
         }
         CanvasAction::Group => canvas::editor::group(&before, &selection, &all),
         CanvasAction::Ungroup => canvas::editor::ungroup(&before, &selection),
-        CanvasAction::Connect => match canvas::editor::connect(&before, &selection, &all) {
-            Ok(after) => after,
-            Err(error) => {
-                state.notice = Some(error.to_owned());
-                return;
-            }
-        },
         CanvasAction::Align(alignment) => canvas::editor::align(&before, &selection, alignment),
         CanvasAction::ZOrder(order) => canvas::editor::change_z_order(&before, &selection, order),
-        CanvasAction::Undo | CanvasAction::Redo => unreachable!("handled above"),
+        CanvasAction::Undo | CanvasAction::Redo | CanvasAction::Connect => {
+            unreachable!("handled above")
+        }
     };
     if before == after {
         return;
@@ -4384,6 +5078,35 @@ fn apply_canvas_action(state: &mut OpenPodium, action: CanvasAction) {
         state.canvas_history.record(before);
         state.canvas_selection = selection;
         state.notice = None;
+    }
+}
+
+fn connect_nodes(state: &mut OpenPodium, source: NodeId, target: NodeId) {
+    let Some(before) = current_canvas(state) else {
+        return;
+    };
+    state.connection_mode = canvas::ConnectionMode::PickTarget(source);
+    if source == target {
+        state.connection_error = Some("Choose a different card".to_owned());
+        return;
+    }
+    let all = state
+        .workspaces
+        .as_ref()
+        .and_then(WorkspaceManager::active_workspace)
+        .map(Workspace::all_canvas_layout)
+        .unwrap_or_else(|| before.clone());
+    match canvas::editor::connect(&before, &[source, target], &all) {
+        Ok(after) => {
+            if persist_canvas(state, before.clone(), after).is_ok() {
+                state.canvas_history.record(before);
+                state.canvas_selection = vec![source, target];
+                state.cancel_connection();
+            } else {
+                state.connection_error = state.notice.take();
+            }
+        }
+        Err(error) => state.connection_error = Some(error.to_owned()),
     }
 }
 
@@ -4446,6 +5169,7 @@ fn persist_canvas(
                 .expect("workspace was just updated")
                 .all_canvas_layout();
             synchronize_terminals(state, &runtime_layout);
+            state.sync_ipc_directory();
             portals::sync_connections(state);
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
             Ok(())
@@ -4568,7 +5292,7 @@ fn next_agent_id(workspace: &Workspace) -> Option<AgentId> {
     let mut value = 1_u64;
     loop {
         let id = AgentId::new(value);
-        if workspace.agent(id).is_none() {
+        if workspace.recorded_agent(id).is_none() {
             return Some(id);
         }
         value = value.checked_add(1)?;
@@ -4777,6 +5501,57 @@ mod tests {
     }
 
     #[test]
+    fn deleting_agent_window_updates_registry_ipc_and_undo_without_reusing_ids() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let (mut state, workspace_id, thread_id) = state_with_chat(&temp, &database);
+        state.ipc = Some(IpcService::start(temp.path()).unwrap());
+        state.sync_ipc_directory();
+        let connected = |state: &OpenPodium| {
+            state
+                .ipc
+                .as_ref()
+                .unwrap()
+                .connection_info(workspace_id.get(), 1)
+                .is_some()
+        };
+        assert!(connected(&state));
+        apply_canvas_action(&mut state, CanvasAction::Remove);
+        let workspace = state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .workspace(workspace_id)
+            .unwrap();
+        assert_eq!(workspace.agent_count(), 0);
+        assert_eq!(next_agent_id(workspace), Some(AgentId::new(2)));
+        assert!(workspace.chat_thread(thread_id).is_some());
+        assert!(!connected(&state));
+        undo_canvas(&mut state);
+        assert!(connected(&state));
+        assert_eq!(
+            state
+                .workspaces
+                .as_ref()
+                .unwrap()
+                .workspace(workspace_id)
+                .unwrap()
+                .agent_count(),
+            1
+        );
+        redo_canvas(&mut state);
+        assert!(!connected(&state));
+        assert_eq!(
+            WorkspaceManager::open(&database)
+                .unwrap()
+                .workspace(workspace_id)
+                .unwrap()
+                .agent_count(),
+            0
+        );
+    }
+
+    #[test]
     fn handoff_delivery_target_is_independent_of_the_active_workspace() {
         let temp = TempDir::new().unwrap();
         let first = temp.path().join("first");
@@ -4929,15 +5704,21 @@ mod tests {
             .create_workspace(&project, Timestamp::from_unix_millis(1))
             .unwrap();
         let mut state = OpenPodium {
+            transcript_ticks: 0,
+            sidebar_open: true,
+            window_size: DEFAULT_WINDOW_SIZE,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
-            inspector_open: false,
+            controls: None,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
+            rename_ui: renaming::State::default(),
             portal_ui: portals::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
+            connection_mode: canvas::ConnectionMode::Off,
+            connection_error: None,
             canvas_history: History::default(),
             canvas_revision: 1,
             terminals: BTreeMap::new(),
@@ -5166,6 +5947,227 @@ mod tests {
             event::Status::Captured,
         );
         assert_eq!(state.camera.zoom_percent(), 83);
+    }
+
+    #[test]
+    fn workspace_controls_isolate_canvas_shortcuts_and_release_embedded_focus() {
+        let temp = TempDir::new().unwrap();
+        let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+        state.focused_terminal = Some(NodeId::new(1));
+        state.focused_portal = Some(NodeId::new(2));
+
+        let _ = update(&mut state, Message::OpenControls(Controls::Workspace));
+        assert!(state.focused_terminal.is_none());
+        assert!(state.focused_portal.is_none());
+        let zoom_out = state.command_registry.binding(CommandId::ZoomOut).cloned();
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Other,
+            zoom_out.clone(),
+            event::Status::Ignored,
+        );
+        assert_eq!(state.camera.zoom_percent(), 100);
+
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Escape,
+            None,
+            event::Status::Ignored,
+        );
+        assert!(state.controls.is_none());
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Other,
+            zoom_out,
+            event::Status::Ignored,
+        );
+        assert_eq!(state.camera.zoom_percent(), 83);
+    }
+
+    #[test]
+    fn note_editing_opens_on_create_click_and_enter_and_saves_to_disk() {
+        let temp = TempDir::new().unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        workspaces.create_workspace(temp.path(), now()).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+
+        let _ = update(
+            &mut state,
+            Message::AddContextNode(context_nodes::Kind::Note),
+        );
+        let node_id = state.canvas_selection[0];
+        assert_eq!(state.controls, Some(Controls::Node));
+        assert!(context_nodes::note_panel(&state.context_ui).is_some());
+        let _ = update(
+            &mut state,
+            Message::EditNote(text_editor::Action::Edit(text_editor::Edit::Paste(
+                std::sync::Arc::new("A writable note".to_owned()),
+            ))),
+        );
+        let _ = update(&mut state, Message::SaveNote(false));
+        let note_path = temp
+            .path()
+            .join(format!(".openpodium/notes/{}.md", node_id.get()));
+        assert_eq!(
+            fs::read_to_string(&note_path).unwrap().trim_end(),
+            "A writable note"
+        );
+
+        let _ = update(&mut state, Message::CloseControls);
+        let _ = handle_canvas_message(&mut state, canvas::Message::SelectionChanged(Vec::new()));
+        let _ = handle_canvas_message(&mut state, canvas::Message::EditRequested(node_id));
+        assert_eq!(state.controls, Some(Controls::Node));
+        assert_eq!(state.canvas_selection, vec![node_id]);
+        assert_eq!(
+            context_nodes::bodies(&state.context_ui)[&node_id].trim_end(),
+            "A writable note"
+        );
+
+        let _ = update(&mut state, Message::CloseControls);
+        let _ = update(&mut state, Message::ExecuteCommand(CommandId::FocusContent));
+        assert_eq!(state.controls, Some(Controls::Node));
+        assert!(context_nodes::note_panel(&state.context_ui).is_some());
+    }
+
+    #[test]
+    fn text_editing_opens_on_create_and_saves_to_the_canvas() {
+        let temp = TempDir::new().unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        workspaces.create_workspace(temp.path(), now()).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+        let _ = update(
+            &mut state,
+            Message::AddContextNode(context_nodes::Kind::Text),
+        );
+        let node_id = state.canvas_selection[0];
+        assert_eq!(state.controls, Some(Controls::Node));
+        assert!(context_nodes::note_panel(&state.context_ui).is_some());
+        let _ = update(
+            &mut state,
+            Message::EditNote(text_editor::Action::SelectAll),
+        );
+        let _ = update(
+            &mut state,
+            Message::EditNote(text_editor::Action::Edit(text_editor::Edit::Paste(
+                std::sync::Arc::new("Edited text".to_owned()),
+            ))),
+        );
+        let _ = update(&mut state, Message::SaveCanvasText);
+        let node = state
+            .workspaces
+            .as_ref()
+            .unwrap()
+            .active_workspace()
+            .unwrap()
+            .node(node_id)
+            .unwrap();
+        assert!(
+            matches!(node.content(), openpodium::domain::CanvasNodeContent::Text { markdown } if markdown.as_str().trim_end() == "Edited text")
+        );
+    }
+
+    #[test]
+    fn connection_tool_creates_a_durable_link_with_undo_redo_and_duplicate_protection() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("state.sqlite");
+        let mut workspaces = WorkspaceManager::open(&database).unwrap();
+        workspaces.create_workspace(temp.path(), now()).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+        let _ = context_nodes::add(&mut state, context_nodes::Kind::Note);
+        let source = state.canvas_selection[0];
+        let _ = context_nodes::add(&mut state, context_nodes::Kind::Note);
+        let target = state.canvas_selection[0];
+        state.canvas_selection = vec![source];
+        state.focused_terminal = Some(source);
+        apply_canvas_action(&mut state, CanvasAction::Connect);
+        assert_eq!(
+            state.connection_mode,
+            canvas::ConnectionMode::PickTarget(source)
+        );
+        assert!(state.controls.is_none());
+        assert!(state.focused_terminal.is_none());
+
+        let _ = handle_canvas_message(&mut state, canvas::Message::ConnectNodes { source, target });
+        assert_eq!(state.connection_mode, canvas::ConnectionMode::Off);
+        let layout = current_canvas(&state).unwrap();
+        assert_eq!(layout.connections().len(), 1);
+        assert_eq!(layout.connections()[0].source(), source);
+        assert_eq!(layout.connections()[0].target(), target);
+
+        undo_canvas(&mut state);
+        assert!(current_canvas(&state).unwrap().connections().is_empty());
+        redo_canvas(&mut state);
+        assert_eq!(current_canvas(&state).unwrap().connections().len(), 1);
+        connect_nodes(&mut state, source, target);
+        assert!(
+            state
+                .connection_error
+                .as_deref()
+                .unwrap()
+                .contains("already connected")
+        );
+        assert_eq!(current_canvas(&state).unwrap().connections().len(), 1);
+        connect_nodes(&mut state, source, source);
+        assert_eq!(
+            state.connection_error.as_deref(),
+            Some("Choose a different card")
+        );
+        assert_eq!(current_canvas(&state).unwrap().connections().len(), 1);
+        let restored = WorkspaceManager::open(database).unwrap();
+        assert_eq!(
+            restored
+                .active_workspace()
+                .unwrap()
+                .canvas_layout()
+                .connections(),
+            layout.connections()
+        );
+    }
+
+    #[test]
+    fn connection_tool_can_pick_a_source_and_cancel_without_changing_the_canvas() {
+        let temp = TempDir::new().unwrap();
+        let mut workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        workspaces.create_workspace(temp.path(), now()).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+        let _ = context_nodes::add(&mut state, context_nodes::Kind::Note);
+        let source = state.canvas_selection[0];
+        state.canvas_selection.clear();
+        let before = current_canvas(&state).unwrap();
+        apply_canvas_action(&mut state, CanvasAction::Connect);
+        assert_eq!(state.connection_mode, canvas::ConnectionMode::PickSource);
+        let _ = handle_canvas_message(
+            &mut state,
+            canvas::Message::ConnectionSourceSelected(source),
+        );
+        assert_eq!(
+            state.connection_mode,
+            canvas::ConnectionMode::PickTarget(source)
+        );
+        let delete = state.command_registry.binding(CommandId::Delete).cloned();
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Other,
+            delete,
+            event::Status::Ignored,
+        );
+        assert_eq!(current_canvas(&state).unwrap(), before);
+        let _ = navigation::handle_key(
+            &mut state,
+            navigation::NavigationKey::Escape,
+            None,
+            event::Status::Ignored,
+        );
+        assert_eq!(state.connection_mode, canvas::ConnectionMode::Off);
+        assert_eq!(current_canvas(&state).unwrap(), before);
+        apply_canvas_action(&mut state, CanvasAction::Connect);
+        let _ = handle_canvas_message(&mut state, canvas::Message::CancelConnection);
+        assert_eq!(state.connection_mode, canvas::ConnectionMode::Off);
+        apply_canvas_action(&mut state, CanvasAction::Connect);
+        apply_canvas_action(&mut state, CanvasAction::Connect);
+        assert_eq!(state.connection_mode, canvas::ConnectionMode::Off);
+        assert_eq!(current_canvas(&state).unwrap(), before);
     }
 
     #[test]
@@ -5663,8 +6665,10 @@ mod tests {
         );
 
         let previous_contrast = state.presentation.high_contrast();
+        let previous_canvas_revision = state.canvas_revision;
         let _ = update(&mut state, Message::ToggleHighContrast);
         assert_eq!(state.presentation.high_contrast(), !previous_contrast);
+        assert_ne!(state.canvas_revision, previous_canvas_revision);
         assert_eq!(
             state.workspaces.as_ref().unwrap().preferences().unwrap(),
             vec![
@@ -5675,6 +6679,32 @@ mod tests {
                 (LOCALE_KEY.to_owned(), "pt-BR".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn interface_scale_and_workspace_controls_preserve_canvas_geometry() {
+        let temp = TempDir::new().unwrap();
+        let workspaces = WorkspaceManager::open(temp.path().join("state.sqlite")).unwrap();
+        let mut state = test_state(workspaces, BTreeMap::new());
+        state
+            .presentation
+            .apply_stored([(TEXT_SCALE_KEY.to_owned(), "1".to_owned())]);
+        let initial_viewport = canvas_viewport(&state);
+        let _ = update(&mut state, Message::OpenControls(Controls::Workspace));
+        assert_eq!(canvas_viewport(&state), initial_viewport);
+
+        for _ in 0..4 {
+            let _ = update(&mut state, Message::CycleTextScale);
+        }
+        assert_eq!(state.presentation.text_scale_percent(), 200);
+        assert!((state.window_size.width - 640.0).abs() < 0.01);
+        let with_controls = canvas_viewport(&state);
+        assert!(with_controls.0 > 400.0);
+        let _ = update(&mut state, Message::CloseControls);
+        assert_eq!(canvas_viewport(&state), with_controls);
+
+        let _ = update(&mut state, Message::WindowResized(Size::new(900.0, 620.0)));
+        assert!(canvas_viewport(&state).0 > 670.0);
     }
 
     #[test]
@@ -5696,20 +6726,26 @@ mod tests {
         assert_eq!(state.notice.as_deref(), Some("Workspace created"));
     }
 
-    fn test_state(
+    pub(super) fn test_state(
         workspaces: WorkspaceManager,
         terminals: BTreeMap<TerminalKey, Session>,
     ) -> OpenPodium {
         OpenPodium {
+            transcript_ticks: 0,
+            sidebar_open: true,
+            window_size: DEFAULT_WINDOW_SIZE,
             localizer: Localizer::new(openpodium::localization::Locale::EnUs),
             presentation: PresentationPreferences::default(),
-            inspector_open: false,
+            controls: None,
             floor_ui: floors::UiState::default(),
             context_ui: context_nodes::UiState::default(),
+            rename_ui: renaming::State::default(),
             portal_ui: portals::UiState::default(),
             camera: Camera::default(),
             canvas_selection: Vec::new(),
             canvas_preview: None,
+            connection_mode: canvas::ConnectionMode::Off,
+            connection_error: None,
             canvas_history: History::default(),
             canvas_revision: 1,
             terminals,

@@ -23,6 +23,7 @@ pub(crate) struct Session {
     controller: Option<ProcessController>,
     stream: Option<ProcessStream>,
     generation: u64,
+    transcript_dirty: bool,
 }
 
 impl Session {
@@ -33,7 +34,33 @@ impl Session {
             controller: None,
             stream: None,
             generation,
+            transcript_dirty: false,
         }
+    }
+
+    /// Rebuilds a node's last screen from a stored transcript. The process is
+    /// gone, so the session stays offline and only replays what it showed.
+    pub(crate) fn restored(size: GridSize, generation: u64, transcript: Vec<u8>) -> Self {
+        let model = super::snapshot::restore(size, &transcript);
+        Self {
+            model,
+            status: Status::Offline,
+            controller: None,
+            stream: None,
+            generation,
+            transcript_dirty: false,
+        }
+    }
+
+    /// The bytes worth storing, or `None` when nothing has changed since the
+    /// successful store. Capturing does not acknowledge persistence.
+    pub(crate) fn take_transcript(&mut self) -> Option<Vec<u8>> {
+        self.transcript_dirty
+            .then(|| super::snapshot::capture(&mut self.model))
+    }
+
+    pub(crate) fn mark_transcript_persisted(&mut self) {
+        self.transcript_dirty = false;
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -66,7 +93,9 @@ impl Session {
     }
 
     pub(crate) fn view(&self) -> View {
-        self.model.view(self.status.clone())
+        let mut view = self.model.view(self.status.clone());
+        view.mode.mouse_reporting &= matches!(self.status, Status::Running);
+        view
     }
 
     pub(crate) fn input_mode(&self) -> InputMode {
@@ -86,6 +115,7 @@ impl Session {
     }
 
     pub(crate) fn resize(&mut self, size: GridSize) -> Result<(), String> {
+        self.transcript_dirty |= self.model.size != size;
         self.model.resize(size);
         let Some(controller) = &self.controller else {
             return Ok(());
@@ -120,25 +150,27 @@ impl Session {
 
     pub(crate) fn handle_event(&mut self, event: ProcessEvent) -> Vec<Action> {
         match event {
-            ProcessEvent::Output(bytes) => self
-                .model
-                .feed(&bytes)
-                .into_iter()
-                .filter_map(|update| match update {
-                    Update::PtyWrite(bytes) => {
-                        if let Err(error) = self.write(&bytes) {
-                            self.status = Status::Failed(error.to_string());
+            ProcessEvent::Output(bytes) => {
+                self.transcript_dirty = true;
+                self.model
+                    .feed(&bytes)
+                    .into_iter()
+                    .filter_map(|update| match update {
+                        Update::PtyWrite(bytes) => {
+                            if let Err(error) = self.write(&bytes) {
+                                self.status = Status::Failed(error.to_string());
+                            }
+                            None
                         }
-                        None
-                    }
-                    Update::ClipboardStore(text) => Some(Action::ClipboardStore(text)),
-                    Update::Bell => Some(Action::Bell),
-                    Update::TitleChanged(title) => {
-                        let _ = title;
-                        None
-                    }
-                })
-                .collect(),
+                        Update::ClipboardStore(text) => Some(Action::ClipboardStore(text)),
+                        Update::Bell => Some(Action::Bell),
+                        Update::TitleChanged(title) => {
+                            let _ = title;
+                            None
+                        }
+                    })
+                    .collect()
+            }
             ProcessEvent::Terminated(termination) => {
                 self.controller = None;
                 self.stream = None;
@@ -190,4 +222,67 @@ pub(crate) fn process_spec(
         TerminalSize::new(size.rows, size.columns)
             .expect("terminal grid dimensions are always non-zero"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Session;
+    use crate::terminal::{GridSize, Status};
+    use openpodium::runtime::ProcessEvent;
+
+    fn size() -> GridSize {
+        GridSize::for_node(400.0, 300.0)
+    }
+
+    #[test]
+    fn a_restored_session_replays_its_transcript_without_running_anything() {
+        let session = Session::restored(size(), 1, b"hello".to_vec());
+        let view = session.view();
+
+        assert!(!session.is_active());
+        assert!(matches!(view.status, Status::Offline));
+        assert!(
+            view.cells.iter().any(|cell| cell.text == "h"),
+            "the stored output should be back on screen"
+        );
+    }
+
+    #[test]
+    fn offline_mouse_reporting_uses_local_scrollback() {
+        let mut session = Session::starting(size(), 1);
+        session.handle_event(ProcessEvent::Output(b"\x1b[?1000hhello".to_vec()));
+        let payload = session.take_transcript().unwrap();
+        let restored = Session::restored(size(), 2, payload);
+        assert!(!restored.view().mode.mouse_reporting);
+    }
+
+    #[test]
+    fn a_transcript_is_captured_once_per_change() {
+        let mut session = Session::starting(size(), 1);
+        assert!(session.take_transcript().is_none());
+
+        session.handle_event(ProcessEvent::Output(b"first".to_vec()));
+        let first = session.take_transcript().unwrap();
+        assert_eq!(session.take_transcript(), Some(first.clone()));
+        session.mark_transcript_persisted();
+        assert!(session.take_transcript().is_none());
+
+        session.handle_event(ProcessEvent::Output(b" second".to_vec()));
+        assert_ne!(session.take_transcript(), Some(first));
+    }
+
+    #[test]
+    fn large_output_preserves_early_styles_in_a_bounded_screen_snapshot() {
+        let mut session = Session::starting(size(), 1);
+        session.handle_event(ProcessEvent::Output(b"\x1b[31m".to_vec()));
+        let line = b"0123456789abcdef\r\n";
+        for _ in 0..10_000 {
+            session.handle_event(ProcessEvent::Output(line.to_vec()));
+        }
+        let payload = session.take_transcript().unwrap();
+        assert!(payload.len() < 1024 * 1024);
+        let mut expected = session.view();
+        expected.status = Status::Offline;
+        assert_eq!(Session::restored(size(), 2, payload).view(), expected);
+    }
 }

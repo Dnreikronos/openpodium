@@ -1,5 +1,8 @@
-use iced::widget::{button, column, row, text, text_input};
-use iced::{Element, Task};
+use iced::widget::{column, row, text};
+use iced::{Alignment, Element, Fill, Task};
+
+use super::shell;
+use super::ui::{action_grid, button, primary_button, section_label, text_input};
 use openpodium::domain::WorkspaceId;
 use openpodium::domain::{FloorLifecycle, FloorOwner, NodeTarget};
 use openpodium::workspaces::{FloorOperation, FloorResult};
@@ -227,12 +230,18 @@ pub(super) fn update(state: &mut OpenPodium, message: Message) -> Task<AppMessag
 
 pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
     let mut content = column![
-        text("Git worktree floors").size(18),
-        button("Discover / refresh worktrees").on_press(AppMessage::Floor(Message::Refresh))
+        section_label("Git worktree floors"),
+        button(text("Discover / refresh worktrees").size(12))
+            .padding([6, 10])
+            .on_press(AppMessage::Floor(Message::Refresh))
     ]
     .spacing(8);
     if state.floor_ui.busy {
-        content = content.push(text("Git operation in progress…"));
+        content = content.push(
+            text("Git operation in progress…")
+                .size(12)
+                .style(shell::muted_text),
+        );
     }
     let Some(workspace) = state
         .workspaces
@@ -244,15 +253,19 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
     let selected = workspace.floors().active;
     let main_severity = status::severity_for_main(&state.floor_ui.status, workspace.id());
     content = content.push(
-        button(text(format!(
-            "Main floor{}{}",
-            if selected.is_none() {
-                " (selected)"
-            } else {
-                ""
-            },
-            main_severity.map_or(String::new(), |severity| format!(" · Git {severity}"))
-        )))
+        button(
+            row![
+                text("Main floor").size(12).width(Fill),
+                text(main_severity.map_or(String::new(), |severity| format!("Git {severity}")))
+                    .size(11)
+                    .style(shell::muted_text),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .padding([6, 9])
+        .style(shell::navigation_button(selected.is_none()))
+        .width(Fill)
         .on_press(AppMessage::Floor(Message::Switch(None))),
     );
     for change in status::changes_for_main(&state.floor_ui.status, workspace.id()) {
@@ -262,7 +275,8 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
                 status::change_label(&change.kind),
                 change.path
             ))
-            .size(12),
+            .size(11)
+            .style(shell::muted_text),
         );
     }
     for (id, floor) in &workspace.floors().entries {
@@ -271,14 +285,8 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
             workspace.id(),
             std::path::Path::new(floor.directory.as_str()),
         );
-        let label = format!(
-            "{}{} · {} · {} · {:?}{}",
-            floor.name,
-            if selected == Some(*id) {
-                " (selected)"
-            } else {
-                ""
-            },
+        let detail = format!(
+            "{} · {} · {:?}{}",
             if floor.managed {
                 "managed"
             } else {
@@ -289,14 +297,27 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
             severity.map_or(String::new(), |severity| format!(" · Git {severity}"))
         );
         content = content
-            .push(button(text(label)).on_press(AppMessage::Floor(Message::Switch(Some(*id)))))
+            .push(
+                button(
+                    column![
+                        text(floor.name.to_string()).size(12),
+                        text(detail).size(11).style(shell::muted_text),
+                    ]
+                    .spacing(1),
+                )
+                .padding([6, 9])
+                .style(shell::navigation_button(selected == Some(*id)))
+                .width(Fill)
+                .on_press(AppMessage::Floor(Message::Switch(Some(*id)))),
+            )
             .push(
                 text(format!(
                     "{} · {}",
                     floor.branch.as_deref().unwrap_or("detached"),
                     floor.directory.as_str()
                 ))
-                .size(12),
+                .size(11)
+                .style(shell::subtle_text),
             );
         for change in status::changes_for(
             &state.floor_ui.status,
@@ -309,23 +330,32 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
                     status::change_label(&change.kind),
                     change.path
                 ))
-                .size(12),
+                .size(11)
+                .style(shell::muted_text),
             );
         }
         if floor.lifecycle == FloorLifecycle::Available {
-            content = content.push(button("Preview integration into main").on_press(
-                AppMessage::Floor(Message::Integration(integration::Message::Preview(*id))),
-            ));
+            content = content.push(
+                button(text("Preview integration into main").size(12))
+                    .padding([6, 10])
+                    .width(Fill)
+                    .on_press(AppMessage::Floor(Message::Integration(
+                        integration::Message::Preview(*id),
+                    ))),
+            );
         }
         if floor.managed && floor.lifecycle == FloorLifecycle::Available {
-            content = content.push(
-                row![
-                    button("Clean up").on_press(AppMessage::Floor(Message::Remove(*id))),
-                    button("Discard checkout…")
-                        .on_press(AppMessage::Floor(Message::RequestDiscard(*id)))
-                ]
-                .spacing(8),
-            );
+            content = content.push(action_grid([
+                button(text("Clean up").size(12))
+                    .padding([6, 10])
+                    .on_press(AppMessage::Floor(Message::Remove(*id)))
+                    .into(),
+                button(text("Discard…").size(12))
+                    .padding([6, 10])
+                    .style(shell::danger_button)
+                    .on_press(AppMessage::Floor(Message::RequestDiscard(*id)))
+                    .into(),
+            ]));
         }
     }
     content = content
@@ -337,15 +367,33 @@ pub(super) fn view(state: &OpenPodium) -> Element<'_, AppMessage> {
             text_input("New branch", &state.floor_ui.branch)
                 .on_input(|s| AppMessage::Floor(Message::Branch(s))),
         )
-        .push(text("Select an agent or task node first to record it as the owner.").size(12))
-        .push(button("Create floor").on_press(AppMessage::Floor(Message::Create)));
+        .push(
+            text("Select an agent or task node first to record it as the owner.")
+                .size(11)
+                .style(shell::muted_text),
+        )
+        .push(
+            primary_button(text("Create floor").size(13))
+                .on_press(AppMessage::Floor(Message::Create)),
+        );
     if let Some((id, floor)) = state.floor_ui.discard
         && id == workspace.id()
         && let Some(floor) = workspace.floors().entries.get(&floor)
     {
-        content = content.push(text(format!("Discard {} at {}? This deletes its checkout, including uncommitted and untracked files. The branch and canvas history are retained. Type the floor name to confirm.", floor.name, floor.directory.as_str())))
+        content = content
+            .push(text(format!("Discard {} at {}? This deletes its checkout, including uncommitted and untracked files. The branch and canvas history are retained. Type the floor name to confirm.", floor.name, floor.directory.as_str())).size(12))
             .push(text_input("Exact floor name", &state.floor_ui.confirmation).on_input(|s| AppMessage::Floor(Message::Confirmation(s))))
-            .push(row![button("Discard checkout").on_press(AppMessage::Floor(Message::ConfirmDiscard)), button("Keep floor").on_press(AppMessage::Floor(Message::Keep))].spacing(8));
+            .push(action_grid([
+                button(text("Discard checkout").size(12))
+                    .padding([6, 10])
+                    .style(shell::danger_button)
+                    .on_press(AppMessage::Floor(Message::ConfirmDiscard))
+                    .into(),
+                button(text("Keep floor").size(12))
+                    .padding([6, 10])
+                    .on_press(AppMessage::Floor(Message::Keep))
+                    .into(),
+            ]));
     }
     content
         .push(status::view(state))

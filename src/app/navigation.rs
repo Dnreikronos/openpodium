@@ -110,6 +110,8 @@ pub(super) fn tick(state: &mut OpenPodium) -> Task<Message> {
 pub(super) fn update(state: &mut OpenPodium, message: navigation_panel::Message) -> Task<Message> {
     match message {
         navigation_panel::Message::Open => {
+            state.cancel_connection();
+            state.controls = None;
             state.navigation_ui.open = true;
             state.navigation_ui.selected = 0;
             return Task::batch([
@@ -156,6 +158,15 @@ pub(super) fn update(state: &mut OpenPodium, message: navigation_panel::Message)
             documents,
         } => {
             state.navigation_ui.busy = None;
+            if state
+                .workspaces
+                .as_ref()
+                .and_then(|manager| manager.workspace(workspace_id))
+                .is_none()
+            {
+                state.navigation_ui.index.remove_workspace(workspace_id);
+                return Task::none();
+            }
             let documents = match documents {
                 Ok(documents) => documents,
                 Err(error) => {
@@ -209,6 +220,28 @@ pub(super) fn handle_key(
     shortcut: Option<Shortcut>,
     status: Status,
 ) -> Task<Message> {
+    if state.connection_mode != crate::canvas::ConnectionMode::Off
+        && matches!(navigation_key, NavigationKey::Escape)
+    {
+        state.cancel_connection();
+        return Task::none();
+    }
+    if state.controls.is_some() {
+        return match navigation_key {
+            NavigationKey::Escape => {
+                state.controls = None;
+                Task::none()
+            }
+            NavigationKey::Tab { reverse } if status == Status::Ignored => {
+                if reverse {
+                    iced::widget::operation::focus_previous()
+                } else {
+                    iced::widget::operation::focus_next()
+                }
+            }
+            _ => Task::none(),
+        };
+    }
     if state.navigation_ui.open {
         return match navigation_key {
             NavigationKey::Up => update(state, navigation_panel::Message::MoveSelection(false)),
@@ -244,6 +277,14 @@ pub(super) fn handle_key(
     let Some(command) = state.command_registry.command_for(&shortcut) else {
         return Task::none();
     };
+    if state.connection_mode != crate::canvas::ConnectionMode::Off
+        && !matches!(
+            command,
+            CommandId::OpenPalette | CommandId::ZoomIn | CommandId::ZoomOut | CommandId::ResetZoom
+        )
+    {
+        return Task::none();
+    }
     let embedded_content_focused =
         state.focused_terminal.is_some() || state.focused_portal.is_some();
     if status == Status::Captured
@@ -320,6 +361,7 @@ fn save_binding(state: &mut OpenPodium, unbind: bool) -> Task<Message> {
 pub(super) fn execute_command(state: &mut OpenPodium, command: CommandId) -> Task<Message> {
     match command {
         CommandId::OpenPalette => return update(state, navigation_panel::Message::Open),
+        CommandId::ToggleSidebar => return super::toggle_sidebar(state),
         CommandId::NextWorkspace => return cycle_workspace(state, true),
         CommandId::PreviousWorkspace => return cycle_workspace(state, false),
         CommandId::NextAttention => navigate_attention(state, true),
@@ -359,7 +401,7 @@ fn cycle_workspace(state: &OpenPodium, forward: bool) -> Task<Message> {
         return Task::none();
     };
     let ids = workspaces
-        .recent_workspaces()
+        .ordered_workspaces()
         .map(|workspace| workspace.id())
         .collect::<Vec<_>>();
     let Some(next) = cycle(&ids, workspaces.active_workspace_id(), forward) else {
@@ -468,8 +510,7 @@ fn focus_content(state: &mut OpenPodium) -> Task<Message> {
             state.timeline_ui.select_task(workspace_id, Some(task_id));
         }
         Some((_, CanvasNodeContent::Note { .. } | CanvasNodeContent::Text { .. })) => {
-            crate::app::context_nodes::selection_changed(state);
-            return iced::widget::operation::focus(crate::app::context_nodes::EDITOR_ID);
+            return crate::app::context_nodes::open_editor(state);
         }
         Some((_, _)) | None => {}
     }
@@ -552,7 +593,7 @@ pub(super) fn navigate_to_search_target(
         }
         Some(ContentTarget::Note { character_offset })
         | Some(ContentTarget::Text { character_offset }) => {
-            crate::app::context_nodes::selection_changed(state);
+            let _ = crate::app::context_nodes::open_editor(state);
             state.notice = Some(format!(
                 "Opened matching content near character {character_offset}"
             ));

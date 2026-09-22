@@ -1,12 +1,13 @@
 //! Local workspace creation, settings, switching, and restoration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::domain::{
-    Content, DomainCommand, Name, NodeId, TimelineEvent, TimelineEventId, Timestamp,
-    ValidationError, Workspace, WorkspaceDirectory, WorkspaceIcon, WorkspaceId, WorkspaceSettings,
+    Content, DomainCommand, DomainEvent, Name, NodeId, NodeTarget, TimelineEvent, TimelineEventId,
+    Timestamp, ValidationError, Workspace, WorkspaceDirectory, WorkspaceIcon, WorkspaceId,
+    WorkspaceSettings,
 };
 use crate::persistence::{
     ImportPreview, Journal, PointV1, PortableError, PortableImport, decode_template,
@@ -34,11 +35,50 @@ impl WorkspaceManager {
         let mut workspaces = BTreeMap::new();
 
         for workspace_id in &recent {
-            let workspace = journal.recover(*workspace_id)?.ok_or(
+            let mut workspace = journal.recover(*workspace_id)?.ok_or(
                 WorkspaceError::MissingPersistedWorkspace {
                     workspace_id: *workspace_id,
                 },
             )?;
+            let placed: BTreeSet<_> = workspace
+                .nodes()
+                .filter_map(|node| match node.reference() {
+                    Some(NodeTarget::Agent(id)) => Some(id),
+                    _ => None,
+                })
+                .collect();
+            if workspace
+                .agents()
+                .any(|agent| !placed.contains(&agent.id()))
+            {
+                // Old snapshots kept agents after removing their last card. Only
+                // migrate identities with evidence of a previous canvas window.
+                // Unreadable old events must not invalidate a recovered snapshot.
+                if let Ok(events) = journal.timeline(*workspace_id) {
+                    let mut previously_placed = BTreeSet::new();
+                    for event in events {
+                        match event.event() {
+                            DomainEvent::AgentNodeAdded { agent, .. } => {
+                                previously_placed.insert(agent.id());
+                            }
+                            DomainEvent::NodeAdded(node) => {
+                                if let Some(NodeTarget::Agent(id)) = node.reference() {
+                                    previously_placed.insert(id);
+                                }
+                            }
+                            DomainEvent::CanvasReplaced { before, after } => {
+                                for node in before.nodes().iter().chain(after.nodes()) {
+                                    if let Some(NodeTarget::Agent(id)) = node.reference() {
+                                        previously_placed.insert(id);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    workspace.archive_unplaced_agents(previously_placed);
+                }
+            }
             workspaces.insert(*workspace_id, workspace);
         }
 
@@ -63,6 +103,25 @@ impl WorkspaceManager {
         occurred_at: Timestamp,
     ) -> Result<WorkspaceId, WorkspaceError> {
         let (canonical_path, working_directory) = validate_directory(directory.as_ref())?;
+        for workspace_id in self.journal.recorded_workspace_ids()? {
+            if self.workspaces.contains_key(&workspace_id) {
+                continue;
+            }
+            let Some(workspace) = self.journal.recover(workspace_id)? else {
+                continue;
+            };
+            if workspace
+                .settings()
+                .working_directory()
+                .is_some_and(|directory| Path::new(directory.as_str()) == canonical_path)
+            {
+                self.journal.restore_workspace(workspace_id, occurred_at)?;
+                self.workspaces.insert(workspace_id, workspace);
+                self.mark_recent(workspace_id);
+                self.active = Some(workspace_id);
+                return Ok(workspace_id);
+            }
+        }
         let name = default_workspace_name(&canonical_path)?;
         let workspace_id = self.next_workspace_id()?;
         let settings = WorkspaceSettings::new(name.clone(), None, Some(working_directory), None);
@@ -306,6 +365,17 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    pub fn remove_workspace(&mut self, workspace_id: WorkspaceId) -> Result<(), WorkspaceError> {
+        if !self.workspaces.contains_key(&workspace_id) {
+            return Err(WorkspaceError::UnknownWorkspace { workspace_id });
+        }
+        let next = self.journal.remove_workspace(workspace_id)?;
+        self.workspaces.remove(&workspace_id);
+        self.recent.retain(|id| *id != workspace_id);
+        self.active = next;
+        Ok(())
+    }
+
     pub fn active_workspace_id(&self) -> Option<WorkspaceId> {
         self.active
     }
@@ -338,6 +408,11 @@ impl WorkspaceManager {
             .map_err(WorkspaceError::from)
     }
 
+    /// Workspaces in creation order, independent of selection and recency.
+    pub fn ordered_workspaces(&self) -> impl Iterator<Item = &Workspace> {
+        self.workspaces.values()
+    }
+
     pub fn recent_workspaces(&self) -> impl Iterator<Item = &Workspace> {
         self.recent
             .iter()
@@ -358,6 +433,38 @@ impl WorkspaceManager {
             .map_err(WorkspaceError::from)
     }
 
+    /// Terminal transcripts recorded for a workspace, keyed by node identifier.
+    pub fn terminal_transcripts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<(u64, Vec<u8>)>, WorkspaceError> {
+        self.journal
+            .terminal_transcripts(workspace_id)
+            .map_err(WorkspaceError::from)
+    }
+
+    pub fn store_terminal_transcript(
+        &mut self,
+        workspace_id: WorkspaceId,
+        node_id: u64,
+        captured_at: Timestamp,
+        payload: &[u8],
+    ) -> Result<(), WorkspaceError> {
+        self.journal
+            .store_terminal_transcript(workspace_id, node_id, captured_at, payload)
+            .map_err(WorkspaceError::from)
+    }
+
+    pub fn clear_terminal_transcript(
+        &mut self,
+        workspace_id: WorkspaceId,
+        node_id: u64,
+    ) -> Result<(), WorkspaceError> {
+        self.journal
+            .clear_terminal_transcript(workspace_id, node_id)
+            .map_err(WorkspaceError::from)
+    }
+
     pub fn preferences(&self) -> Result<Vec<(String, String)>, WorkspaceError> {
         self.journal.preferences().map_err(WorkspaceError::from)
     }
@@ -370,9 +477,12 @@ impl WorkspaceManager {
 
     fn next_workspace_id(&self) -> Result<WorkspaceId, WorkspaceError> {
         let next = self
-            .workspaces
-            .last_key_value()
-            .map_or(0, |(workspace_id, _)| workspace_id.get())
+            .journal
+            .recorded_workspace_ids()?
+            .into_iter()
+            .map(|id| id.get())
+            .max()
+            .unwrap_or(0)
             .checked_add(1)
             .ok_or(WorkspaceError::WorkspaceIdExhausted)?;
         Ok(WorkspaceId::new(next))
