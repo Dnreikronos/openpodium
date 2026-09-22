@@ -5,6 +5,7 @@ mod navigation;
 mod portals;
 mod renaming;
 pub(crate) mod shell;
+mod terminal_recovery;
 mod trackpad;
 #[cfg(test)]
 mod transcript_tests;
@@ -448,6 +449,11 @@ enum Message {
     RoleImportRead(Option<String>),
     CanvasFragmentRead(Option<String>),
     StartTerminal(NodeId),
+    RecoverTerminal(NodeId),
+    ResumeTerminal {
+        node_id: NodeId,
+        program: AgentProgram,
+    },
     StopTerminal(NodeId),
     TerminalStarted {
         workspace_id: WorkspaceId,
@@ -497,6 +503,7 @@ enum Controls {
     Node,
     Rename,
     RemoveWorkspace(WorkspaceId),
+    TerminalRecovery(NodeId),
 }
 
 impl Controls {
@@ -516,6 +523,7 @@ impl Controls {
             Self::Node => "Selected node",
             Self::Rename => "Rename window",
             Self::RemoveWorkspace(_) => "Remove workspace?",
+            Self::TerminalRecovery(_) => "Restart or resume",
         }
     }
 }
@@ -860,6 +868,10 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             paste_canvas_fragment(state, payload.as_deref());
         }
         Message::StartTerminal(node_id) => return start_terminal(state, node_id),
+        Message::RecoverTerminal(node_id) => return terminal_recovery::open(state, node_id),
+        Message::ResumeTerminal { node_id, program } => {
+            return start_terminal_with_resume(state, node_id, Some(program));
+        }
         Message::StopTerminal(node_id) => stop_terminal(state, node_id),
         Message::TerminalStarted {
             workspace_id,
@@ -880,6 +892,11 @@ fn update(state: &mut OpenPodium, message: Message) -> Task<Message> {
             node_id,
             contents,
         } => {
+            if active_workspace_id(state) == Some(workspace_id)
+                && terminal_recovery::needs_recovery(state, node_id)
+            {
+                return terminal_recovery::open(state, node_id);
+            }
             let key = TerminalKey {
                 workspace_id,
                 node_id,
@@ -1740,8 +1757,8 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                 primary_button(text("Stop terminal").size(13))
                     .on_press(Message::StopTerminal(node_id))
             } else if session.is_some() {
-                primary_button(text("Reconnect terminal").size(13))
-                    .on_press(Message::StartTerminal(node_id))
+                primary_button(text("Restart / Resume").size(13))
+                    .on_press(Message::RecoverTerminal(node_id))
             } else {
                 primary_button(text("Start terminal").size(13))
                     .on_press(Message::StartTerminal(node_id))
@@ -1907,14 +1924,14 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
                         text(if running {
                             "Stop terminal"
                         } else {
-                            "Start terminal"
+                            "Restart / Resume"
                         })
                         .size(12),
                     )
                     .on_press(if running {
                         Message::StopTerminal(node_id)
                     } else {
-                        Message::StartTerminal(node_id)
+                        Message::RecoverTerminal(node_id)
                     }),
                 )
                 .push(button(text("Chat").size(12)).on_press(Message::OpenControls(Controls::Node)))
@@ -2065,6 +2082,9 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         stage
     };
     let application = if let Some(controls) = state.controls {
+        if let Controls::TerminalRecovery(node) = controls {
+            settings = terminal_recovery::view(state, node);
+        }
         if matches!(controls, Controls::Menu | Controls::Advanced) {
             let choices: &[Controls] = if controls == Controls::Menu {
                 &[Controls::Workspace, Controls::Advanced]
@@ -2129,6 +2149,7 @@ fn view(state: &OpenPodium) -> Element<'_, Message> {
         .max_width(match controls {
             Controls::Menu | Controls::Advanced => 340.0,
             Controls::Rename | Controls::RemoveWorkspace(_) => 420.0,
+            Controls::TerminalRecovery(_) => 440.0,
             _ => 620.0,
         });
         stack![
@@ -3281,6 +3302,9 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
         }
         canvas::Message::TerminalInput { node_id, bytes } => {
+            if terminal_recovery::needs_recovery(state, node_id) {
+                return terminal_recovery::open(state, node_id);
+            }
             if let Some(session) =
                 active_terminal_key(state, node_id).and_then(|key| state.terminals.get(&key))
                 && let Err(error) = session.write(&bytes)
@@ -3289,6 +3313,9 @@ fn handle_canvas_message(state: &mut OpenPodium, message: canvas::Message) -> Ta
             }
         }
         canvas::Message::TerminalPasteRequested(node_id) => {
+            if terminal_recovery::needs_recovery(state, node_id) {
+                return terminal_recovery::open(state, node_id);
+            }
             let Some(workspace_id) = active_workspace_id(state) else {
                 return Task::none();
             };
@@ -4652,6 +4679,14 @@ fn add_agent(state: &mut OpenPodium, program: AgentProgram) -> Task<Message> {
 }
 
 fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
+    start_terminal_with_resume(state, node_id, None)
+}
+
+fn start_terminal_with_resume(
+    state: &mut OpenPodium,
+    node_id: NodeId,
+    resume: Option<AgentProgram>,
+) -> Task<Message> {
     if floors::is_busy(state) {
         state.notice =
             Some("Wait for the Git operation to finish before starting a terminal".to_owned());
@@ -4719,8 +4754,13 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
         return Task::none();
     }
 
+    if resume.is_some_and(|resumed| !terminal_recovery::can_resume(program, resumed)) {
+        state.notice = Some("This agent does not support that resume action".to_owned());
+        return Task::none();
+    }
+    let launch_program = resume.unwrap_or(program);
     if profile.is_none() {
-        match check_agent_capability(program, preset.as_ref()) {
+        match check_agent_capability(launch_program, preset.as_ref()) {
             Ok(capability) if !capability.installed() => {
                 state.notice = capability.setup_guidance().map(str::to_owned);
                 return Task::none();
@@ -4734,7 +4774,7 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
     }
 
     let spec = match session::process_spec(
-        program,
+        launch_program,
         preset.as_ref(),
         role.as_ref(),
         &working_directory,
@@ -4742,6 +4782,11 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
     )
     .map_err(|error| error.to_string())
     .and_then(|spec| {
+        let spec = if let Some(program) = resume {
+            terminal_recovery::resume_spec(spec, program)
+        } else {
+            spec
+        };
         let spec = apply_ipc_environment(
             spec,
             state.ipc.as_ref(),
@@ -4772,9 +4817,13 @@ fn start_terminal(state: &mut OpenPodium, node_id: NodeId) -> Task<Message> {
 
     state.terminal_generation = state.terminal_generation.wrapping_add(1);
     let generation = state.terminal_generation;
-    state
-        .terminals
-        .insert(key, Session::starting(size, generation));
+    if let Some(session) = state.terminals.get_mut(&key) {
+        session.prepare_restart(size, generation);
+    } else {
+        state
+            .terminals
+            .insert(key, Session::starting(size, generation));
+    }
     state.focused_terminal = Some(node_id);
     state.canvas_revision = state.canvas_revision.wrapping_add(1);
     state.notice = Some("Terminal starting".to_owned());
@@ -4865,6 +4914,10 @@ fn handle_terminal_started(
             }
             if is_active_workspace {
                 state.notice = None;
+                if state.controls == Some(Controls::TerminalRecovery(node_id)) {
+                    state.controls = None;
+                    state.focused_terminal = Some(node_id);
+                }
             }
             state.canvas_revision = state.canvas_revision.wrapping_add(1);
             wait_for_terminal_event(

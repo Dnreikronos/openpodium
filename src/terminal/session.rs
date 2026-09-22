@@ -67,11 +67,18 @@ impl Session {
         self.generation
     }
 
+    pub(crate) fn prepare_restart(&mut self, size: GridSize, generation: u64) {
+        self.model.resize(size);
+        self.generation = generation;
+        self.status = Status::Starting;
+    }
+
     pub(crate) fn attach(&mut self, stream: ProcessStream) -> Result<(), &'static str> {
         let controller = stream
             .try_lock()
             .map_err(|_| "the process stream was busy before event polling started")?
             .controller();
+        self.model = Model::new(self.model.size);
         self.controller = Some(controller);
         self.stream = Some(stream);
         self.status = Status::Running;
@@ -245,6 +252,18 @@ mod tests {
             view.cells.iter().any(|cell| cell.text == "h"),
             "the stored output should be back on screen"
         );
+    }
+
+    #[test]
+    fn failed_restart_preserves_the_saved_screen() {
+        let mut session = Session::restored(size(), 1, b"saved conversation".to_vec());
+        let before = session.view().cells;
+        session.prepare_restart(size(), 2);
+        assert!(session.is_active());
+        assert_eq!(session.generation(), 2);
+        session.fail("program could not be started");
+        assert!(!session.is_active());
+        assert_eq!(session.view().cells, before);
     }
 
     #[test]
